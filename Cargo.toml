@@ -11,3 +11,6 @@ clap = { version = "4.5.21", features = ["derive"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 rand = "0.8.5"
 anyhow = "1.0.93"
+io-uring = "0.7.2"
+slab = "0.4.9"
+libc = "0.2.169"

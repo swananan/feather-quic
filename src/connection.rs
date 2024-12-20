@@ -1,5 +1,4 @@
 use anyhow::Result;
-use std::net::SocketAddr;
 use std::time::Instant;
 
 pub struct QuicConnection {
@@ -17,12 +16,15 @@ impl QuicConnection {
     }
 
     pub fn is_readable(&self) -> bool {
-        // TODO: Implement QUIC stream
-        unimplemented!();
+        false
+    }
+
+    pub fn is_writable(&self) -> bool {
+        false
     }
 
     pub fn is_established(&self) -> bool {
-        unimplemented!();
+        false
     }
 
     pub fn update_current_time(&mut self) {
@@ -39,7 +41,7 @@ impl QuicConnection {
     }
 
     #[allow(unused_variables)]
-    pub fn provide_data(&mut self, rcvbuf: &[u8], source_addr: &SocketAddr) -> Result<()> {
+    pub fn provide_data(&mut self, rcvbuf: &[u8]) -> Result<()> {
         unimplemented!();
     }
 
@@ -52,7 +54,7 @@ impl QuicConnection {
         unimplemented!();
     }
 
-    fn get_idle_timeout(&self) -> u64 {
+    pub fn get_idle_timeout(&self) -> u64 {
         // TODO: Retrieve idle timeout from server transport parameters
         self.quic_config.get_idle_timeout()
     }
