@@ -1,10 +1,10 @@
 use anyhow::{anyhow, Result};
-use log::{info, trace, warn};
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::net::UdpSocket;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;
+use tracing::{info, trace, warn};
 use types::Timespec;
 
 use io_uring::{cqueue, opcode, types, IoUring, Probe, SubmissionQueue};
@@ -230,7 +230,6 @@ impl IoUringEventLoop {
     where
         F: FnOnce(&mut Vec<u8>) -> Result<u16>,
     {
-        let datagram_len = 1;
         let (buf_index, buf) = match self.bufpool.pop() {
             Some(buf_index) => (buf_index, &mut self.buf_alloc[buf_index]),
             None => {
@@ -247,7 +246,7 @@ impl IoUringEventLoop {
 
         let token_index = self.token_alloc.insert(Token::Write {
             buf_index,
-            datagram_len: datagram_len as u16,
+            datagram_len: write_len,
         });
 
         let send_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), write_len as u32)
@@ -318,11 +317,15 @@ impl IoUringEventLoop {
             udp_fd
         );
 
-        self.create_and_sumbit_write_event(&mut sq, udp_fd, |_| {
-            // let initial_packet_size = qconn.connect(&mut udp_sndbuf)?;
-            // client_socket.send(&udp_sndbuf[..initial_packet_size as usize])?;
-            // info!("Starting QUIC handshake with target: {:?}", target_addr);
-            Ok(0)
+        self.create_and_sumbit_write_event(&mut sq, udp_fd, |buf| {
+            qconn.connect()?;
+            let udp_sndbuf = qconn
+                .consume_data()
+                .expect("Should have first initial QUIC packet");
+
+            buf.clear();
+            buf.extend(udp_sndbuf);
+            Ok(buf.len() as u16)
         })?;
 
         const BUF_GROUP_ID: u16 = 0xdead;
@@ -390,10 +393,14 @@ impl IoUringEventLoop {
                             token,
                         );
                         if write_len != datagram_len {
-                            trace!("Write error - incorrect write length {}, {:?}", write_len, token);
+                            trace!(
+                                "Write error - incorrect write length {}, {:?}",
+                                write_len,
+                                token
+                            );
                         }
 
-                        // Free buffer and token
+                        // Clean up: restore the buffer and remove the token
                         self.token_alloc.remove(token_index);
                         self.bufpool.push(buf_index);
                     }
@@ -449,8 +456,7 @@ impl IoUringEventLoop {
 
                         qconn.update_current_time();
 
-                        // TODO: Process QUIC handshake
-                        qconn.provide_data(read_buf)?;
+                        qconn.provide_data(read_buf, self.target_address)?;
 
                         while let Some(send_buf) = qconn.consume_data() {
                             trace!(
