@@ -119,7 +119,7 @@ pub(crate) enum QuicPacket<'a> {
     ShortHeader(QuicShortHeaderPacket<'a>),
 }
 
-impl<'a> QuicPacket<'a> {
+impl QuicPacket<'_> {
     pub(crate) fn start_tls_handshake(qconn: &mut QuicConnection, is_retry: bool) -> Result<()> {
         // https://www.rfc-editor.org/rfc/rfc9001#section-5.2-9
         let secret = if !is_retry {
