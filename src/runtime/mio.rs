@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use log::{info, trace, warn};
 use mio::{net::UdpSocket, Events, Interest, Poll, Token};
 use mio_timerfd::{ClockId, TimerFd};
 use std::net::SocketAddr;
 use std::time::Duration;
+use tracing::{info, trace, warn};
 
 use crate::runtime::{QuicCallbacks, QuicUserContext};
 use crate::QuicConnection;
@@ -64,9 +64,15 @@ impl MioEventLoop {
             .register(&mut quic_timer, QUIC_TIMER_TOKEN, Interest::READABLE)?;
 
         // TODO: Initialize QUIC handshake and send the initial packet
-        // let initial_packet_size = qconn.connect(&mut udp_sndbuf)?;
-        // client_socket.send(&udp_sndbuf[..initial_packet_size as usize])?;
-        // info!("Initiating QUIC handshake with target: {:?}", target_addr);
+        qconn.connect()?;
+        let udp_sndbuf = qconn
+            .consume_data()
+            .expect("Should have first initial QUIC packet");
+        client_socket.send(&udp_sndbuf)?;
+        info!(
+            "Initiating QUIC handshake, first UDP Datagram size {}",
+            udp_sndbuf.len()
+        );
 
         // Buffer size set to 65536 (maximum UDP datagram size)
         let mut udp_rcvbuf = [0; 1 << 16];
@@ -90,8 +96,7 @@ impl MioEventLoop {
 
                                 qconn.update_current_time();
 
-                                // TODO: Process QUIC handshake
-                                qconn.provide_data(&udp_rcvbuf[..packet_size])?;
+                                qconn.provide_data(&udp_rcvbuf[..packet_size], source_addr)?;
 
                                 while let Some(send_buf) = qconn.consume_data() {
                                     trace!(
