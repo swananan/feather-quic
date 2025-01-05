@@ -22,6 +22,20 @@ pub(crate) fn get_remain_length(cursor: &mut Cursor<&[u8]>) -> Option<u64> {
     (cursor.get_ref().len() as u64).checked_sub(cursor.position())
 }
 
+pub(crate) fn get_variable_length(len: u64) -> Result<u8> {
+    if len < (1 << 6) {
+        Ok(1)
+    } else if len < (1 << 14) {
+        Ok(2)
+    } else if len < (1 << 30) {
+        Ok(4)
+    } else if len < (1 << 62) {
+        Ok(8)
+    } else {
+        return Err(anyhow!("Length is so big more then 1<<62 {}", len));
+    }
+}
+
 pub(crate) fn encode_variable_length_force_two_bytes<W>(cursor: &mut W, len: u64) -> Result<u8>
 where
     W: Write + Seek + Read,

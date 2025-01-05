@@ -1,12 +1,15 @@
 use anyhow::{anyhow, Result};
-use byteorder::WriteBytesExt;
+use byteorder::{ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read, Seek, Write};
-use tracing::{span, trace, Level};
+use tracing::{info, span, trace, Level};
 
 use crate::connection::{QuicConnection, QuicLevel};
 use crate::packet::QuicPacket;
 use crate::send::QuicSendContext;
 use crate::utils::{decode_variable_length, encode_variable_length, get_remain_length};
+
+const QUIC_CRYPTO_FRAME_MAX_BUFFER_SIZE: u64 = 1 << 16;
+const QUIC_STATELESS_RESET_TOKEN_LENGTH: u16 = 16;
 
 // The "Pkts" column in Table 3 lists the types of packets that each frame type could appear in,
 // indicated by the following characters:
@@ -30,6 +33,8 @@ pub(crate) enum QuicFrameType {
     Ping = 0x01,
     /// Pkts: IH_1, Spec: NC
     Ack = 0x02,
+    /// Pkts: IH_1, Spec: NC
+    AckEcn = 0x03,
     // TODO ack type 0x03
     /// Pkts: __01
     ResetStream = 0x04,
@@ -63,6 +68,8 @@ pub(crate) enum QuicFrameType {
     PathResponse = 0x1b,
     /// Pkts: ih01, Spec: N
     ConnectionClose = 0x1c,
+    /// Pkts: ih01, Spec: N
+    AppConnectionClose = 0x1d,
     /// Pkts: ___1
     HandshakeDone = 0x1e,
 }
@@ -73,11 +80,12 @@ impl From<u8> for QuicFrameType {
             0x00 => QuicFrameType::Padding,
             0x01 => QuicFrameType::Ping,
             0x02 => QuicFrameType::Ack,
+            0x03 => QuicFrameType::AckEcn,
             0x04 => QuicFrameType::ResetStream,
             0x05 => QuicFrameType::StopSending,
             0x06 => QuicFrameType::Crypto,
             0x07 => QuicFrameType::NewToken,
-            0x08 => QuicFrameType::Stream,
+            0x08..=0x0f => QuicFrameType::Stream,
             0x10 => QuicFrameType::MaxData,
             0x11 => QuicFrameType::MaxStreamData,
             0x12 => QuicFrameType::MaxStreams,
@@ -89,8 +97,9 @@ impl From<u8> for QuicFrameType {
             0x1a => QuicFrameType::PathChallenge,
             0x1b => QuicFrameType::PathResponse,
             0x1c => QuicFrameType::ConnectionClose,
+            0x1d => QuicFrameType::AppConnectionClose,
             0x1e => QuicFrameType::HandshakeDone,
-            _ => panic!("Invalid QuicFrameType value"),
+            _ => panic!("Invalid QuicFrameType value {:x}", value),
         }
     }
 }
@@ -101,6 +110,7 @@ impl From<QuicFrameType> for u8 {
             QuicFrameType::Padding => 0x00,
             QuicFrameType::Ping => 0x01,
             QuicFrameType::Ack => 0x02,
+            QuicFrameType::AckEcn => 0x03,
             QuicFrameType::ResetStream => 0x04,
             QuicFrameType::StopSending => 0x05,
             QuicFrameType::Crypto => 0x06,
@@ -117,9 +127,17 @@ impl From<QuicFrameType> for u8 {
             QuicFrameType::PathChallenge => 0x1a,
             QuicFrameType::PathResponse => 0x1b,
             QuicFrameType::ConnectionClose => 0x1c,
+            QuicFrameType::AppConnectionClose => 0x1d,
             QuicFrameType::HandshakeDone => 0x1e,
         }
     }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct QuicAckRange {
+    gap: u64,
+    ack_range_length: u64,
 }
 
 #[allow(dead_code)]
@@ -149,7 +167,7 @@ struct QuicAck {
     ack_delay: u64,
     ack_range_count: u64,
     first_ack_range: u64,
-    // ack_ranges: Option<Vec<QuicAckRange>>,
+    ack_ranges: Option<Vec<QuicAckRange>>,
 }
 
 #[allow(dead_code)]
@@ -318,6 +336,33 @@ impl QuicFrame {
         W: Write + Seek + Read,
     {
         match self {
+            QuicFrame::Ack(ack_frame) => {
+                // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.3
+                // ACK Frame {
+                //   Type (i) = 0x02..0x03,
+                //   Largest Acknowledged (i),
+                //   ACK Delay (i),
+                //   ACK Range Count (i),
+                //   First ACK Range (i),
+                //   ACK Range (..) ...,
+                //   [ECN Counts (..)],
+                // }
+
+                // TODO: check it more accurate
+                if remain < 10 {
+                    return Ok(false);
+                }
+
+                let frame_type: u8 = QuicFrameType::Ack.into();
+                encode_variable_length(cursor, frame_type as u64)?;
+                encode_variable_length(cursor, ack_frame.largest_acknowledged)?;
+                encode_variable_length(cursor, ack_frame.ack_delay)?;
+                // TODO
+                encode_variable_length(cursor, 0 /* ack_frame.ack_range_count */)?;
+                encode_variable_length(cursor, ack_frame.first_ack_range)?;
+
+                trace!("Serialized {:?} frame", QuicFrameType::Ack);
+            }
             QuicFrame::Crypto(crypto_frame) => {
                 // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.6
                 // CRYPTO Frame {
@@ -337,11 +382,15 @@ impl QuicFrame {
                 encode_variable_length(cursor, crypto_frame.offset)?;
                 encode_variable_length(cursor, crypto_frame.crypto_data.len() as u64)?;
                 cursor.write_all(&crypto_frame.crypto_data)?;
+
+                trace!("Serialized {:?} frame", QuicFrameType::Crypto);
             }
             QuicFrame::Ping(_) => {
                 // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.2
                 let frame_type: u8 = QuicFrameType::Ping.into();
                 encode_variable_length(cursor, frame_type as u64)?;
+
+                trace!("Serialized {:?} frame", QuicFrameType::Ping);
             }
             _ => unimplemented!(),
         }
@@ -349,8 +398,63 @@ impl QuicFrame {
         Ok(true)
     }
 
-    pub(crate) fn is_crypto_frame(&self) -> bool {
+    pub(crate) fn _is_ack_eliciting(&self) -> bool {
+        !matches!(
+            self,
+            QuicFrame::Ack(_) | QuicFrame::Padding(_) | QuicFrame::ConnectionClose(_)
+        )
+    }
+
+    pub(crate) fn _is_crypto_frame(&self) -> bool {
         matches!(self, QuicFrame::Crypto(_))
+    }
+
+    pub(crate) fn create_ack_frame(
+        qconn: &mut QuicConnection,
+        level: QuicLevel,
+    ) -> Result<Option<QuicFrame>> {
+        let send_ctx = match level {
+            QuicLevel::Initial => &mut qconn.init_send,
+            QuicLevel::Handshake => &mut qconn.hs_send,
+            QuicLevel::Application => &mut qconn.app_send,
+        };
+
+        if send_ctx.largest_pn.is_none() {
+            return Ok(None);
+        }
+
+        let lpn = send_ctx.largest_pn.unwrap();
+
+        // TODO: Need to check if the Ack frame should be created
+        if let Some(sent_largest_acked_pn) = send_ctx.sent_largest_acked_pn {
+            if sent_largest_acked_pn >= lpn {
+                return Ok(None);
+            }
+        }
+
+        let ack_frame = QuicFrame::Ack(QuicAck {
+            common: QuicFrameCommon {
+                is_key_updating: false,
+                level: Some(level),
+                pn: None,
+            },
+            largest_acknowledged: lpn,
+            ack_delay: 30,
+            // TODO
+            ack_range_count: 0,
+            first_ack_range: 0,
+            ack_ranges: None,
+        });
+
+        trace!(
+            "Now we are creating {:?} ACK frame, largest_pn {}",
+            level,
+            lpn
+        );
+
+        send_ctx.sent_largest_acked_pn = Some(lpn);
+
+        Ok(Some(ack_frame))
     }
 
     pub(crate) fn create_padding_frame<W>(cursor: &mut W, padding_frame_size: u16) -> Result<u32>
@@ -435,6 +539,16 @@ impl QuicFrame {
             );
             match frame_type {
                 QuicFrameType::Crypto => Self::handle_crypto_frame(&mut cursor, qconn, level)?,
+                QuicFrameType::Ack => Self::handle_ack_frame(&mut cursor, qconn, level)?,
+                QuicFrameType::Ping => Self::handle_ping_frame(&mut cursor, qconn, level)?,
+                QuicFrameType::Padding => Self::handle_padding_frame(&mut cursor, qconn, level)?,
+                QuicFrameType::HandshakeDone => {
+                    Self::handle_handshake_done_frame(&mut cursor, qconn, level)?
+                }
+                QuicFrameType::NewConnectionId => {
+                    Self::handle_new_conncetion_id_frame(&mut cursor, qconn, level)?
+                }
+                QuicFrameType::NewToken => Self::handle_new_token_frame(&mut cursor, qconn, level)?,
                 _ => unimplemented!(),
             }
             trace!(
@@ -462,23 +576,6 @@ impl QuicFrame {
             length
         );
 
-        let send_ctx = match level {
-            QuicLevel::Initial => &mut qconn.init_send,
-            QuicLevel::Handshake => &mut qconn.hs_send,
-            QuicLevel::Application => &mut qconn.app_send,
-        };
-
-        // Verify frame ordering
-        if send_ctx.crypto_recv_offset != offset {
-            trace!(
-                "Out-of-order CRYPTO frame: expected offset={}, got={}",
-                send_ctx.crypto_recv_offset,
-                offset
-            );
-            // TODO: handle reordered crypto frames
-            unimplemented!();
-        }
-
         let remain_bytes = get_remain_length(cursor).ok_or_else(|| {
             anyhow!(
                 "Bad cursor, position {}, all size {}",
@@ -495,19 +592,321 @@ impl QuicFrame {
             ));
         }
 
-        send_ctx.crypto_recv_offset += length;
-
         let crypto_start_pos = cursor.position();
 
+        let send_ctx = match level {
+            QuicLevel::Initial => &mut qconn.init_send,
+            QuicLevel::Handshake => &mut qconn.hs_send,
+            QuicLevel::Application => &mut qconn.app_send,
+        };
+
+        // Verify frame ordering
+        if send_ctx.crypto_recv_offset < offset {
+            trace!(
+                "Out-of-order CRYPTO frame: expected offset={}, got={}",
+                send_ctx.crypto_recv_offset,
+                offset
+            );
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-7.5
+            if send_ctx.get_recv_cbufs_length() + length > QUIC_CRYPTO_FRAME_MAX_BUFFER_SIZE {
+                // TODO: Need to close connection with `CRYPTO_BUFFER_EXCEEDED`
+                return Ok(());
+            }
+            send_ctx.insert_recv_cbufs(
+                &cursor.get_ref()
+                    [crypto_start_pos as usize..crypto_start_pos as usize + length as usize],
+                offset,
+            );
+            cursor.seek_relative(length as i64)?;
+            return Ok(());
+        }
+
+        send_ctx.crypto_recv_offset += length;
+
         // Tls module must consume all the crypto buffer
-        qconn.tls.continue_tls_handshake(
+        qconn.tls.handle_tls_handshake(
             &cursor.get_ref()
                 [crypto_start_pos as usize..crypto_start_pos as usize + length as usize],
-            length,
         )?;
         cursor.seek_relative(length as i64)?;
 
+        if let Some(pre_buf) = send_ctx.consume_pre_recv_cbufs(offset + length) {
+            trace!(
+                "Continue to consume pre restored crypto bufs, offset {}, length {}, crypto_recv_offset {}",
+                offset + length,
+                pre_buf.len(),
+                send_ctx.crypto_recv_offset,
+            );
+            qconn.tls.handle_tls_handshake(&pre_buf)?;
+            send_ctx.crypto_recv_offset += pre_buf.len() as u64;
+        }
+
+        if qconn.tls.should_derive_hs_secret()
+            && !qconn.crypto.is_key_available(QuicLevel::Handshake)
+        {
+            qconn.crypto.create_secrets(
+                qconn.tls.get_selected_cipher_suite()?,
+                QuicLevel::Handshake,
+                qconn.tls.get_handshake_client_secret()?,
+                qconn.tls.get_handshake_server_secret()?,
+            )?;
+        }
+
+        if qconn.tls.should_derive_ap_secret()
+            && !qconn.crypto.is_key_available(QuicLevel::Application)
+        {
+            qconn.crypto.create_secrets(
+                qconn.tls.get_selected_cipher_suite()?,
+                QuicLevel::Application,
+                qconn.tls.get_application_client_secret()?,
+                qconn.tls.get_application_server_secret()?,
+            )?;
+        }
+
+        if qconn.tls.have_server_transport_params() && qconn.idle_timeout.is_none() {
+            // Max_idle_timeout: Idle timeout is disabled when both endpoints
+            // omit this transport parameter or specify a value of 0.
+            let peer_idle_timeout = qconn.tls.get_peer_idle_timeout().unwrap_or(0);
+            let local_idle_timeout = qconn.quic_config.get_idle_timeout();
+
+            qconn.idle_timeout = if local_idle_timeout == 0 {
+                Some(peer_idle_timeout)
+            } else if peer_idle_timeout == 0 {
+                Some(local_idle_timeout)
+            } else {
+                Some(local_idle_timeout.min(peer_idle_timeout))
+            };
+
+            info!(
+                "The real idle_timeout {} have been negotiated from local {} and peer {}",
+                qconn.idle_timeout.unwrap(),
+                local_idle_timeout,
+                peer_idle_timeout
+            );
+        }
+
         qconn.consume_tls_send_queue()?;
+
+        Ok(())
+    }
+
+    fn handle_new_token_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+        level: QuicLevel,
+    ) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.7
+        // NEW_TOKEN Frame {
+        //  Type (i) = 0x07,
+        //  Token Length (i),
+        //  Token (..),
+        //}
+
+        assert_eq!(level, QuicLevel::Application);
+
+        let token_len = decode_variable_length(cursor)?;
+        let mut token = vec![0u8; token_len as usize];
+        cursor.read_exact(&mut token)?;
+
+        trace!("Got new token {} bytes {:x?}", token_len, &token,);
+
+        qconn.new_token = Some(token);
+
+        Ok(())
+    }
+
+    fn handle_new_conncetion_id_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+        level: QuicLevel,
+    ) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.15
+        // NEW_CONNECTION_ID Frame {
+        //   Type (i) = 0x18,
+        //   Sequence Number (i),
+        //   Retire Prior To (i),
+        //   Length (8),
+        //   Connection ID (8..160),
+        //   Stateless Reset Token (128),
+        // }
+
+        assert_eq!(level, QuicLevel::Application);
+
+        // The sequence number assigned to the connection ID by the sender,
+        // encoded as a variable-length integer; see Section 5.1.1.
+        let sequence_number = decode_variable_length(cursor)?;
+        let retire_prior = decode_variable_length(cursor)?;
+
+        let scid_len = cursor.read_u8()?;
+        let mut scid = vec![0u8; scid_len as usize];
+        cursor.read_exact(&mut scid)?;
+
+        let mut stateless_reset_token = [0u8; QUIC_STATELESS_RESET_TOKEN_LENGTH as usize];
+        cursor.read_exact(&mut stateless_reset_token)?;
+
+        trace!(
+            "Got new connection id {} bytes {:x?}, sequence_number {}, retire_prior {} \
+            stateless reset token {:x?}",
+            scid_len,
+            scid,
+            sequence_number,
+            retire_prior,
+            stateless_reset_token
+        );
+
+        qconn
+            .new_conn_ids
+            .push((scid, stateless_reset_token.to_vec()));
+
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
+    fn handle_handshake_done_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+        level: QuicLevel,
+    ) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.20
+        // HANDSHAKE_DONE Frame {
+        //    Type (i) = 0x1e,
+        // }
+
+        assert_eq!(level, QuicLevel::Application);
+        info!("Now we can say that QUIC handshake was performed perfectly!");
+
+        qconn.set_connected()?;
+
+        qconn
+            .crypto
+            .quic_secrets_update(qconn.tls.get_selected_cipher_suite()?)?;
+
+        if qconn.quic_config.get_trigger_key_update().is_some() {
+            QuicFrame::create_and_insert_ping_frame(qconn, QuicLevel::Application)?;
+        }
+
+        if qconn.crypto.is_key_available(QuicLevel::Handshake) {
+            // https://www.rfc-editor.org/rfc/rfc9001#section-4.9.2
+            qconn.crypto.discard_keys(QuicLevel::Handshake)?;
+        }
+
+        Ok(())
+    }
+
+    fn create_and_insert_ping_frame(qconn: &mut QuicConnection, level: QuicLevel) -> Result<()> {
+        let send_ctx = match level {
+            QuicLevel::Initial => &mut qconn.init_send,
+            QuicLevel::Handshake => &mut qconn.hs_send,
+            QuicLevel::Application => &mut qconn.app_send,
+        };
+
+        let ping_frame = QuicFrame::Ping(QuicPing::default());
+        send_ctx.insert_send_queue_back(ping_frame);
+
+        trace!("Now we are creating {:?} ping frame", level,);
+
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
+    fn handle_padding_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+        level: QuicLevel,
+    ) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.1
+
+        // Padding frame doesn't have length field, but it must be the last QUIC frame in the packet
+        // so we need to consume the entire cursor
+        let remain_bytes = get_remain_length(cursor).ok_or_else(|| {
+            anyhow!(
+                "Bad cursor from finished message, position {}, all size {}",
+                cursor.position(),
+                cursor.get_ref().len()
+            )
+        })?;
+        cursor.seek_relative(remain_bytes as i64)?;
+
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
+    fn handle_ping_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+        level: QuicLevel,
+    ) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.2
+        // The receiver of a PING frame simply needs to acknowledge the packet containing this frame.
+        // The PING frame can be used to keep a connection alive when an application or application
+        // protocol wishes to prevent the connection from timing out; see Section 10.1.2.
+
+        // TODO: need to ack
+
+        Ok(())
+    }
+
+    fn handle_ack_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+        level: QuicLevel,
+    ) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.3
+        // ACK Frame {
+        //   Type (i) = 0x02..0x03,
+        //   Largest Acknowledged (i),
+        //   ACK Delay (i),
+        //   ACK Range Count (i),
+        //   First ACK Range (i),
+        //   ACK Range (..) ...,
+        //   [ECN Counts (..)],
+        // }
+
+        let largest_acked = decode_variable_length(cursor)?;
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-13.2.5
+        let ack_delay = decode_variable_length(cursor)?;
+        let ack_range_count = decode_variable_length(cursor)?;
+        let first_ack_range = decode_variable_length(cursor)?;
+
+        trace!(
+            "Processing {:?} ack frame, we received largest_acked {}, ack_delay {}, \
+            ack_range_count {}, first_ack_range {}",
+            level,
+            largest_acked,
+            ack_delay,
+            ack_range_count,
+            first_ack_range,
+        );
+
+        // TODO: need to process these data further
+        let ps = match level {
+            QuicLevel::Initial => &mut qconn.init_send,
+            QuicLevel::Handshake => &mut qconn.hs_send,
+            QuicLevel::Application => &mut qconn.app_send,
+        };
+        ps.largest_acked = Some(largest_acked);
+
+        // TODO: need to handle ack range
+        // ACK Range {
+        //   Gap (i),
+        //   ACK Range Length (i),
+        // }
+        let mut ack_ranges = vec![];
+        for _ in 0..ack_range_count {
+            let gap = decode_variable_length(cursor)?;
+            let ack_range_length = decode_variable_length(cursor)?;
+            ack_ranges.push(QuicAckRange {
+                gap,
+                ack_range_length,
+            });
+        }
+
+        if !ack_ranges.is_empty() {
+            trace!(
+                "Processing ack frame, we received ack ranges {:?}",
+                ack_ranges
+            );
+        }
 
         Ok(())
     }

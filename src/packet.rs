@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use tracing::{info, span, trace, warn, Level};
 
 use crate::connection::{QuicConnection, QuicLevel};
-use crate::crypto::{QuicCrypto, QUIC_TAG_LENGTH};
+use crate::crypto::{DecryptKeyMode, QuicCrypto, QUIC_TAG_LENGTH};
 use crate::frame::QuicFrame;
 use crate::tls::TLS_AES_128_GCM_SHA256;
 use crate::utils::{
@@ -13,7 +13,6 @@ use crate::utils::{
     write_cursor_bytes_with_pos,
 };
 
-pub(crate) const DEFAULT_INITIAL_PACKET_SIZE: u16 = 1200;
 const DEFAULT_MTU: u16 = 1472; // 1500 - udp header 8 - ip header 20
 
 const QUIC_PACKET_LENGTH_FIELD_SIZE: u16 = 2;
@@ -42,6 +41,9 @@ const QUIC_VERSION: u32 = 1;
 
 // https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2.5
 const QUIC_RETRY_INTEGRITY_TAG_SIZE: u16 = 16;
+
+// TODO: three times the PTO
+const QUIC_DISCARD_OLD_KEY_TIMEOUT: u64 = 800; // Unit is millisecond
 
 #[derive(Debug)]
 struct QuicPacketNumber {
@@ -133,11 +135,13 @@ impl QuicPacket<'_> {
 
         qconn.crypto.create_initial_secrets(secret)?;
 
+        // TODO: No need to recreate client hello frame for QUIC retry or retransmission
+        qconn.init_send.crypto_send_offset = 0;
         qconn.tls.start_tls_handshake()?;
 
         qconn.consume_tls_send_queue()?;
 
-        Self::update_quic_send_queue(qconn, qconn.quic_config.first_initial_packet_size)?;
+        Self::update_quic_send_queue(qconn, qconn.quic_config.get_first_initial_packet_size())?;
 
         Ok(())
     }
@@ -148,13 +152,17 @@ impl QuicPacket<'_> {
         remain: u16,
         bufs: &mut Vec<Vec<u8>>,
     ) -> Result<u16> {
-        // TODO: Check if need to generate the Ack frame
+        let ack_frame = QuicFrame::create_ack_frame(qconn, level)?;
 
         let send_ctx = match level {
             QuicLevel::Initial => &mut qconn.init_send,
             QuicLevel::Handshake => &mut qconn.hs_send,
             QuicLevel::Application => &mut qconn.app_send,
         };
+
+        if let Some(ack_frame) = ack_frame {
+            send_ctx.insert_send_queue_front(ack_frame);
+        }
 
         // Check if need to create packet
         if send_ctx.is_send_queue_empty() {
@@ -226,6 +234,15 @@ impl QuicPacket<'_> {
                 break;
             }
         }
+
+        if !qconn.init_send.need_ack()
+            && qconn.hs_send.largest_pn.is_some()
+            && qconn.crypto.is_key_available(QuicLevel::Initial)
+        {
+            // https://www.rfc-editor.org/rfc/rfc9001#section-4.9.1
+            qconn.crypto.discard_keys(QuicLevel::Initial)?;
+        }
+
         Ok(())
     }
 
@@ -391,15 +408,10 @@ impl QuicPacket<'_> {
 
         let mut payload: Vec<u8> = vec![];
         let mut payload_cursor = Cursor::new(&mut payload);
-        let mut need_padding = false;
         while let Some(frame) = qconn.init_send.consume_send_queue() {
             let payload_len = payload_cursor.position();
             let res = frame.serialize(&mut payload_cursor, remain_len - payload_len as u16)?;
-            if res {
-                if frame.is_crypto_frame() {
-                    need_padding = true;
-                }
-            } else {
+            if !res {
                 // Restore the send queue, if QUIC payload size is not enough
                 qconn.init_send.insert_send_queue_front(frame);
                 break;
@@ -411,32 +423,33 @@ impl QuicPacket<'_> {
             return Ok(None);
         }
 
-        if need_padding {
-            let padding_frame_size = remain_len
-                .checked_sub(pn.packet_size as u16)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Bad packet number size {}, initial_packet_len {}",
-                        pn.packet_size,
-                        initial_packet_len
-                    )
-                })?
-                .checked_sub(payload_len as u16)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Bad crypto frame size {}, initial_packet_len {}",
-                        payload_len,
-                        initial_packet_len
-                    )
-                })?
-                .checked_sub(QUIC_TAG_LENGTH as u16)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Bad QUIC tag length {}, initial_packet_len {}",
-                        QUIC_TAG_LENGTH,
-                        initial_packet_len
-                    )
-                })?;
+        let padding_frame_size = remain_len
+            .checked_sub(pn.packet_size as u16)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Bad packet number size {}, initial_packet_len {}",
+                    pn.packet_size,
+                    initial_packet_len
+                )
+            })?
+            .checked_sub(payload_len as u16)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Bad crypto frame size {}, initial_packet_len {}",
+                    payload_len,
+                    initial_packet_len
+                )
+            })?
+            .checked_sub(QUIC_TAG_LENGTH as u16)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Bad QUIC tag length {}, initial_packet_len {}",
+                    QUIC_TAG_LENGTH,
+                    initial_packet_len
+                )
+            })?;
+
+        if padding_frame_size > 0 {
             QuicFrame::create_padding_frame(&mut payload_cursor, padding_frame_size)?;
             trace!("Added padding frame at pos {}", payload_cursor.position());
         }
@@ -555,6 +568,24 @@ impl QuicPacket<'_> {
             return Ok(None);
         }
 
+        // Trigger the key update voluntarily
+        if qconn.should_update_key() {
+            info!(
+                "Trigger the key update voluntarily, from {} to {}",
+                qconn.key_phase,
+                qconn.key_phase ^ KEY_PHASE
+            );
+            qconn.key_phase ^= KEY_PHASE;
+            let (client_secret, server_secret) = qconn
+                .crypto
+                .switch_keys(qconn.tls.get_selected_cipher_suite()?)?;
+            qconn
+                .tls
+                .append_key_update_sslkey(&client_secret, &server_secret)?;
+            qconn.set_oldkey_discard_time(QUIC_DISCARD_OLD_KEY_TIMEOUT);
+        }
+
+        flag |= qconn.key_phase;
         flag |= (pn
             .packet_size
             .checked_sub(1)
@@ -685,12 +716,12 @@ impl QuicPacket<'_> {
 
         // TODO: MTU Discovery
         let quic_header_size = cursor.position() as u16;
-        if udp_datagram_remaining < quic_header_size {
+        if udp_datagram_remaining < quic_header_size + QUIC_TAG_LENGTH as u16 {
             return Ok(None);
         }
         let max_payload_size = udp_datagram_remaining - quic_header_size - QUIC_TAG_LENGTH as u16;
         trace!(
-            "We are preparing QUIC handshake packet, UDP datagram remaining {}, QUIC header size {}, \
+            "Preparing QUIC handshake packet, UDP datagram remaining {}, QUIC header size {}, \
             max_payload_size {}, aead tag length {}",
             udp_datagram_remaining,
             quic_header_size,
@@ -712,7 +743,8 @@ impl QuicPacket<'_> {
             }
         }
 
-        if payload.is_empty() {
+        let payload_len = payload_cursor.position();
+        if payload_len == 0 {
             return Ok(None);
         }
 
@@ -781,6 +813,10 @@ impl QuicPacket<'_> {
                 rcvbuf.len()
             );
             offset += packet_size as usize;
+            if !is_long_header(flag) {
+                // UDP datagram must contain only one QUIC short packet
+                break;
+            }
         }
 
         if offset != rcvbuf.len() {
@@ -809,15 +845,19 @@ impl QuicPacket<'_> {
         );
         let _enter = span.enter();
 
-        let (pkt, consumed_size) =
-            Self::handle_long_header_packet_helper(rcvbuf, qconn, source_addr)?;
+        if let Some((pkt, consumed_size)) =
+            Self::handle_long_header_packet_helper(rcvbuf, qconn, source_addr)?
+        {
+            let pkt = QuicPacket::LongHeader(pkt);
 
-        let pkt = QuicPacket::LongHeader(pkt);
+            Self::update_packet_space(qconn, &pkt)?;
+            QuicFrame::handle_quic_frame(qconn, &pkt)?;
 
-        Self::update_packet_space(qconn, &pkt)?;
-        QuicFrame::handle_quic_frame(qconn, &pkt)?;
-
-        Ok(consumed_size)
+            Ok(consumed_size)
+        } else {
+            // Discarding packet
+            Ok(rcvbuf.len() as u16)
+        }
     }
 
     pub(crate) fn get_packet_number(&self) -> Option<u64> {
@@ -920,7 +960,6 @@ impl QuicPacket<'_> {
             pn_length << 3,
         )?;
 
-        // TODO: key update
         let key_phase = unprotected_flag & KEY_PHASE;
         trace!(
             "Here we finally got real flag 0x{:x} and packet number {}, \
@@ -945,43 +984,94 @@ impl QuicPacket<'_> {
         aad[pn_offset..pn_offset + pn_length as usize]
             .copy_from_slice(&pn_bytes[4 - pn_length as usize..]);
 
-        let decrypted_data = qconn.crypto.decrypt_packet(
-            QuicLevel::Application,
-            qconn.tls.get_selected_cipher_suite()?,
-            &cursor.get_ref()[decrypted_start_pos as usize..decrypted_end_pos],
-            // The associated data, A, for the AEAD is the contents of the QUIC header,
-            // starting from the first byte of either the short or long header,
-            // up to and including the unprotected packet number.
-            &aad,
-            real_pn,
-        )?;
-
-        cursor.seek_relative((decrypted_data.len() + QUIC_TAG_LENGTH) as i64)?;
-
-        let spkt = QuicShortHeaderPacket {
-            from: *source_addr,
-            flag: unprotected_flag,
-            pn: real_pn,
-            dcid,
-            length,
-            raw_payload: rcvbuf,
-            payload: decrypted_data,
+        let key_modes = if key_phase != qconn.key_phase {
+            warn!(
+                "Could be key update, got key phase {}, orignal {}",
+                key_phase, qconn.key_phase,
+            );
+            if qconn.app_send.largest_acked.is_none() {
+                // TODO: should response a KEY_UPDATE_ERROR connection close message
+                unimplemented!();
+            }
+            if qconn.crypto.is_last_key_available() {
+                vec![
+                    DecryptKeyMode::Current,
+                    DecryptKeyMode::Last,
+                    DecryptKeyMode::Next,
+                ]
+            } else {
+                vec![DecryptKeyMode::Current, DecryptKeyMode::Next]
+            }
+        } else {
+            vec![DecryptKeyMode::Current]
         };
 
-        let pkt = QuicPacket::ShortHeader(spkt);
-        Self::update_packet_space(qconn, &pkt)?;
+        for m in key_modes.iter() {
+            match qconn.crypto.decrypt_packet(
+                QuicLevel::Application,
+                qconn.tls.get_selected_cipher_suite()?,
+                &cursor.get_ref()[decrypted_start_pos as usize..decrypted_end_pos],
+                // The associated data, A, for the AEAD is the contents of the QUIC header,
+                // starting from the first byte of either the short or long header,
+                // up to and including the unprotected packet number.
+                &aad,
+                real_pn,
+                *m,
+            ) {
+                Ok(d) => {
+                    if matches!(*m, DecryptKeyMode::Next) {
+                        info!("Key update was triggered by peer side");
+                        let (client_secret, server_secret) = qconn
+                            .crypto
+                            .switch_keys(qconn.tls.get_selected_cipher_suite()?)?;
+                        qconn
+                            .tls
+                            .append_key_update_sslkey(&client_secret, &server_secret)?;
+                        qconn.set_oldkey_discard_time(QUIC_DISCARD_OLD_KEY_TIMEOUT);
+                        qconn.key_phase = key_phase;
+                    } else if matches!(*m, DecryptKeyMode::Last) {
+                        info!("The reorder packet was decrypted by the last key");
+                    }
 
-        // Handle short header packet's payload
-        QuicFrame::handle_quic_frame(qconn, &pkt)?;
+                    cursor.seek_relative((d.len() + QUIC_TAG_LENGTH) as i64)?;
 
-        Ok(cursor.position() as u16)
+                    let spkt = QuicShortHeaderPacket {
+                        from: *source_addr,
+                        flag: unprotected_flag,
+                        pn: real_pn,
+                        dcid,
+                        length,
+                        raw_payload: rcvbuf,
+                        payload: d,
+                    };
+
+                    let pkt = QuicPacket::ShortHeader(spkt);
+                    Self::update_packet_space(qconn, &pkt)?;
+
+                    // Handle short header packet's payload
+                    QuicFrame::handle_quic_frame(qconn, &pkt)?;
+
+                    return Ok(cursor.position() as u16);
+                }
+                Err(e) => {
+                    if e.downcast_ref::<ring::error::Unspecified>().is_some() {
+                        trace!("Decryption failed, could caused by key update");
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        // Discard the QUIC short header packet
+        Ok(decrypted_end_pos as u16)
     }
 
     pub fn handle_long_header_packet_helper<'b>(
         rcvbuf: &'b [u8],
         qconn: &mut QuicConnection,
         source_addr: &SocketAddr,
-    ) -> Result<(QuicLongHeaderPacket<'b>, u16)> {
+    ) -> Result<Option<(QuicLongHeaderPacket<'b>, u16)>> {
         // https://datatracker.ietf.org/doc/html/rfc9000#section-17.2.2
         // An Initial packet uses long headers with a type value of 0x00.
         // It carries the first CRYPTO frames sent by the client and server
@@ -1030,6 +1120,14 @@ impl QuicPacket<'_> {
             _ => unimplemented!(),
         };
 
+        if !qconn.crypto.is_key_available(level) {
+            warn!(
+                "QUIC {:?} keys are not available, discarded the whole packet {} bytes",
+                level, rcvbuf_len
+            );
+            return Ok(None);
+        }
+
         let version = cursor.read_u32::<BigEndian>()?;
         let dcid_len = cursor.read_u8()?;
         if dcid_len > QUIC_MAX_CONNECTION_ID_LENGTH {
@@ -1054,24 +1152,17 @@ impl QuicPacket<'_> {
         cursor.read_exact(&mut scid)?;
 
         // TODO: should verify dcid, scid, version and other staff
-        if qconn.dcid.is_none() {
-            trace!("Got first dcid {:x?} on our side", &scid);
+        if qconn.dcid.is_none() || qconn.retry_token.is_some() {
+            trace!(
+                "Switched to dcid {:x?}, is retry {}",
+                &scid,
+                qconn.retry_token.is_some()
+            );
             qconn.dcid = Some(scid.clone());
+            qconn.retry_token = None;
         }
 
         if matches!(header_type, LongHeaderType::Retry) {
-            let tmp_pkt = QuicLongHeaderPacket {
-                packet_type: header_type,
-                level,
-                from: *source_addr,
-                flag,
-                pn: None,
-                dcid: dcid.clone(),
-                scid: scid.clone(),
-                length: None,
-                raw_payload: rcvbuf,
-                payload: vec![],
-            };
             // After the client has received and processed an Initial or Retry packet from the server,
             // it MUST discard any subsequent Retry packets that it receives.
             if qconn.retry_token.is_some() {
@@ -1079,7 +1170,7 @@ impl QuicPacket<'_> {
                     "Received multiple retry packet with size {}, discarding this packet",
                     rcvbuf_len
                 );
-                return Ok((tmp_pkt, rcvbuf_len as u16));
+                return Ok(None);
             }
 
             let remain_len = rcvbuf_len as u64 - cursor.position();
@@ -1126,7 +1217,7 @@ impl QuicPacket<'_> {
                     add.len(),
                     add,
                 );
-                return Ok((tmp_pkt, rcvbuf_len as u16));
+                return Ok(None);
             }
 
             // A Retry packet does not include a packet number and cannot be explicitly acknowledged by a client.
@@ -1135,7 +1226,7 @@ impl QuicPacket<'_> {
 
             Self::start_tls_handshake(qconn, true)?;
 
-            return Ok((tmp_pkt, rcvbuf_len as u16));
+            return Ok(None);
         }
 
         if level == QuicLevel::Initial {
@@ -1205,6 +1296,7 @@ impl QuicPacket<'_> {
             // up to and including the unprotected packet number.
             &aad,
             real_pn,
+            DecryptKeyMode::Current,
         )?;
 
         trace!(
@@ -1226,7 +1318,7 @@ impl QuicPacket<'_> {
             payload: decrypted_data,
         };
 
-        Ok((lpkt, consumed_size))
+        Ok(Some((lpkt, consumed_size)))
     }
 }
 
@@ -1279,7 +1371,8 @@ fn decode_packet_number_field_size(
     let pn_hwin = pn_win / 2;
     let pn_mask = pn_win - 1;
     trace!(
-        "pn_nbits {}, pn_win {}, pn_hwin{}, pn_mask {}, expected_pn {}",
+        "largest_pn {:?}, pn_nbits {}, pn_win {}, pn_hwin {}, pn_mask {}, expected_pn {}",
+        largest_pn,
         pn_nbits,
         pn_win,
         pn_hwin,

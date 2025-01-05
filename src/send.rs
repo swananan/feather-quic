@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::collections::VecDeque;
+use tracing::warn;
 
 use crate::frame::QuicFrame;
 
@@ -20,12 +21,75 @@ pub(crate) struct QuicSendContext {
     pub(crate) next_pn: u64,
     pub(crate) sent_largest_acked_pn: Option<u64>,
 
+    recv_cbuf_len: u64,
+    store_recv_cbufs: VecDeque<(u64, Vec<u8>)>, // Sorted by first elem of tuple
     pub(crate) crypto_recv_offset: u64,
     pub(crate) crypto_send_offset: u64,
 }
 
 #[allow(dead_code)]
 impl QuicSendContext {
+    // TODO: Design better recv buffers for crypto and stream frame
+    pub(crate) fn get_recv_cbufs_length(&self) -> u64 {
+        self.store_recv_cbufs
+            .iter()
+            .map(|(_, b)| b.len() as u64)
+            .sum()
+    }
+
+    pub(crate) fn insert_recv_cbufs(&mut self, buf: &[u8], offset: u64) {
+        let pos = self
+            .store_recv_cbufs
+            .iter()
+            .position(|(off, _)| offset < *off)
+            .unwrap_or(self.store_recv_cbufs.len());
+        self.store_recv_cbufs.insert(pos, (offset, buf.to_vec()));
+    }
+
+    pub(crate) fn consume_pre_recv_cbufs(&mut self, offset: u64) -> Option<Vec<u8>> {
+        let mut res = vec![];
+        let mut consumed_offset = offset;
+        while let Some((off, buf)) = self.store_recv_cbufs.pop_front() {
+            if off > consumed_offset {
+                self.store_recv_cbufs.push_front((off, buf));
+                return None;
+            }
+
+            let new_buf = if off != consumed_offset {
+                warn!(
+                    "Weird buf was sent by peer side, buf offset {}, buf len {}, expected offset {}",
+                    off, buf.len(), consumed_offset
+                );
+                if consumed_offset >= off + buf.len() as u64 {
+                    // Need to discard this useless buffer
+                    return None;
+                }
+                let (_, right) = buf.split_at(consumed_offset as usize - off as usize);
+                right
+            } else {
+                &buf
+            };
+            consumed_offset += new_buf.len() as u64;
+            res.extend(new_buf);
+        }
+
+        Some(res)
+    }
+
+    pub(crate) fn need_ack(&self) -> bool {
+        if self.largest_pn.is_none() {
+            return false;
+        }
+
+        let lgn = self.largest_pn.unwrap();
+        if self.sent_largest_acked_pn.is_none() {
+            return false;
+        }
+
+        let slgan = self.sent_largest_acked_pn.unwrap();
+        slgan < lgn
+    }
+
     pub(crate) fn get_next_packet_number(&self) -> u64 {
         self.next_pn
     }

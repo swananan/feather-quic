@@ -1,10 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use rand::Rng;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use tracing::{span, warn, Level};
+use tracing::{info, span, trace, warn, Level};
 
+use crate::config::QuicConfig;
 use crate::crypto::QuicCrypto;
 use crate::packet::QuicPacket;
 use crate::send::QuicSendContext;
@@ -17,9 +18,19 @@ pub(crate) enum QuicLevel {
     Application,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum QuicConnectionState {
+    Init,
+    Connecting,
+    Established,
+    _ConnectionClose,
+}
+
 pub struct QuicConnection {
     pub(crate) quic_config: QuicConfig,
+    state: QuicConnectionState,
     current_ts: Instant,
+    pub(crate) idle_timeout: Option<u64>,
     idle_timeout_threshold: Option<Instant>,
 
     pub(crate) scid: Vec<u8>,
@@ -28,6 +39,11 @@ pub struct QuicConnection {
     pub(crate) crypto: QuicCrypto,
     pub(crate) tls: TlsContext,
     pub(crate) retry_token: Option<Vec<u8>>,
+    pub(crate) new_token: Option<Vec<u8>>,
+    pub(crate) new_conn_ids: Vec<(Vec<u8>, Vec<u8>)>,
+
+    pub(crate) key_phase: u8,
+    discard_oldkey_threshold: Option<Instant>,
 
     send_queue: VecDeque<Vec<Vec<u8>>>, // UDP datagram could carry multiple Long Header QUIC packet
     pub(crate) init_send: QuicSendContext,
@@ -57,13 +73,14 @@ impl QuicConnection {
         };
 
         let now = Instant::now();
-        let threshold = if quic_config.idle_timeout != 0 {
-            now.checked_add(Duration::from_millis(quic_config.idle_timeout))
+        let threshold = if quic_config.get_idle_timeout() != 0 {
+            now.checked_add(Duration::from_millis(quic_config.get_idle_timeout()))
         } else {
             None
         };
 
         QuicConnection {
+            state: QuicConnectionState::Init,
             crypto: QuicCrypto::default(),
             tls: TlsContext::new(&quic_config, &scid),
             current_ts: now,
@@ -71,8 +88,14 @@ impl QuicConnection {
             scid,
             dcid: None,
             retry_token: None,
+            new_token: None,
+            idle_timeout: None,
             org_dcid,
             quic_config,
+            new_conn_ids: vec![],
+
+            key_phase: 0,
+            discard_oldkey_threshold: None,
 
             send_queue: VecDeque::new(),
             init_send: QuicSendContext::default(),
@@ -90,7 +113,13 @@ impl QuicConnection {
     }
 
     pub fn is_established(&self) -> bool {
-        false
+        self.state == QuicConnectionState::Established
+    }
+
+    pub(crate) fn set_connected(&mut self) -> Result<()> {
+        self.expected_state(QuicConnectionState::Connecting)?;
+        self.state = QuicConnectionState::Established;
+        Ok(())
     }
 
     pub fn update_current_time(&mut self) {
@@ -109,11 +138,39 @@ impl QuicConnection {
             }
         }
 
+        if let Some(discard_oldkey_threshold) = self.discard_oldkey_threshold.as_ref() {
+            if *discard_oldkey_threshold <= self.current_ts {
+                info!(
+                    "We need to discard last key here, {:?}",
+                    discard_oldkey_threshold
+                );
+                self.discard_oldkey_threshold = None;
+                self.crypto.discard_last_key();
+            }
+        }
+
         Ok(())
     }
 
     pub fn next_time(&self) -> Option<u64> {
-        Some(self.get_idle_timeout())
+        let idle_update_threshold = if let Some(ref threshold) = self.idle_timeout_threshold {
+            (*threshold - self.current_ts).as_millis() as u64
+        } else {
+            u64::MAX
+        };
+
+        let key_update_threshold = if let Some(ref threshold) = self.discard_oldkey_threshold {
+            (*threshold - self.current_ts).as_millis() as u64
+        } else {
+            u64::MAX
+        };
+
+        let timeout = idle_update_threshold.min(key_update_threshold);
+        if timeout == 0 {
+            None
+        } else {
+            Some(timeout)
+        }
     }
 
     #[allow(unused_variables)]
@@ -152,6 +209,14 @@ impl QuicConnection {
             "connecting",
             scid = ?self.scid.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""),
         );
+        self.expected_state(QuicConnectionState::Init)
+            .with_context(|| {
+                format!(
+                    "Quic connection scid {:x?}, dcid {:x?}, org dcid {:x?}",
+                    self.scid, self.dcid, self.org_dcid
+                )
+            })?;
+        self.state = QuicConnectionState::Connecting;
         let _enter = span.enter();
         QuicPacket::start_tls_handshake(self, false).with_context(|| {
             format!(
@@ -163,9 +228,12 @@ impl QuicConnection {
         Ok(())
     }
 
-    pub fn get_idle_timeout(&self) -> u64 {
-        // TODO: Negotiate idle timeout from server transport parameters
-        self.quic_config.idle_timeout
+    pub(crate) fn get_idle_timeout(&self) -> u64 {
+        if let Some(idle_timeout) = self.idle_timeout {
+            idle_timeout
+        } else {
+            self.quic_config.get_idle_timeout()
+        }
     }
 
     pub(crate) fn consume_tls_send_queue(&mut self) -> Result<()> {
@@ -176,6 +244,7 @@ impl QuicConnection {
                     QuicLevel::Handshake => &mut self.hs_send,
                     QuicLevel::Application => &mut self.app_send,
                 };
+                trace!("Insert crypto frame into {:?} send queue", level);
                 send_ctx.insert_send_queue_with_crypto_data(buf)?;
             }
         }
@@ -191,30 +260,43 @@ impl QuicConnection {
     pub(crate) fn update_packet_send_queue(&mut self, new_pkt: Vec<Vec<u8>>) {
         self.send_queue.push_back(new_pkt);
     }
-}
 
-#[derive(Clone, Default)]
-pub struct QuicConfig {
-    pub(crate) idle_timeout: u64,
-    pub(crate) first_initial_packet_size: u16,
-    pub(crate) org_dcid: Option<Vec<u8>>,
-    pub(crate) scid: Option<Vec<u8>>,
-}
+    pub(crate) fn should_update_key(&mut self) -> bool {
+        // Ensure the first key has been used before allowing an key update
+        if self.app_send.largest_acked.is_none() {
+            return false;
+        }
 
-impl QuicConfig {
-    pub fn set_first_initial_packet_size(&mut self, first_initial_packet_size: u16) {
-        self.first_initial_packet_size = first_initial_packet_size;
+        let trigger_times = match self.quic_config.get_trigger_key_update() {
+            Some(times) => times,
+            None => return false,
+        };
+
+        // Check if the current packet number exceeds the trigger threshold
+        let next_pn = self.app_send.get_next_packet_number();
+        if trigger_times >= next_pn {
+            return false;
+        }
+
+        // Reset the trigger to ensure one-time activation
+        self.quic_config.clear_trigger_key_update();
+
+        true
     }
 
-    pub fn set_idle_timeout(&mut self, idle_timeout: u64) {
-        self.idle_timeout = idle_timeout;
+    pub(crate) fn set_oldkey_discard_time(&mut self, timeout: u64) {
+        self.discard_oldkey_threshold = Instant::now().checked_add(Duration::from_millis(timeout));
     }
 
-    pub fn set_original_dcid(&mut self, original_dcid: &[u8]) {
-        self.org_dcid = Some(original_dcid.to_owned());
-    }
+    fn expected_state(&self, s: QuicConnectionState) -> Result<()> {
+        if s != self.state {
+            return Err(anyhow!(
+                "Invalid QUIC connection state {:?}, expected {:?}",
+                self.state,
+                s
+            ));
+        }
 
-    pub fn set_scid(&mut self, scid: &[u8]) {
-        self.scid = Some(scid.to_owned());
+        Ok(())
     }
 }
