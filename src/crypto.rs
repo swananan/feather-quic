@@ -2,10 +2,10 @@ use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::Aes128;
 use anyhow::{anyhow, Result};
 use ring::aead::{self};
-use ring::hkdf::{KeyType, Prk, Salt, HKDF_SHA256};
+use ring::hkdf::{KeyType, Prk, Salt, HKDF_SHA256, HKDF_SHA384};
 use std::io::Cursor;
 use std::rc::Rc;
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 use crate::connection::QuicLevel;
 use crate::packet::is_long_header;
@@ -14,7 +14,7 @@ use crate::utils::write_cursor_bytes_with_pos;
 
 // Constants for QUIC secret lengths
 pub(crate) const QUIC_SHA256_SECRET_LENGTH: usize = 32;
-// pub(crate) const QUIC_SHA384_SECRET_LENGTH: usize = 48;
+pub(crate) const QUIC_SHA384_SECRET_LENGTH: usize = 48;
 
 // Key lengths for different AEAD algorithms
 const QUIC_AES128_KEY_LENGTH: usize = 16;
@@ -43,6 +43,7 @@ const SERVER_SECRET_LABEL: &[u8] = b"tls13 server in";
 const QUIC_KEY_LABEL: &[u8] = b"tls13 quic key";
 const QUIC_IV_LABEL: &[u8] = b"tls13 quic iv";
 const QUIC_HP_LABEL: &[u8] = b"tls13 quic hp";
+const QUIC_UPDATE_LABEL: &[u8] = b"tls13 quic ku";
 
 // Initial salt for QUIC version 1 (RFC 9001)
 const QUIC_V1_SALT: [u8; 20] = [
@@ -58,6 +59,13 @@ const QUIC_RETRY_NONCE: [u8; 12] = [
     0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
 ];
 
+#[derive(Copy, Clone)]
+pub(crate) enum DecryptKeyMode {
+    Last,
+    Current,
+    Next,
+}
+
 #[derive(Default, Debug)]
 pub(crate) struct QuicCrypto {
     initial_client: QuicKeys,
@@ -66,6 +74,12 @@ pub(crate) struct QuicCrypto {
     handshake_server: QuicKeys,
     application_client: QuicKeys,
     application_server: QuicKeys,
+
+    last_secret_client: Vec<u8>, // For generating the next keys
+    last_secret_server: Vec<u8>,
+    next_key_client: Option<QuicKeys>,
+    next_key_server: Option<QuicKeys>,
+    last_key_server: Option<QuicKeys>, // For reorder old packets
 }
 
 #[derive(Default, Debug, Clone)]
@@ -191,6 +205,69 @@ impl QuicCrypto {
             &prk_client_initial,
             &prk_server_initial,
         )?;
+
+        Ok(())
+    }
+
+    pub(crate) fn is_last_key_available(&self) -> bool {
+        self.last_key_server.is_some()
+    }
+
+    pub(crate) fn is_key_available(&self, level: QuicLevel) -> bool {
+        match level {
+            QuicLevel::Initial => !self.initial_client.key.0.is_empty(),
+            QuicLevel::Handshake => !self.handshake_client.key.0.is_empty(),
+            QuicLevel::Application => !self.application_client.key.0.is_empty(),
+        }
+    }
+
+    pub(crate) fn discard_last_key(&mut self) {
+        self.last_key_server = None;
+    }
+
+    pub(crate) fn discard_keys(&mut self, level: QuicLevel) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9001#section-4.9
+        info!("Discarding {:?} secrets", level);
+
+        let client_keys = match level {
+            QuicLevel::Initial => &mut self.initial_client,
+            QuicLevel::Handshake => &mut self.handshake_client,
+            QuicLevel::Application => &mut self.application_client,
+        };
+
+        let server_keys = match level {
+            QuicLevel::Initial => &mut self.initial_server,
+            QuicLevel::Handshake => &mut self.handshake_server,
+            QuicLevel::Application => &mut self.application_server,
+        };
+
+        client_keys.key.0 = vec![];
+        server_keys.key.0 = vec![];
+
+        Ok(())
+    }
+
+    pub(crate) fn create_secrets(
+        &mut self,
+        cipher: u16,
+        level: QuicLevel,
+        client_secret: &[u8],
+        server_secret: &[u8],
+    ) -> Result<()> {
+        let hash_algo = match cipher {
+            TLS_AES_256_GCM_SHA384 => HKDF_SHA384,
+            TLS_AES_128_GCM_SHA256 => HKDF_SHA256,
+            _ => return Err(anyhow!("Unsupported TLS cipher_suite {:x}", cipher)),
+        };
+        let prk_client = Prk::new_less_safe(hash_algo, client_secret);
+        let prk_server = Prk::new_less_safe(hash_algo, server_secret);
+
+        if matches!(level, QuicLevel::Application) {
+            self.last_secret_client = client_secret.to_vec();
+            self.last_secret_server = server_secret.to_vec();
+        }
+
+        self.create_quic_secrets(level, cipher, &prk_client, &prk_server)?;
 
         Ok(())
     }
@@ -390,13 +467,14 @@ impl QuicCrypto {
         Ok(())
     }
 
-    pub fn decrypt_packet(
-        &mut self,
+    pub(crate) fn decrypt_packet(
+        &self,
         level: QuicLevel,
         cipher: u16,
         encrypted_text: &[u8],
         aad: &[u8],
         packet_num: u64,
+        mode: DecryptKeyMode,
     ) -> Result<Vec<u8>> {
         // Construct AEAD nonce by XORing padded packet number with IV
         // As specified in RFC 9001 Section 5.3:
@@ -410,7 +488,14 @@ impl QuicCrypto {
         let server_keys = match level {
             QuicLevel::Initial => &self.initial_server,
             QuicLevel::Handshake => &self.handshake_server,
-            QuicLevel::Application => &self.application_server,
+            QuicLevel::Application => match mode {
+                DecryptKeyMode::Current => &self.application_server,
+                DecryptKeyMode::Last => self
+                    .last_key_server
+                    .as_ref()
+                    .expect("Must have last key, since we checked it before call"),
+                DecryptKeyMode::Next => self.next_key_server.as_ref().expect("Must have next key"),
+            },
         };
 
         nonce
@@ -419,8 +504,8 @@ impl QuicCrypto {
             .for_each(|(nonce, iv)| {
                 *nonce ^= *iv;
             });
-        trace!("Computed AEAD nonce for decryption: {:x?}", nonce);
 
+        trace!("Computed AEAD nonce for decryption: {:x?}", nonce);
         trace!("Decryption AAD length: {}, content: {:x?}", aad.len(), aad);
 
         // Select AEAD algorithm based on cipher suite
@@ -443,7 +528,7 @@ impl QuicCrypto {
                 aead::Aad::from(aad),
                 &mut in_out_buffer,
             )
-            .map_err(|e| anyhow!("Decryption failed: {e}"))?;
+            .map_err(|e| anyhow!(e))?;
 
         trace!(
             "Decryption complete - input length: {}, output length: {}, first 30 bytes: {:x?}",
@@ -465,7 +550,7 @@ impl QuicCrypto {
         Ok(in_out_buffer)
     }
 
-    pub fn remove_header_protection(
+    pub(crate) fn remove_header_protection(
         &mut self,
         level: QuicLevel,
         cursor: &Cursor<&[u8]>,
@@ -558,5 +643,120 @@ impl QuicCrypto {
             .map_err(|e| anyhow!("Failed to append retry tag: {e}"))?;
 
         Ok(computed_tag == received_tag)
+    }
+
+    pub(crate) fn switch_keys(&mut self, cipher: u16) -> Result<(Vec<u8>, Vec<u8>)> {
+        if self.last_key_server.is_some() {
+            warn!("The last keys haven't been retired yet, but the new key update is coming");
+        }
+
+        let client_key = self.last_secret_client.clone();
+        let server_key = self.last_secret_server.clone();
+
+        self.last_key_server = Some(self.application_server.clone());
+        self.application_server = self
+            .next_key_server
+            .take()
+            .ok_or_else(|| anyhow!("Should have server update keys"))?;
+        self.application_client = self
+            .next_key_client
+            .take()
+            .ok_or_else(|| anyhow!("Should have client update keys"))?;
+
+        self.quic_secrets_update(cipher)?;
+
+        info!("Switched keys successfully");
+
+        Ok((client_key, server_key))
+    }
+
+    pub(crate) fn quic_secrets_update(&mut self, cipher: u16) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9001.html#section-6.1
+        // The header protection key is not updated
+        // secret_<n+1> = HKDF-Expand-Label(secret_<n>, "quic ku", "", Hash.length)
+
+        if self.next_key_client.is_some() {
+            warn!("Trying to update QUIC keys, but client next keys exist");
+        }
+
+        if self.next_key_server.is_some() {
+            warn!("Trying to update QUIC keys, but server next keys exist");
+        }
+
+        let (hash_algo, hash_size, key_length) = match cipher {
+            TLS_AES_256_GCM_SHA384 => (
+                HKDF_SHA384,
+                QUIC_SHA384_SECRET_LENGTH,
+                QUIC_AES256_KEY_LENGTH,
+            ),
+            TLS_AES_128_GCM_SHA256 => (
+                HKDF_SHA256,
+                QUIC_SHA256_SECRET_LENGTH,
+                QUIC_AES128_KEY_LENGTH,
+            ),
+            _ => return Err(anyhow!("Unsupported TLS cipher_suite {:x}", cipher)),
+        };
+
+        let mut client_keys = QuicKeys::default();
+        let hp = self
+            .application_client
+            .hp
+            .as_ref()
+            .ok_or_else(|| anyhow!("Failed to update keys, due to lack of client hp key",))?;
+
+        client_keys.hp = Some(hp.clone());
+
+        let prk_last_client = Prk::new_less_safe(hash_algo, &self.last_secret_client);
+
+        let mut update_secret = vec![0u8; hash_size];
+        hkdf_expand(&prk_last_client, &mut update_secret, QUIC_UPDATE_LABEL, &[])?;
+        trace!(
+            "Update key, client secret {:x?}, last secret {:x?}",
+            update_secret,
+            &self.last_secret_client
+        );
+
+        let prk_client = Prk::new_less_safe(hash_algo, &update_secret);
+
+        client_keys.key.0.extend(vec![0u8; key_length]);
+        hkdf_expand(&prk_client, &mut client_keys.key.0, QUIC_KEY_LABEL, &[])?;
+        hkdf_expand(&prk_client, &mut client_keys.iv.0, QUIC_IV_LABEL, &[])?;
+
+        self.last_secret_client = update_secret;
+        self.next_key_client = Some(client_keys);
+
+        let mut server_keys = QuicKeys::default();
+        let hp = self
+            .application_server
+            .hp
+            .as_ref()
+            .ok_or_else(|| anyhow!("Failed to update keys, due to lack of server hp key",))?;
+
+        server_keys.hp = Some(hp.clone());
+
+        let prk_last_server = Prk::new_less_safe(hash_algo, &self.last_secret_server);
+
+        let mut update_secret = vec![0u8; hash_size];
+        hkdf_expand(&prk_last_server, &mut update_secret, QUIC_UPDATE_LABEL, &[])?;
+        info!(
+            "Update key, server secret {:x?}, last secret {:x?}",
+            update_secret, &self.last_secret_server
+        );
+
+        let prk_server = Prk::new_less_safe(hash_algo, &update_secret);
+
+        server_keys.key.0.extend(vec![0u8; key_length]);
+        hkdf_expand(&prk_server, &mut server_keys.key.0, QUIC_KEY_LABEL, &[])?;
+        hkdf_expand(&prk_server, &mut server_keys.iv.0, QUIC_IV_LABEL, &[])?;
+
+        self.last_secret_server = update_secret;
+        self.next_key_server = Some(server_keys);
+
+        info!(
+            "Now we update keys, client keys {:?}, server keys {:?}",
+            self.next_key_client, self.next_key_server
+        );
+
+        Ok(())
     }
 }

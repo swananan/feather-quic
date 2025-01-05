@@ -331,10 +331,9 @@ impl IoUringEventLoop {
         const BUF_GROUP_ID: u16 = 0xdead;
 
         self.create_and_sumbit_provide_buffers_event(&mut sq, BUF_GROUP_ID, udp_fd)?;
-        self.create_and_sumbit_timer_event(
-            &mut sq,
-            Duration::from_millis(qconn.get_idle_timeout()),
-        )?;
+        if let Some(timeout) = qconn.next_time() {
+            self.create_and_sumbit_timer_event(&mut sq, Duration::from_millis(timeout))?;
+        }
 
         let mut connect_done_trigger = false;
         loop {
@@ -375,6 +374,15 @@ impl IoUringEventLoop {
                         trace!("Timer expired after {:?}", token);
                         self.token_alloc.remove(token_index);
                         self.timer_context.token_index = None;
+
+                        qconn.run_timer()?;
+                        if let Some(timeout) = qconn.next_time() {
+                            trace!("Updating idle timeout to {}ms", timeout);
+                            self.create_and_sumbit_timer_event(
+                                &mut sq,
+                                Duration::from_millis(timeout),
+                            )?;
+                        }
                     }
                     Token::ProvideBuffers { group_id, fd } => {
                         trace!("Initializing buffer group");
@@ -405,9 +413,6 @@ impl IoUringEventLoop {
                         self.bufpool.push(buf_index);
                     }
                     Token::ReadMulti { fd } => {
-                        let cur_buf_index = cqueue::buffer_select(flags)
-                            .ok_or_else(|| anyhow!("Should get buf index, flag {}", flags))?;
-
                         let more = cqueue::more(flags);
                         if !more {
                             self.create_and_sumbit_provide_buffers_event(
@@ -429,6 +434,9 @@ impl IoUringEventLoop {
                             self.token_alloc.remove(token_index);
                             continue;
                         }
+
+                        let cur_buf_index = cqueue::buffer_select(flags)
+                            .ok_or_else(|| anyhow!("Should get buf index, flag {}", flags))?;
 
                         let read_len = ret as usize;
                         trace!(

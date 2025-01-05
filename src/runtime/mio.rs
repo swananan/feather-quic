@@ -55,7 +55,10 @@ impl MioEventLoop {
         let mut poll = Poll::new()?;
         let mut events = Events::with_capacity(5);
 
-        quic_timer.set_timeout(&Duration::from_millis(qconn.get_idle_timeout()))?;
+        if let Some(timeout) = qconn.next_time() {
+            trace!("Update timeout {}ms firstly", timeout);
+            quic_timer.set_timeout(&Duration::from_millis(timeout))?;
+        }
         let mut client_socket = self.create_client_socket()?;
 
         poll.registry()
@@ -148,8 +151,11 @@ impl MioEventLoop {
                     QUIC_TIMER_TOKEN => {
                         if let Ok(real_timeout) = quic_timer.read() {
                             warn!("Timer event triggered {} times!", real_timeout);
-                            // TODO: Process QUIC timer events and update as needed
-                            // qconn.run_timer()?;
+                            qconn.run_timer()?;
+                            if let Some(timeout) = qconn.next_time() {
+                                trace!("Update timeout {}ms", timeout);
+                                quic_timer.set_timeout(&Duration::from_millis(timeout))?;
+                            }
                         }
                     }
                     _ => {
