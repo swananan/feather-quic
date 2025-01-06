@@ -9,6 +9,8 @@ feather-quic 是一个个人实验性质项目，使用 Rust 实现 QUIC 协议�
 
 [用 Rust 从零开始写 QUIC：Runtime](https://jt26wzz.com/posts/0002-implement-quic-in-rust-runtime/)
 
+[用 Rust 从零开始实现 QUIC：尝试深入分析 QUIC 握手😂](https://jt26wzz.com/posts/0003-implement-quic-in-rust/)
+
 未完待续
 
 ---
