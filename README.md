@@ -11,6 +11,8 @@ Feather-QUIC is a personal experimental project aimed at implementing the QUIC p
 
 [Implementing QUIC from Scratch with Rust: Trying to analyse and implement QUIC Handshake 😂](https://jt26wzz.com/en/posts/0003-implement-quic-in-rust-en/)
 
+[Implementing QUIC from Scratch with Rust: Implement TLS 1.3 Handshake and QUIC-TLS Key Update](https://jt26wzz.com/en/posts/0004-implement-quic-in-rust-en/)
+
 To be continued
 
 ---
