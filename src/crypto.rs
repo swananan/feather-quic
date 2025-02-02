@@ -59,6 +59,8 @@ const QUIC_RETRY_NONCE: [u8; 12] = [
     0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
 ];
 
+const QUIC_PN_LENGTH_MASK: u8 = 0x3;
+
 #[derive(Copy, Clone)]
 pub(crate) enum DecryptKeyMode {
     Last,
@@ -594,7 +596,7 @@ impl QuicCrypto {
         trace!("Flag after removing protection: {:x?}", flag);
 
         // Extract and unprotect packet number
-        let pn_length = (flag & 0x02) + 1;
+        let pn_length = (flag & QUIC_PN_LENGTH_MASK) + 1;
         let mut pn_buf = [0u8; MAX_PACKET_NUMBER_LENGTH];
         let start = 4 - pn_length;
         pn_buf[start as usize..].copy_from_slice(
