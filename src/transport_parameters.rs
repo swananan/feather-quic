@@ -4,7 +4,7 @@ use byteorder::{BigEndian, WriteBytesExt};
 use std::fmt;
 use std::io::{Cursor, Read, Seek, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use tracing::trace;
+use tracing::{error, trace, warn};
 
 use crate::config::QuicConfig;
 use crate::utils::{decode_variable_length, encode_variable_length, get_variable_length};
@@ -46,7 +46,11 @@ pub(crate) enum TransportParameter {
 
     AckDelayExponent(u8),
 
-    MaxAckDelay(u16), // in milliseconds
+    // The maximum acknowledgment delay is an integer value indicating the maximum amount of time in milliseconds by
+    // which the endpoint will delay sending acknowledgments. This value SHOULD include the receiver's expected delays in alarms firing.
+    // For example, if a receiver sets a timer for 5ms and alarms commonly fire up to 1ms late, then it should send a max_ack_delay of 6ms.
+    // If this value is absent, a default of 25 milliseconds is assumed. Values of 1 << 14 or greater are invalid.
+    MaxAckDelay(u16),
 
     DisableActiveMigration(bool),
 
@@ -157,7 +161,7 @@ impl TransportParameter {
         }
     }
 
-    pub(crate) fn deserialize(cursor: &mut Cursor<&[u8]>) -> Result<TransportParameter> {
+    pub(crate) fn deserialize(cursor: &mut Cursor<&[u8]>) -> Result<Option<TransportParameter>> {
         let type_id = cursor.read_u8()?;
         trace!(
             "Deserializing transport parameter type 0x{:02x} at position {}",
@@ -331,6 +335,11 @@ impl TransportParameter {
                     value,
                     cursor.position()
                 );
+                if value > 20 {
+                    return Err(anyhow!(
+                        "ack_delay_exponent value {value} is not valid, must below 20"
+                    ));
+                }
                 TransportParameter::AckDelayExponent(value as u8)
             }
             0x0B => {
@@ -341,6 +350,11 @@ impl TransportParameter {
                     cursor.position()
                 );
                 let value = decode_variable_length(cursor)?;
+                if value >= 1 << 14 {
+                    return Err(anyhow!(
+                        "max_ack_delay value {value} is not valid, must greater then 213"
+                    ));
+                }
                 trace!(
                     "MaxAckDelay value {} at position {}",
                     value,
@@ -407,11 +421,22 @@ impl TransportParameter {
                 );
                 TransportParameter::RetrySourceConnectionId(value)
             }
-            _ => return Err(anyhow!("Invalid transport parameter type id: {}", type_id)),
+            _ => {
+                // TODO: Could be version_infomation parameter
+                // https://www.rfc-editor.org/info/rfc9368
+                // or Ack frequency
+                // https://datatracker.ietf.org/doc/html/draft-ietf-quic-ack-frequency
+                error!(
+                    "Invalid or unsupported transport parameter type id: 0x{:x}",
+                    type_id,
+                );
+
+                return Ok(None);
+            }
         };
 
         trace!("Completed deserializing transport parameter {:?}", tp);
-        Ok(tp)
+        Ok(Some(tp))
     }
 
     // https://www.rfc-editor.org/rfc/rfc9000.html#section-18
@@ -541,8 +566,13 @@ pub(crate) fn parse_server_transport_parameters(
     );
 
     while cursor.position() - tp_start_pos < length as u64 {
-        let t = TransportParameter::deserialize(cursor)?;
-        tp.push(t);
+        if let Some(t) = TransportParameter::deserialize(cursor)? {
+            tp.push(t);
+        } else {
+            warn!("We will skip the next QUIC parameters due to the current invalid or unsupported parameter");
+            cursor.set_position(length as u64 + tp_start_pos);
+            break;
+        }
     }
 
     if cursor.position() != tp_start_pos + (length as u64) {

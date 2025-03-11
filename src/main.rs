@@ -1,15 +1,17 @@
 use anyhow::{Context, Result};
 use clap::{Arg, Command};
 use clap_num::number_range;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use tracing::{info, trace};
 use tracing_subscriber::EnvFilter;
 
+mod ack;
 mod config;
 mod connection;
 mod crypto;
 mod frame;
 mod packet;
+mod rtt;
 mod runtime;
 mod send;
 mod tls;
@@ -18,7 +20,7 @@ mod utils;
 
 use crate::config::{QuicConfig, DEFAULT_INITIAL_PACKET_SIZE};
 use crate::connection::QuicConnection;
-use crate::runtime::{QuicCallbacks, QuicRuntime, QuicUserContext};
+use crate::runtime::{QuicCallbacks, QuicRuntime, QuicUserContext, RuntimeConfig};
 
 fn limitation_initial_packet_size(s: &str) -> Result<u16, String> {
     number_range(s, DEFAULT_INITIAL_PACKET_SIZE, u16::MAX)
@@ -78,6 +80,16 @@ impl QuicCallbacks for FeatherQuicClientContext {
         // TODO: Resume sending data if previously blocked since QUIC stack send queue is full
         Ok(())
     }
+}
+
+fn validate_rate(s: &str) -> Result<f32, String> {
+    let rate: f32 = s
+        .parse()
+        .map_err(|_| format!("Invalid float value: {}", s))?;
+    if !(0.0..=1.0).contains(&rate) {
+        return Err(format!("Rate must be between 0.0 and 1.0, got {}", rate));
+    }
+    Ok(rate)
 }
 
 fn main() -> Result<()> {
@@ -226,6 +238,69 @@ fn main() -> Result<()> {
                     (default: disabled)")
                 .value_parser(more_then_zero),
         )
+        .arg(
+            Arg::new("max_quic_packet_send_count")
+                .long("max-quic-packet-send-count")
+                .help("Maximum number of QUIC packets that can be sent by this client. \
+                    This is a testing parameter that artificially limits packet transmission. \
+                    When the limit is reached, the connection will be closed. \
+                    By default, there is no limit.")
+                .value_parser(clap::value_parser!(u64)),
+        )
+        .arg(
+            Arg::new("packet_loss_rate")
+                .long("loss-rate")
+                .help("Packet loss rate (0.0 - 1.0) for both sending and receiving. \
+                    Will be overridden by --send-loss-rate or --recv-loss-rate if specified")
+                .value_parser(validate_rate),
+        )
+        .arg(
+            Arg::new("send_packet_loss_rate")
+                .long("send-loss-rate")
+                .help("Packet loss rate (0.0 - 1.0) for sending packets. \
+                    Takes precedence over --loss-rate")
+                .value_parser(validate_rate),
+        )
+        .arg(
+            Arg::new("recv_packet_loss_rate")
+                .long("recv-loss-rate")
+                .help("Packet loss rate (0.0 - 1.0) for receiving packets. \
+                    Takes precedence over --loss-rate")
+                .value_parser(validate_rate),
+        )
+        .arg(
+            Arg::new("packet_reorder_rate")
+                .long("reorder-rate")
+                .help("Packet reorder rate (0.0 - 1.0) for both sending and receiving. \
+                    Will be overridden by --send-reorder-rate or --recv-reorder-rate if specified")
+                .value_parser(validate_rate),
+        )
+        .arg(
+            Arg::new("send_packet_reorder_rate")
+                .long("send-reorder-rate")
+                .help("Packet reorder rate (0.0 - 1.0) for sending packets. \
+                    Takes precedence over --reorder-rate")
+                .value_parser(validate_rate),
+        )
+        .arg(
+            Arg::new("recv_packet_reorder_rate")
+                .long("recv-reorder-rate")
+                .help("Packet reorder rate (0.0 - 1.0) for receiving packets. \
+                    Takes precedence over --reorder-rate")
+                .value_parser(validate_rate),
+        )
+        .arg(
+            Arg::new("reorder_queue_size")
+                .long("reorder-queue-size")
+                .help("Maximum size of the packet reordering queue (default: 32)")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("reorder_delay_ms")
+                .long("reorder-delay")
+                .help("Maximum delay in milliseconds for reordered packets (default: 10) Not implemented yet!")
+                .value_parser(clap::value_parser!(u64)),
+        )
         .get_matches();
 
     let env_filter = EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()));
@@ -236,7 +311,8 @@ fn main() -> Result<()> {
     let target_address = matches.get_one::<String>("target_address").unwrap().clone();
 
     let target_addr: SocketAddr = target_address
-        .parse()
+        .to_socket_addrs()?
+        .next()
         .with_context(|| format!("Invalid target address: {}", target_address))?;
 
     if let Some(idle_timeout) = matches.get_one::<u64>("idle_timeout") {
@@ -264,7 +340,7 @@ fn main() -> Result<()> {
     if let Some(sn) = matches.get_one::<String>("server_name") {
         config.set_server_name(sn);
     } else {
-        config.set_server_name(target_address);
+        config.set_server_name(target_address.split(':').next().unwrap_or(&target_address));
     }
 
     if let Some(original_dcid) = matches.get_one::<Vec<u8>>("original_dcid") {
@@ -319,10 +395,59 @@ fn main() -> Result<()> {
         config.set_trigger_key_update(*value);
     }
 
-    let mut qconn = QuicConnection::new(config);
+    let max_quic_packet_send_count = matches
+        .get_one::<u64>("max_quic_packet_send_count")
+        .copied();
 
-    let mut runtime = QuicRuntime::new(use_io_uring, target_addr);
+    let loss_rate = matches.get_one::<f32>("packet_loss_rate").copied();
+
+    let send_loss_rate = matches
+        .get_one::<f32>("send_packet_loss_rate")
+        .copied()
+        .or(loss_rate);
+
+    let recv_loss_rate = matches
+        .get_one::<f32>("recv_packet_loss_rate")
+        .copied()
+        .or(loss_rate);
+
+    let reorder_rate = matches.get_one::<f32>("packet_reorder_rate").copied();
+
+    let send_reorder_rate = matches
+        .get_one::<f32>("send_packet_reorder_rate")
+        .copied()
+        .or(reorder_rate);
+
+    let recv_reorder_rate = matches
+        .get_one::<f32>("recv_packet_reorder_rate")
+        .copied()
+        .or(reorder_rate);
+
+    /* let reorder_queue_size = matches
+        .get_one::<usize>("reorder_queue_size")
+        .copied()
+        .unwrap_or(32);
+
+    let reorder_delay_ms = matches
+        .get_one::<u64>("reorder_delay_ms")
+        .copied()
+        .unwrap_or(10); */
+
+    let runtime_config = RuntimeConfig {
+        use_io_uring,
+        max_quic_packet_send_count,
+        tx_packet_loss_rate: send_loss_rate,
+        rx_packet_loss_rate: recv_loss_rate,
+        tx_packet_reorder_rate: send_reorder_rate,
+        rx_packet_reorder_rate: recv_reorder_rate,
+        io_uring_capacity: 256,
+        buffer_size: 1 << 16,
+        target_address: target_addr,
+    };
+
+    let mut qconn = QuicConnection::new(config);
     let mut uctx = QuicUserContext::new(FeatherQuicClientContext::default());
+    let mut runtime = QuicRuntime::new(runtime_config);
 
     runtime.run(&mut qconn, &mut uctx)?;
 

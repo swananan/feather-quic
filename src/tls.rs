@@ -17,7 +17,7 @@ use crate::transport_parameters::{
     create_client_transport_parameters, parse_server_transport_parameters,
     search_transport_parameters, TransportParameter,
 };
-use crate::utils::{get_remain_length, write_cursor_bytes_with_pos};
+use crate::utils::{remaining_bytes, write_cursor_bytes_with_pos};
 
 // Algorithm used in QUIC initial phase
 pub(crate) const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
@@ -324,6 +324,26 @@ impl TlsContext {
         })
         .map(|t| match t {
             TransportParameter::MaxIdleTimeout(tt) => *tt,
+            _ => panic!(),
+        })
+    }
+
+    pub(crate) fn get_peer_max_ack_delay(&self) -> Option<u16> {
+        search_transport_parameters(self.s_tp.as_ref()?, |item| {
+            matches!(item, TransportParameter::MaxAckDelay(_))
+        })
+        .map(|t| match t {
+            TransportParameter::MaxAckDelay(tt) => *tt,
+            _ => panic!(),
+        })
+    }
+
+    pub(crate) fn get_peer_ack_delay_exponent(&self) -> Option<u8> {
+        search_transport_parameters(self.s_tp.as_ref()?, |item| {
+            matches!(item, TransportParameter::AckDelayExponent(_))
+        })
+        .map(|t| match t {
+            TransportParameter::AckDelayExponent(tt) => *tt,
             _ => panic!(),
         })
     }
@@ -949,13 +969,7 @@ impl TlsContext {
             .checked_sub(1)
             .ok_or_else(|| anyhow!("Cursor position underflowed {}", cursor.position()))?;
         let length = cursor.read_u24::<BigEndian>()?;
-        let remain_bytes = get_remain_length(cursor).ok_or_else(|| {
-            anyhow!(
-                "Bad cursor from finished message, position {}, all size {}",
-                cursor.position(),
-                cursor.get_ref().len()
-            )
-        })?;
+        let remain_bytes = remaining_bytes(cursor)?;
 
         if length > remain_bytes as u32 {
             info!(
@@ -1007,13 +1021,7 @@ impl TlsContext {
             .checked_sub(1)
             .ok_or_else(|| anyhow!("Cursor position underflowed {}", cursor.position()))?;
         let length = cursor.read_u24::<BigEndian>()?;
-        let remain_bytes = get_remain_length(cursor).ok_or_else(|| {
-            anyhow!(
-                "Bad cursor from new session ticket message, position {}, all size {}",
-                cursor.position(),
-                cursor.get_ref().len()
-            )
-        })?;
+        let remain_bytes = remaining_bytes(cursor)?;
 
         if length > remain_bytes as u32 {
             info!(
@@ -1046,13 +1054,7 @@ impl TlsContext {
             .checked_sub(1)
             .ok_or_else(|| anyhow!("Cursor position underflowed {}", cursor.position()))?;
         let length = cursor.read_u24::<BigEndian>()?;
-        let remain_bytes = get_remain_length(cursor).ok_or_else(|| {
-            anyhow!(
-                "Bad cursor from cerificate message, position {}, all size {}",
-                cursor.position(),
-                cursor.get_ref().len()
-            )
-        })?;
+        let remain_bytes = remaining_bytes(cursor)?;
 
         if length > remain_bytes as u32 {
             info!(
@@ -1092,13 +1094,7 @@ impl TlsContext {
             .checked_sub(1)
             .ok_or_else(|| anyhow!("Cursor position underflowed {}", cursor.position()))?;
         let length = cursor.read_u24::<BigEndian>()?;
-        let remain_bytes = get_remain_length(cursor).ok_or_else(|| {
-            anyhow!(
-                "Invalid cursor position in certificate verify message (position: {}, size: {})",
-                cursor.position(),
-                cursor.get_ref().len()
-            )
-        })?;
+        let remain_bytes = remaining_bytes(cursor)?;
 
         if length > remain_bytes as u32 {
             info!(
@@ -1154,13 +1150,7 @@ impl TlsContext {
             .ok_or_else(|| anyhow!("Cursor position underflowed {}", cursor.position()))?;
         let length = cursor.read_u24::<BigEndian>()?;
 
-        let remain_bytes = get_remain_length(cursor).ok_or_else(|| {
-            anyhow!(
-                "Invalid cursor position in server hello message (position: {}, size: {})",
-                cursor.position(),
-                cursor.get_ref().len()
-            )
-        })?;
+        let remain_bytes = remaining_bytes(cursor)?;
 
         if length > remain_bytes as u32 {
             info!(
@@ -1282,13 +1272,7 @@ impl TlsContext {
             .checked_sub(1)
             .ok_or_else(|| anyhow!("Cursor position underflowed {}", cursor.position()))?;
         let length = cursor.read_u24::<BigEndian>()?;
-        let remain_bytes = get_remain_length(cursor).ok_or_else(|| {
-            anyhow!(
-                "Invalid cursor position in encrypted extensions (position: {}, size: {})",
-                cursor.position(),
-                cursor.get_ref().len()
-            )
-        })?;
+        let remain_bytes = remaining_bytes(cursor)?;
 
         if length > remain_bytes as u32 {
             info!(
