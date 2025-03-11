@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use rand::Rng;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::net::UdpSocket;
@@ -15,7 +16,7 @@ use crate::QuicConnection;
 
 #[derive(Clone)]
 enum Token {
-    Timer,
+    Timer { fd: RawFd },
     TimerUpdate { ts: Timespec },
     ReadMulti { fd: RawFd },
     Write { buf_index: usize, datagram_len: u16 },
@@ -25,7 +26,7 @@ enum Token {
 impl Debug for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Token::Timer => write!(f, "Token::Timer "),
+            Token::Timer { fd } => write!(f, "Token::Timer fd {}", fd),
             Token::TimerUpdate { ts } => write!(f, "Token::TimerUpdate {{ ts {:?} }}", ts),
             Token::ReadMulti { fd } => write!(f, "Token::ReadMulti {{ fd: {} }}", fd),
             Token::Write {
@@ -81,10 +82,22 @@ pub struct IoUringEventLoop {
     token_alloc: Slab<Token>,
     timer_context: TimerContext,
     capacity: usize,
+    max_quic_packet_send_count: Option<u64>,
+    sent_cnt: u64,
+    tx_packet_loss_rate: Option<f32>,
+    rx_packet_loss_rate: Option<f32>,
+    rng: rand::rngs::ThreadRng,
 }
 
 impl IoUringEventLoop {
-    pub fn with_capacity(capacity: usize, buffer_size: usize, target_address: SocketAddr) -> Self {
+    pub fn with_capacity(
+        capacity: usize,
+        buffer_size: usize,
+        target_address: SocketAddr,
+        max_quic_packet_send_count: Option<u64>,
+        tx_packet_loss_rate: Option<f32>,
+        rx_packet_loss_rate: Option<f32>,
+    ) -> Self {
         const MULTI_BUFFER_CNT: u16 = 20;
         Self {
             capacity,
@@ -96,6 +109,11 @@ impl IoUringEventLoop {
             read_bufs_cnt: MULTI_BUFFER_CNT,
             token_alloc: Slab::with_capacity(capacity),
             timer_context: TimerContext::new(),
+            max_quic_packet_send_count,
+            sent_cnt: 0,
+            tx_packet_loss_rate,
+            rx_packet_loss_rate,
+            rng: rand::thread_rng(),
         }
     }
 
@@ -137,8 +155,9 @@ impl IoUringEventLoop {
         &mut self,
         sq: &mut SubmissionQueue<'_>,
         timeout: Duration,
+        fd: i32,
     ) -> Result<()> {
-        let token_index = self.token_alloc.insert(Token::Timer);
+        let token_index = self.token_alloc.insert(Token::Timer { fd });
         let ts = Timespec::new()
             .sec(timeout.as_secs())
             .nsec(timeout.subsec_nanos());
@@ -221,6 +240,22 @@ impl IoUringEventLoop {
         Ok(())
     }
 
+    fn should_drop_tx_packet(&mut self) -> bool {
+        if let Some(packet_loss_rate) = self.tx_packet_loss_rate {
+            self.rng.gen::<f32>() < packet_loss_rate
+        } else {
+            false
+        }
+    }
+
+    fn should_drop_rx_packet(&mut self) -> bool {
+        if let Some(packet_loss_rate) = self.rx_packet_loss_rate {
+            self.rng.gen::<f32>() < packet_loss_rate
+        } else {
+            false
+        }
+    }
+
     fn create_and_sumbit_write_event<F>(
         &mut self,
         sq: &mut SubmissionQueue<'_>,
@@ -230,6 +265,18 @@ impl IoUringEventLoop {
     where
         F: FnOnce(&mut Vec<u8>) -> Result<u16>,
     {
+        if let Some(limit) = self.max_quic_packet_send_count {
+            if limit <= self.sent_cnt {
+                return Ok(());
+            }
+        }
+
+        if self.should_drop_tx_packet() {
+            trace!("Simulating TX packet loss - dropping QUIC packet");
+            self.sent_cnt += 1;
+            return Ok(());
+        }
+
         let (buf_index, buf) = match self.bufpool.pop() {
             Some(buf_index) => (buf_index, &mut self.buf_alloc[buf_index]),
             None => {
@@ -252,6 +299,7 @@ impl IoUringEventLoop {
         let send_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), write_len as u32)
             .build()
             .user_data(token_index as u64);
+        self.sent_cnt += 1;
 
         trace!(
             "Attempting to submit write operation, length: {}, token index: {}",
@@ -263,6 +311,16 @@ impl IoUringEventLoop {
         unsafe { sq.push(&send_e)? }
 
         sq.sync();
+        Ok(())
+    }
+
+    fn add_timer(&mut self, sq: &mut SubmissionQueue<'_>, udp_fd: i32, timeout: u64) -> Result<()> {
+        trace!("updating idle timeout to {}ns", timeout);
+        if self.timer_context.token_index.is_some() {
+            self.update_and_sumbit_timer_event(sq, Duration::from_micros(timeout))?;
+        } else {
+            self.create_and_sumbit_timer_event(sq, Duration::from_micros(timeout), udp_fd)?;
+        }
         Ok(())
     }
 
@@ -323,16 +381,25 @@ impl IoUringEventLoop {
                 .consume_data()
                 .expect("Should have first initial QUIC packet");
 
-            buf.clear();
-            buf.extend(udp_sndbuf);
-            Ok(buf.len() as u16)
+            // Should not change the buf size, just use this buf
+            let snd_len = udp_sndbuf.len();
+            trace!(
+                "First write event, buf size {}, datagram len {}",
+                buf.len(),
+                snd_len
+            );
+            buf[..snd_len].copy_from_slice(&udp_sndbuf[..]);
+            Ok(snd_len as u16)
         })?;
 
         const BUF_GROUP_ID: u16 = 0xdead;
 
         self.create_and_sumbit_provide_buffers_event(&mut sq, BUF_GROUP_ID, udp_fd)?;
         if let Some(timeout) = qconn.next_time() {
-            self.create_and_sumbit_timer_event(&mut sq, Duration::from_millis(timeout))?;
+            trace!("Update timeout to {}ns", timeout);
+            self.add_timer(&mut sq, udp_fd, timeout)?;
+        } else {
+            warn!("Should not trigger the timer process immediately!");
         }
 
         let mut connect_done_trigger = false;
@@ -346,6 +413,8 @@ impl IoUringEventLoop {
 
             cq.sync();
 
+            let mut recv_evt_triggered = false;
+            qconn.update_current_time();
             for cqe in &mut cq {
                 let ret = cqe.result();
                 let flags = cqe.flags();
@@ -365,7 +434,7 @@ impl IoUringEventLoop {
                         trace!("Updating timer to {:?}, result: {ret}", ts);
                         self.token_alloc.remove(token_index);
                     }
-                    Token::Timer => {
+                    Token::Timer { fd } => {
                         let timer_token_index = self
                             .timer_context
                             .token_index
@@ -377,11 +446,35 @@ impl IoUringEventLoop {
 
                         qconn.run_timer()?;
                         if let Some(timeout) = qconn.next_time() {
-                            trace!("Updating idle timeout to {}ms", timeout);
-                            self.create_and_sumbit_timer_event(
-                                &mut sq,
-                                Duration::from_millis(timeout),
-                            )?;
+                            self.add_timer(&mut sq, udp_fd, timeout)?;
+                        } else {
+                            warn!("Should not trigger the timer process immediately!");
+                        }
+
+                        let buffer_size = self.buffer_size;
+                        while let Some(send_buf) = qconn.consume_data() {
+                            trace!(
+                                "Sending {} bytes to {}, triggered by timer",
+                                send_buf.len(),
+                                self.target_address
+                            );
+                            self.create_and_sumbit_write_event(&mut sq, fd, |buf| {
+                                let snd_len = send_buf.len();
+                                if buf.len() < snd_len {
+                                    warn!(
+                                        "Send buffer size {} insufficient for send buffer {}",
+                                        buffer_size, snd_len
+                                    );
+                                    return Ok(0);
+                                }
+                                buf[..snd_len].copy_from_slice(&send_buf[..]);
+                                Ok(snd_len as u16)
+                            })?;
+                        }
+                        if let Some(timeout) = qconn.next_time() {
+                            self.add_timer(&mut sq, udp_fd, timeout)?;
+                        } else {
+                            warn!("Should not trigger the timer process immediately!");
                         }
                     }
                     Token::ProvideBuffers { group_id, fd } => {
@@ -446,77 +539,70 @@ impl IoUringEventLoop {
                             more
                         );
 
-                        if self.timer_context.token_index.is_some() {
-                            self.update_and_sumbit_timer_event(
-                                &mut sq,
-                                Duration::from_millis(5000),
-                            )?;
-                        } else {
-                            self.create_and_sumbit_timer_event(
-                                &mut sq,
-                                Duration::from_millis(5000),
-                            )?;
+                        if self.should_drop_rx_packet() {
+                            trace!("Simulating RX packet loss - dropping {} bytes", read_len);
+                            continue;
                         }
 
                         let buffer_size = self.buffer_size;
                         let buf_start = buffer_size * cur_buf_index as usize;
                         let read_buf = &mut self.read_bufs[buf_start..buf_start + read_len];
 
-                        qconn.update_current_time();
-
                         qconn.provide_data(read_buf, self.target_address)?;
-
-                        while let Some(send_buf) = qconn.consume_data() {
-                            trace!(
-                                "Sending {} bytes to {}",
-                                send_buf.len(),
-                                self.target_address
-                            );
-                            self.create_and_sumbit_write_event(&mut sq, fd, |buf| {
-                                let snd_len = send_buf.len();
-                                if buf.len() < snd_len {
-                                    warn!(
-                                        "Send buffer size {} insufficient for send buffer {}",
-                                        buffer_size, snd_len
-                                    );
-                                    return Ok(0);
-                                }
-                                buf[..snd_len].copy_from_slice(&send_buf[..snd_len]);
-                                Ok(snd_len as u16)
-                            })?;
-                        }
-
-                        // Update the idle timer
-                        if let Some(timeout) = qconn.next_time() {
-                            trace!("Updating idle timeout to {}ms", timeout);
-                            if self.timer_context.token_index.is_some() {
-                                self.update_and_sumbit_timer_event(
-                                    &mut sq,
-                                    Duration::from_millis(timeout),
-                                )?;
-                            } else {
-                                self.create_and_sumbit_timer_event(
-                                    &mut sq,
-                                    Duration::from_millis(timeout),
-                                )?;
-                            }
-                        }
-
-                        // TODO: When QUIC handshake is completed, client can send some data.
-                        // like HTTP/3 traffic actually
-                        if qconn.is_established() && !connect_done_trigger {
-                            connect_done_trigger = true;
-                            uctx.user_data.connect_done(qconn)?;
-                        }
-
-                        if qconn.is_readable() {
-                            uctx.user_data.read_event(qconn)?;
-                        }
-
-                        if qconn.is_writable() {
-                            uctx.user_data.write_event(qconn)?;
-                        }
+                        recv_evt_triggered = true;
                     }
+                }
+
+                if !recv_evt_triggered {
+                    continue;
+                }
+
+                // update the idle timer
+                if let Some(timeout) = qconn.next_time() {
+                    self.add_timer(&mut sq, udp_fd, timeout)?;
+                } else {
+                    qconn.run_timer()?;
+                    if let Some(timeout) = qconn.next_time() {
+                        self.add_timer(&mut sq, udp_fd, timeout)?;
+                    } else {
+                        warn!("Should not trigger the timer process immediately!");
+                    }
+                }
+
+                let buffer_size = self.buffer_size;
+                while let Some(send_buf) = qconn.consume_data() {
+                    trace!(
+                        "sending {} bytes to {}",
+                        send_buf.len(),
+                        self.target_address
+                    );
+                    self.create_and_sumbit_write_event(&mut sq, udp_fd, |buf| {
+                        let snd_len = send_buf.len();
+                        if buf.len() < snd_len {
+                            warn!(
+                                "send buffer size {} insufficient for send buffer {}",
+                                buffer_size, snd_len
+                            );
+                            return Ok(0);
+                        }
+                        buf[..snd_len].copy_from_slice(&send_buf[..]);
+                        Ok(snd_len as u16)
+                    })?;
+                }
+
+                // todo: when quic handshake is completed, client can send some data.
+                // like http/3 traffic actually
+                if qconn.is_established() && !connect_done_trigger {
+                    connect_done_trigger = true;
+                    uctx.user_data.connect_done(qconn)?;
+                }
+
+                if qconn.is_readable() {
+                    uctx.user_data.read_event(qconn)?;
+                }
+
+                if qconn.is_writable() {
+                    uctx.user_data.write_event(qconn)?;
                 }
             }
         }

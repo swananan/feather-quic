@@ -29,7 +29,7 @@ const QUIC_AES256_HP_LENGTH: usize = 32;
 const QUIC_IV_LENGTH: usize = 12;
 
 // Common lengths for cryptographic operations
-const QUIC_SAMPLE_LENGTH: usize = 16; // Sample size for AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305
+pub(crate) const QUIC_SAMPLE_LENGTH: usize = 16; // Sample size for AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305
 const QUIC_HP_MASK_LENGTH: usize = 5; // Header protection mask length
 const QUIC_NONCE_LENGTH: usize = 12; // AEAD nonce length
 const MAX_PACKET_NUMBER_LENGTH: usize = 4; // Maximum encoded packet number length
@@ -59,7 +59,9 @@ const QUIC_RETRY_NONCE: [u8; 12] = [
     0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
 ];
 
-const QUIC_PN_LENGTH_MASK: u8 = 0x3;
+const QUIC_PN_LENGTH_MASK: u8 = 0x03;
+
+pub(crate) const QUIC_PN_OFFSET: u8 = 4;
 
 #[derive(Copy, Clone)]
 pub(crate) enum DecryptKeyMode {
@@ -81,7 +83,7 @@ pub(crate) struct QuicCrypto {
     last_secret_server: Vec<u8>,
     next_key_client: Option<QuicKeys>,
     next_key_server: Option<QuicKeys>,
-    last_key_server: Option<QuicKeys>, // For reorder old packets
+    last_key_server: Option<QuicKeys>, // For out of order old packets
 }
 
 #[derive(Default, Debug, Clone)]
@@ -413,11 +415,12 @@ impl QuicCrypto {
         let mut cursor = Cursor::new(data);
         let mut sample = [0u8; QUIC_SAMPLE_LENGTH];
         sample.copy_from_slice(
-            &cursor.get_ref()[pn_offset as usize + 4..pn_offset as usize + 4 + QUIC_SAMPLE_LENGTH],
+            &cursor.get_ref()[pn_offset as usize + QUIC_PN_OFFSET as usize
+                ..pn_offset as usize + QUIC_PN_OFFSET as usize + QUIC_SAMPLE_LENGTH],
         );
         trace!(
             "Header protection sample at offset {}: {:x?}",
-            pn_offset + 4,
+            pn_offset + QUIC_PN_OFFSET as u64,
             sample
         );
 
@@ -562,11 +565,12 @@ impl QuicCrypto {
         // Sample is taken from 4 bytes after the start of packet number field
         let mut sample = [0u8; QUIC_SAMPLE_LENGTH];
         sample.copy_from_slice(
-            &cursor.get_ref()[pn_offset as usize + 4..pn_offset as usize + 4 + QUIC_SAMPLE_LENGTH],
+            &cursor.get_ref()[pn_offset as usize + QUIC_PN_OFFSET as usize
+                ..pn_offset as usize + QUIC_PN_OFFSET as usize + QUIC_SAMPLE_LENGTH],
         );
         trace!(
             "Header protection sample at offset {}: {:x?}",
-            pn_offset + 4,
+            pn_offset + QUIC_PN_OFFSET as u64,
             sample
         );
 
@@ -679,10 +683,12 @@ impl QuicCrypto {
 
         if self.next_key_client.is_some() {
             warn!("Trying to update QUIC keys, but client next keys exist");
+            return Ok(());
         }
 
         if self.next_key_server.is_some() {
             warn!("Trying to update QUIC keys, but server next keys exist");
+            return Ok(());
         }
 
         let (hash_algo, hash_size, key_length) = match cipher {

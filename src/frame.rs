@@ -1,12 +1,18 @@
 use anyhow::{anyhow, Result};
 use byteorder::{ReadBytesExt, WriteBytesExt};
+use std::cmp::Ordering;
+use std::collections::VecDeque;
+use std::fmt::Debug;
 use std::io::{Cursor, Read, Seek, Write};
-use tracing::{info, span, trace, Level};
+use std::ops::Div;
+use std::time::{Duration, Instant};
+use tracing::{info, span, trace, warn, Level};
 
+use crate::ack::QuicAckRange;
 use crate::connection::{QuicConnection, QuicLevel};
 use crate::packet::QuicPacket;
 use crate::send::QuicSendContext;
-use crate::utils::{decode_variable_length, encode_variable_length, get_remain_length};
+use crate::utils::{decode_variable_length, encode_variable_length, remaining_bytes};
 
 const QUIC_CRYPTO_FRAME_MAX_BUFFER_SIZE: u64 = 1 << 16;
 const QUIC_STATELESS_RESET_TOKEN_LENGTH: u16 = 16;
@@ -133,45 +139,59 @@ impl From<QuicFrameType> for u8 {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct QuicAckRange {
-    gap: u64,
-    ack_range_length: u64,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 struct QuicHandshakeDone {
     common: QuicFrameCommon,
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Default)]
-struct QuicPing {
+#[derive(Clone, Default, Debug)]
+pub(crate) struct QuicPing {
     common: QuicFrameCommon,
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuicPadding {
     common: QuicFrameCommon,
     padding_size: u64,
 }
 
-#[allow(dead_code)]
-#[derive(Clone)]
-struct QuicAck {
+#[derive(Clone, Debug)]
+pub(crate) struct QuicAck {
     common: QuicFrameCommon,
     largest_acknowledged: u64,
     ack_delay: u64,
     ack_range_count: u64,
     first_ack_range: u64,
-    ack_ranges: Option<Vec<QuicAckRange>>,
+    ack_ranges: Option<VecDeque<QuicAckRange>>,
+}
+
+impl QuicAck {
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        largest_acknowledged: u64,
+        ack_delay: u64,
+        ack_range_count: u64,
+        first_ack_range: u64,
+        ack_ranges: Option<VecDeque<QuicAckRange>>,
+    ) -> Self {
+        Self {
+            largest_acknowledged,
+            ack_range_count,
+            ack_delay,
+            first_ack_range,
+            ack_ranges,
+            common: QuicFrameCommon::default(),
+        }
+    }
+
+    pub(crate) fn get_largest_acknowledged(&self) -> u64 {
+        self.largest_acknowledged
+    }
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuicResetStream {
     common: QuicFrameCommon,
     stream_id: u64,
@@ -180,15 +200,14 @@ struct QuicResetStream {
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuicStopSending {
     common: QuicFrameCommon,
     stream_id: u64,
     application_error_code: u64,
 }
 
-#[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuicCrypto {
     common: QuicFrameCommon,
     offset: u64,
@@ -196,15 +215,15 @@ struct QuicCrypto {
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuicNewToken {
     common: QuicFrameCommon,
     token: Vec<u8>,
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
-struct QuicStream {
+#[derive(Clone, Debug)]
+pub(crate) struct QuicStream {
     common: QuicFrameCommon,
     stream_id: u64,
     offset: u64,
@@ -214,14 +233,14 @@ struct QuicStream {
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuicMaxData {
     common: QuicFrameCommon,
     maximum_data: u64,
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuicMaxStreamData {
     common: QuicFrameCommon,
     stream_id: u64,
@@ -229,21 +248,21 @@ struct QuicMaxStreamData {
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuicMaxStreams {
     common: QuicFrameCommon,
     maximum_streams: u64,
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuicDataBlocked {
     common: QuicFrameCommon,
     maximum_data: u64,
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuicStreamDataBlocked {
     common: QuicFrameCommon,
     stream_id: u64,
@@ -251,14 +270,14 @@ struct QuicStreamDataBlocked {
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuicStreamsBlocked {
     common: QuicFrameCommon,
     maximum_streams: u64,
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuicNewConnectionId {
     common: QuicFrameCommon,
     sequence_number: u64,
@@ -268,28 +287,28 @@ struct QuicNewConnectionId {
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuicRetireConnectionId {
     common: QuicFrameCommon,
     sequence_number: u64,
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuicPathChallenge {
     common: QuicFrameCommon,
     data: [u8; 8],
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuicPathResponse {
     common: QuicFrameCommon,
     data: [u8; 8],
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct QuicConnectionClose {
     common: QuicFrameCommon,
     error_code: u64,
@@ -298,15 +317,22 @@ struct QuicConnectionClose {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 struct QuicFrameCommon {
-    is_key_updating: bool,
     level: Option<QuicLevel>,
     pn: Option<u64>,
+    send_time: Option<Instant>,
+}
+
+impl QuicFrameCommon {
+    fn clear(&mut self) {
+        self.send_time = None;
+        self.pn = None;
+    }
 }
 
 #[allow(private_interfaces, dead_code)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum QuicFrame {
     Padding(QuicPadding),
     Ping(QuicPing),
@@ -348,8 +374,11 @@ impl QuicFrame {
                 //   [ECN Counts (..)],
                 // }
 
-                // TODO: check it more accurate
-                if remain < 10 {
+                if remain < 5 * 8 {
+                    warn!(
+                        "Should provide more buffer for Ack frame, only got {} bytes",
+                        remain
+                    );
                     return Ok(false);
                 }
 
@@ -357,11 +386,31 @@ impl QuicFrame {
                 encode_variable_length(cursor, frame_type as u64)?;
                 encode_variable_length(cursor, ack_frame.largest_acknowledged)?;
                 encode_variable_length(cursor, ack_frame.ack_delay)?;
-                // TODO
-                encode_variable_length(cursor, 0 /* ack_frame.ack_range_count */)?;
-                encode_variable_length(cursor, ack_frame.first_ack_range)?;
 
-                trace!("Serialized {:?} frame", QuicFrameType::Ack);
+                let remain_bytes = remaining_bytes(cursor)?;
+                let range_count = remain_bytes.saturating_sub(2 * 8).div(2 * 8);
+                if range_count < ack_frame.ack_range_count {
+                    warn!(
+                        "remain_bytes {} is not enough, ack_range_count is {}, but \
+                        only {} ranges can be added",
+                        remain_bytes, ack_frame.ack_range_count, range_count
+                    );
+                    return Ok(false);
+                }
+
+                encode_variable_length(cursor, ack_frame.ack_range_count)?;
+                encode_variable_length(cursor, ack_frame.first_ack_range)?;
+                if let Some(ranges) = ack_frame.ack_ranges.as_ref() {
+                    ranges.iter().take(range_count as usize).try_for_each(
+                        |r| -> Result<(), anyhow::Error> {
+                            encode_variable_length(cursor, r.get_gap())?;
+                            encode_variable_length(cursor, r.get_ack_range_length())?;
+                            Ok(())
+                        },
+                    )?;
+                }
+
+                trace!("Serialized {:?} frame", ack_frame);
             }
             QuicFrame::Crypto(crypto_frame) => {
                 // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.6
@@ -398,7 +447,7 @@ impl QuicFrame {
         Ok(true)
     }
 
-    pub(crate) fn _is_ack_eliciting(&self) -> bool {
+    pub(crate) fn is_ack_eliciting(&self) -> bool {
         !matches!(
             self,
             QuicFrame::Ack(_) | QuicFrame::Padding(_) | QuicFrame::ConnectionClose(_)
@@ -409,52 +458,215 @@ impl QuicFrame {
         matches!(self, QuicFrame::Crypto(_))
     }
 
-    pub(crate) fn create_ack_frame(
+    pub(crate) fn get_send_time(&self) -> Option<Instant> {
+        match self {
+            QuicFrame::Padding(frame) => frame.common.send_time,
+            QuicFrame::Ping(frame) => frame.common.send_time,
+            QuicFrame::Ack(frame) => frame.common.send_time,
+            QuicFrame::ResetStream(frame) => frame.common.send_time,
+            QuicFrame::StopSending(frame) => frame.common.send_time,
+            QuicFrame::Crypto(frame) => frame.common.send_time,
+            QuicFrame::NewToken(frame) => frame.common.send_time,
+            QuicFrame::Stream(frame) => frame.common.send_time,
+            QuicFrame::MaxData(frame) => frame.common.send_time,
+            QuicFrame::MaxStreamData(frame) => frame.common.send_time,
+            QuicFrame::MaxStreams(frame) => frame.common.send_time,
+            QuicFrame::DataBlocked(frame) => frame.common.send_time,
+            QuicFrame::StreamDataBlocked(frame) => frame.common.send_time,
+            QuicFrame::StreamsBlocked(frame) => frame.common.send_time,
+            QuicFrame::NewConnectionId(frame) => frame.common.send_time,
+            QuicFrame::RetireConnectionId(frame) => frame.common.send_time,
+            QuicFrame::PathChallenge(frame) => frame.common.send_time,
+            QuicFrame::PathResponse(frame) => frame.common.send_time,
+            QuicFrame::ConnectionClose(frame) => frame.common.send_time,
+            QuicFrame::HandshakeDone(frame) => frame.common.send_time,
+        }
+    }
+
+    pub(crate) fn set_send_time(&mut self, send_time: Instant) {
+        match self {
+            QuicFrame::Padding(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::Ping(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::Ack(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::ResetStream(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::StopSending(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::Crypto(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::NewToken(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::Stream(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::MaxData(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::MaxStreamData(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::MaxStreams(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::DataBlocked(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::StreamDataBlocked(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::StreamsBlocked(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::NewConnectionId(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::RetireConnectionId(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::PathChallenge(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::PathResponse(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::ConnectionClose(frame) => frame.common.send_time = Some(send_time),
+            QuicFrame::HandshakeDone(frame) => frame.common.send_time = Some(send_time),
+        }
+    }
+
+    pub(crate) fn clear_frame_common(&mut self) {
+        match self {
+            QuicFrame::Padding(frame) => frame.common.clear(),
+            QuicFrame::Ping(frame) => frame.common.clear(),
+            QuicFrame::Ack(frame) => frame.common.clear(),
+            QuicFrame::ResetStream(frame) => frame.common.clear(),
+            QuicFrame::StopSending(frame) => frame.common.clear(),
+            QuicFrame::Crypto(frame) => frame.common.clear(),
+            QuicFrame::NewToken(frame) => frame.common.clear(),
+            QuicFrame::Stream(frame) => frame.common.clear(),
+            QuicFrame::MaxData(frame) => frame.common.clear(),
+            QuicFrame::MaxStreamData(frame) => frame.common.clear(),
+            QuicFrame::MaxStreams(frame) => frame.common.clear(),
+            QuicFrame::DataBlocked(frame) => frame.common.clear(),
+            QuicFrame::StreamDataBlocked(frame) => frame.common.clear(),
+            QuicFrame::StreamsBlocked(frame) => frame.common.clear(),
+            QuicFrame::NewConnectionId(frame) => frame.common.clear(),
+            QuicFrame::RetireConnectionId(frame) => frame.common.clear(),
+            QuicFrame::PathChallenge(frame) => frame.common.clear(),
+            QuicFrame::PathResponse(frame) => frame.common.clear(),
+            QuicFrame::ConnectionClose(frame) => frame.common.clear(),
+            QuicFrame::HandshakeDone(frame) => frame.common.clear(),
+        }
+    }
+
+    pub(crate) fn get_packet_number(&self) -> Option<u64> {
+        match self {
+            QuicFrame::Padding(frame) => frame.common.pn,
+            QuicFrame::Ping(frame) => frame.common.pn,
+            QuicFrame::Ack(frame) => frame.common.pn,
+            QuicFrame::ResetStream(frame) => frame.common.pn,
+            QuicFrame::StopSending(frame) => frame.common.pn,
+            QuicFrame::Crypto(frame) => frame.common.pn,
+            QuicFrame::NewToken(frame) => frame.common.pn,
+            QuicFrame::Stream(frame) => frame.common.pn,
+            QuicFrame::MaxData(frame) => frame.common.pn,
+            QuicFrame::MaxStreamData(frame) => frame.common.pn,
+            QuicFrame::MaxStreams(frame) => frame.common.pn,
+            QuicFrame::DataBlocked(frame) => frame.common.pn,
+            QuicFrame::StreamDataBlocked(frame) => frame.common.pn,
+            QuicFrame::StreamsBlocked(frame) => frame.common.pn,
+            QuicFrame::NewConnectionId(frame) => frame.common.pn,
+            QuicFrame::RetireConnectionId(frame) => frame.common.pn,
+            QuicFrame::PathChallenge(frame) => frame.common.pn,
+            QuicFrame::PathResponse(frame) => frame.common.pn,
+            QuicFrame::ConnectionClose(frame) => frame.common.pn,
+            QuicFrame::HandshakeDone(frame) => frame.common.pn,
+        }
+    }
+
+    pub(crate) fn set_packet_number(&mut self, pn: u64) {
+        match self {
+            QuicFrame::Padding(frame) => frame.common.pn = Some(pn),
+            QuicFrame::Ping(frame) => frame.common.pn = Some(pn),
+            QuicFrame::Ack(frame) => frame.common.pn = Some(pn),
+            QuicFrame::ResetStream(frame) => frame.common.pn = Some(pn),
+            QuicFrame::StopSending(frame) => frame.common.pn = Some(pn),
+            QuicFrame::Crypto(frame) => frame.common.pn = Some(pn),
+            QuicFrame::NewToken(frame) => frame.common.pn = Some(pn),
+            QuicFrame::Stream(frame) => frame.common.pn = Some(pn),
+            QuicFrame::MaxData(frame) => frame.common.pn = Some(pn),
+            QuicFrame::MaxStreamData(frame) => frame.common.pn = Some(pn),
+            QuicFrame::MaxStreams(frame) => frame.common.pn = Some(pn),
+            QuicFrame::DataBlocked(frame) => frame.common.pn = Some(pn),
+            QuicFrame::StreamDataBlocked(frame) => frame.common.pn = Some(pn),
+            QuicFrame::StreamsBlocked(frame) => frame.common.pn = Some(pn),
+            QuicFrame::NewConnectionId(frame) => frame.common.pn = Some(pn),
+            QuicFrame::RetireConnectionId(frame) => frame.common.pn = Some(pn),
+            QuicFrame::PathChallenge(frame) => frame.common.pn = Some(pn),
+            QuicFrame::PathResponse(frame) => frame.common.pn = Some(pn),
+            QuicFrame::ConnectionClose(frame) => frame.common.pn = Some(pn),
+            QuicFrame::HandshakeDone(frame) => frame.common.pn = Some(pn),
+        }
+    }
+
+    pub(crate) fn create_ack_frames(
         qconn: &mut QuicConnection,
         level: QuicLevel,
-    ) -> Result<Option<QuicFrame>> {
+    ) -> Result<VecDeque<QuicFrame>> {
         let send_ctx = match level {
             QuicLevel::Initial => &mut qconn.init_send,
             QuicLevel::Handshake => &mut qconn.hs_send,
             QuicLevel::Application => &mut qconn.app_send,
         };
 
-        if send_ctx.largest_pn.is_none() {
-            return Ok(None);
+        let mut ack_frames: VecDeque<QuicFrame> = VecDeque::new();
+        if let Some(single_pns) = send_ctx.get_single_ack_pns() {
+            single_pns.iter().for_each(|pn| {
+                ack_frames.push_back(QuicFrame::Ack(QuicAck {
+                    common: QuicFrameCommon {
+                        level: Some(level),
+                        pn: None,
+                        send_time: None,
+                    },
+                    largest_acknowledged: *pn,
+                    ack_delay: 0, // Should be zero!
+                    ack_range_count: 0,
+                    first_ack_range: 0,
+                    ack_ranges: None,
+                }));
+            });
         }
 
-        let lpn = send_ctx.largest_pn.unwrap();
-
-        // TODO: Need to check if the Ack frame should be created
-        if let Some(sent_largest_acked_pn) = send_ctx.sent_largest_acked_pn {
-            if sent_largest_acked_pn >= lpn {
-                return Ok(None);
-            }
+        if !send_ctx.need_ack(&qconn.current_ts, qconn.quic_config.get_max_ack_delay()) {
+            return Ok(ack_frames);
         }
 
-        let ack_frame = QuicFrame::Ack(QuicAck {
+        let local_max_ack_delay =
+            Duration::from_millis(qconn.quic_config.get_max_ack_delay() as u64);
+        let ack_delay = qconn
+            .current_ts
+            .checked_duration_since(
+                *send_ctx
+                    .get_ack_delay_start_time()
+                    .ok_or_else(|| anyhow!("Must have ack delay start time here"))?,
+            )
+            .map_or(0, |dur| {
+                if dur >= local_max_ack_delay {
+                    warn!("Ack delay {}ns could be a little high", dur.as_micros());
+                    local_max_ack_delay.as_micros() as u64
+                } else {
+                    dur.as_micros() as u64
+                }
+            })
+            .checked_mul(1 << qconn.quic_config.get_ack_delay_exponent())
+            .ok_or_else(|| {
+                anyhow!(
+                    "Too big ack delay, exponent {}",
+                    qconn.quic_config.get_ack_delay_exponent()
+                )
+            })?;
+
+        let ranges = send_ctx.get_ranges();
+        ack_frames.push_back(QuicFrame::Ack(QuicAck {
             common: QuicFrameCommon {
-                is_key_updating: false,
                 level: Some(level),
                 pn: None,
+                send_time: None,
             },
-            largest_acknowledged: lpn,
-            ack_delay: 30,
-            // TODO
-            ack_range_count: 0,
-            first_ack_range: 0,
-            ack_ranges: None,
-        });
+            largest_acknowledged: send_ctx
+                .get_top_range()
+                .ok_or_else(|| anyhow!("Must have top range"))?,
+            ack_delay,
+            ack_range_count: ranges.len() as u64,
+            first_ack_range: send_ctx.get_first_range(),
+            ack_ranges: Some(ranges),
+        }));
 
         trace!(
-            "Now we are creating {:?} ACK frame, largest_pn {}",
+            "Now we are creating {:?} ACK frames cnt {}, largest_pn {:?}",
             level,
-            lpn
+            ack_frames.len(),
+            send_ctx.largest_pn
         );
 
-        send_ctx.sent_largest_acked_pn = Some(lpn);
+        send_ctx.reset_ack();
+        qconn.reset_ack_delay_threshold();
 
-        Ok(Some(ack_frame))
+        Ok(ack_frames)
     }
 
     pub(crate) fn create_padding_frame<W>(cursor: &mut W, padding_frame_size: u16) -> Result<u32>
@@ -514,7 +726,7 @@ impl QuicFrame {
         Ok(Some(crypto_frame))
     }
 
-    pub(crate) fn handle_quic_frame(qconn: &mut QuicConnection, pkt: &QuicPacket) -> Result<()> {
+    pub(crate) fn handle_quic_frame(qconn: &mut QuicConnection, pkt: &QuicPacket) -> Result<bool> {
         let span = span!(
             Level::TRACE,
             "handle_quic_frame",
@@ -527,6 +739,7 @@ impl QuicFrame {
         let pbuf = pkt.get_payload();
         let mut cursor = Cursor::new(pbuf);
 
+        let mut need_ack = false;
         while (cursor.position() as usize) < pbuf.len() {
             let frame_type_val = decode_variable_length(&mut cursor)?;
             let frame_type = QuicFrameType::from(frame_type_val as u8);
@@ -549,16 +762,33 @@ impl QuicFrame {
                     Self::handle_new_conncetion_id_frame(&mut cursor, qconn, level)?
                 }
                 QuicFrameType::NewToken => Self::handle_new_token_frame(&mut cursor, qconn, level)?,
+                QuicFrameType::Stream => {
+                    // TODO: support QUIC stream
+                    let mut tmp = vec![0u8; pbuf.len() - cursor.position() as usize];
+                    cursor.read_exact(&mut tmp)?;
+                }
                 _ => unimplemented!(),
             }
+
+            if Self::is_ack_eliciting_by_frame_type(frame_type) {
+                need_ack = true;
+            }
+
             trace!(
                 "Handle QUIC frame with offset {}, udp datagram size {}",
                 cursor.position(),
-                pbuf.len()
+                pbuf.len(),
             );
         }
 
-        Ok(())
+        Ok(need_ack)
+    }
+
+    fn is_ack_eliciting_by_frame_type(ft: QuicFrameType) -> bool {
+        matches!(
+            ft,
+            QuicFrameType::Ack | QuicFrameType::Padding | QuicFrameType::ConnectionClose
+        )
     }
 
     fn handle_crypto_frame(
@@ -576,14 +806,7 @@ impl QuicFrame {
             length
         );
 
-        let remain_bytes = get_remain_length(cursor).ok_or_else(|| {
-            anyhow!(
-                "Bad cursor, position {}, all size {}",
-                cursor.position(),
-                cursor.get_ref().len()
-            )
-        })?;
-
+        let remain_bytes = remaining_bytes(cursor)?;
         if length > remain_bytes {
             return Err(anyhow!(
                 "Invalid QUIC crypto frame, bad length {}, remain bytes {}",
@@ -601,24 +824,40 @@ impl QuicFrame {
         };
 
         // Verify frame ordering
-        if send_ctx.crypto_recv_offset < offset {
-            trace!(
-                "Out-of-order CRYPTO frame: expected offset={}, got={}",
-                send_ctx.crypto_recv_offset,
-                offset
-            );
-            // https://www.rfc-editor.org/rfc/rfc9000.html#section-7.5
-            if send_ctx.get_recv_cbufs_length() + length > QUIC_CRYPTO_FRAME_MAX_BUFFER_SIZE {
-                // TODO: Need to close connection with `CRYPTO_BUFFER_EXCEEDED`
+        match send_ctx.crypto_recv_offset.cmp(&offset) {
+            Ordering::Less => {
+                trace!(
+                    "Out-of-order CRYPTO frame: expected offset={}, got={}",
+                    send_ctx.crypto_recv_offset,
+                    offset
+                );
+                // https://www.rfc-editor.org/rfc/rfc9000.html#section-7.5
+                if send_ctx.get_recv_cbufs_length() + length > QUIC_CRYPTO_FRAME_MAX_BUFFER_SIZE {
+                    // TODO: Need to close connection with `CRYPTO_BUFFER_EXCEEDED`
+                    return Ok(());
+                }
+                send_ctx.insert_recv_cbufs(
+                    &cursor.get_ref()
+                        [crypto_start_pos as usize..crypto_start_pos as usize + length as usize],
+                    offset,
+                );
+                cursor.seek_relative(length as i64)?;
                 return Ok(());
             }
-            send_ctx.insert_recv_cbufs(
-                &cursor.get_ref()
-                    [crypto_start_pos as usize..crypto_start_pos as usize + length as usize],
-                offset,
-            );
-            cursor.seek_relative(length as i64)?;
-            return Ok(());
+            Ordering::Greater => {
+                trace!(
+                    "Out-of-order CRYPTO frame has been received: expected offset={}, got={}",
+                    send_ctx.crypto_recv_offset,
+                    offset
+                );
+
+                // https://www.rfc-editor.org/rfc/rfc9002.html#section-6.2.3
+                send_ctx.resend_all()?;
+                qconn.set_next_send_event_time(0);
+
+                return Ok(());
+            }
+            _ => (),
         }
 
         send_ctx.crypto_recv_offset += length;
@@ -663,26 +902,40 @@ impl QuicFrame {
             )?;
         }
 
-        if qconn.tls.have_server_transport_params() && qconn.idle_timeout.is_none() {
-            // Max_idle_timeout: Idle timeout is disabled when both endpoints
-            // omit this transport parameter or specify a value of 0.
-            let peer_idle_timeout = qconn.tls.get_peer_idle_timeout().unwrap_or(0);
-            let local_idle_timeout = qconn.quic_config.get_idle_timeout();
+        if qconn.tls.have_server_transport_params() {
+            if qconn.idle_timeout.is_none() {
+                // Max_idle_timeout: Idle timeout is disabled when both endpoints
+                // omit this transport parameter or specify a value of 0.
+                let peer_idle_timeout = qconn.tls.get_peer_idle_timeout().unwrap_or(0);
+                let local_idle_timeout = qconn.quic_config.get_idle_timeout();
 
-            qconn.idle_timeout = if local_idle_timeout == 0 {
-                Some(peer_idle_timeout)
-            } else if peer_idle_timeout == 0 {
-                Some(local_idle_timeout)
-            } else {
-                Some(local_idle_timeout.min(peer_idle_timeout))
-            };
+                qconn.idle_timeout = if local_idle_timeout == 0 {
+                    Some(peer_idle_timeout)
+                } else if peer_idle_timeout == 0 {
+                    Some(local_idle_timeout)
+                } else {
+                    Some(local_idle_timeout.min(peer_idle_timeout))
+                };
 
-            info!(
-                "The real idle_timeout {} have been negotiated from local {} and peer {}",
-                qconn.idle_timeout.unwrap(),
-                local_idle_timeout,
-                peer_idle_timeout
-            );
+                info!(
+                    "The real idle_timeout {} have been negotiated from local {} and peer {}",
+                    qconn.idle_timeout.unwrap(),
+                    local_idle_timeout,
+                    peer_idle_timeout
+                );
+            }
+
+            if qconn.rtt.max_ack_delay.is_none() {
+                if let Some(mad) = qconn.tls.get_peer_max_ack_delay() {
+                    qconn.rtt.max_ack_delay = Some(mad);
+                }
+            }
+
+            if qconn.rtt.ack_delay_exponent.is_none() {
+                if let Some(ade) = qconn.tls.get_peer_ack_delay_exponent() {
+                    qconn.rtt.ack_delay_exponent = Some(ade);
+                }
+            }
         }
 
         qconn.consume_tls_send_queue()?;
@@ -787,13 +1040,16 @@ impl QuicFrame {
 
         if qconn.crypto.is_key_available(QuicLevel::Handshake) {
             // https://www.rfc-editor.org/rfc/rfc9001#section-4.9.2
-            qconn.crypto.discard_keys(QuicLevel::Handshake)?;
+            qconn.discard_keys(QuicLevel::Handshake)?;
         }
 
         Ok(())
     }
 
-    fn create_and_insert_ping_frame(qconn: &mut QuicConnection, level: QuicLevel) -> Result<()> {
+    pub(crate) fn create_and_insert_ping_frame(
+        qconn: &mut QuicConnection,
+        level: QuicLevel,
+    ) -> Result<()> {
         let send_ctx = match level {
             QuicLevel::Initial => &mut qconn.init_send,
             QuicLevel::Handshake => &mut qconn.hs_send,
@@ -801,7 +1057,7 @@ impl QuicFrame {
         };
 
         let ping_frame = QuicFrame::Ping(QuicPing::default());
-        send_ctx.insert_send_queue_back(ping_frame);
+        send_ctx.insert_send_queue_front(ping_frame);
 
         trace!("Now we are creating {:?} ping frame", level,);
 
@@ -818,13 +1074,7 @@ impl QuicFrame {
 
         // Padding frame doesn't have length field, but it must be the last QUIC frame in the packet
         // so we need to consume the entire cursor
-        let remain_bytes = get_remain_length(cursor).ok_or_else(|| {
-            anyhow!(
-                "Bad cursor from finished message, position {}, all size {}",
-                cursor.position(),
-                cursor.get_ref().len()
-            )
-        })?;
+        let remain_bytes = remaining_bytes(cursor)?;
         cursor.seek_relative(remain_bytes as i64)?;
 
         Ok(())
@@ -868,25 +1118,23 @@ impl QuicFrame {
         let ack_range_count = decode_variable_length(cursor)?;
         let first_ack_range = decode_variable_length(cursor)?;
 
+        let send_ctx = match level {
+            QuicLevel::Initial => &mut qconn.init_send,
+            QuicLevel::Handshake => &mut qconn.hs_send,
+            QuicLevel::Application => &mut qconn.app_send,
+        };
+
         trace!(
             "Processing {:?} ack frame, we received largest_acked {}, ack_delay {}, \
-            ack_range_count {}, first_ack_range {}",
+            ack_range_count {}, first_ack_range {}, origin largest_acked {:?}",
             level,
             largest_acked,
             ack_delay,
             ack_range_count,
             first_ack_range,
+            send_ctx.largest_acked,
         );
 
-        // TODO: need to process these data further
-        let ps = match level {
-            QuicLevel::Initial => &mut qconn.init_send,
-            QuicLevel::Handshake => &mut qconn.hs_send,
-            QuicLevel::Application => &mut qconn.app_send,
-        };
-        ps.largest_acked = Some(largest_acked);
-
-        // TODO: need to handle ack range
         // ACK Range {
         //   Gap (i),
         //   ACK Range Length (i),
@@ -895,11 +1143,27 @@ impl QuicFrame {
         for _ in 0..ack_range_count {
             let gap = decode_variable_length(cursor)?;
             let ack_range_length = decode_variable_length(cursor)?;
-            ack_ranges.push(QuicAckRange {
-                gap,
-                ack_range_length,
-            });
+            ack_ranges.push(QuicAckRange::new(gap, ack_range_length));
         }
+
+        // TODO: Update Congestion Control state via ACK frame
+        // https://www.rfc-editor.org/rfc/rfc9002.html#section-7
+
+        // Clean the Acked frames in sent queue
+        // and retire the old ack ranges in the ack generator
+        send_ctx.handle_ack_frame(
+            first_ack_range,
+            largest_acked,
+            &ack_ranges,
+            &mut qconn.rtt,
+            level,
+            &qconn.current_ts,
+            ack_delay,
+        )?;
+
+        qconn.reset_pto_backoff_factor();
+        qconn.detect_lost()?;
+        qconn.set_loss_or_pto_timer()?;
 
         if !ack_ranges.is_empty() {
             trace!(
