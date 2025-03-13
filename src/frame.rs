@@ -383,22 +383,26 @@ impl QuicFrame {
                 }
 
                 let frame_type: u8 = QuicFrameType::Ack.into();
+                let start_pos = cursor.stream_position()?;
                 encode_variable_length(cursor, frame_type as u64)?;
                 encode_variable_length(cursor, ack_frame.largest_acknowledged)?;
                 encode_variable_length(cursor, ack_frame.ack_delay)?;
+                let consumed_size = cursor.stream_position()?.saturating_sub(start_pos);
 
-                let remain_bytes = remaining_bytes(cursor)?;
+                let remain_bytes = (remain as u64).saturating_sub(consumed_size);
                 let range_count = remain_bytes.saturating_sub(2 * 8).div(2 * 8);
-                if range_count < ack_frame.ack_range_count {
+                let ack_range_count = if range_count < ack_frame.ack_range_count {
                     warn!(
                         "remain_bytes {} is not enough, ack_range_count is {}, but \
                         only {} ranges can be added",
                         remain_bytes, ack_frame.ack_range_count, range_count
                     );
-                    return Ok(false);
-                }
+                    range_count
+                } else {
+                    ack_frame.ack_range_count
+                };
 
-                encode_variable_length(cursor, ack_frame.ack_range_count)?;
+                encode_variable_length(cursor, ack_range_count)?;
                 encode_variable_length(cursor, ack_frame.first_ack_range)?;
                 if let Some(ranges) = ack_frame.ack_ranges.as_ref() {
                     ranges.iter().take(range_count as usize).try_for_each(
