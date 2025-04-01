@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, trace, warn};
 
 use crate::ack::{QuicAckGenerator, QuicAckRange};
+use crate::buffer::QuicBuffer;
 use crate::connection::QuicLevel;
-use crate::frame::{QuicFrame, QuicPing};
+use crate::frame::{QuicFrame, QuicFrameType, QuicPing, QuicResetStream};
 use crate::rtt::QuicRttGenerator;
 
 #[allow(dead_code)]
@@ -28,8 +29,7 @@ pub(crate) struct QuicSendContext {
     pub(crate) ack_generator: QuicAckGenerator,
     packet_threshold: Option<u16>,
 
-    recv_cbuf_len: u64,
-    store_recv_cbufs: VecDeque<(u64, Vec<u8>)>, // Sorted by first elem of tuple
+    crypto_recv_buf: QuicBuffer, // Sorted by first elem of tuple
     pub(crate) crypto_recv_offset: u64,
     pub(crate) crypto_send_offset: u64,
 }
@@ -39,34 +39,16 @@ const QUIC_PACKET_THRESHOLD: u16 = 3;
 
 #[allow(dead_code)]
 impl QuicSendContext {
-    // TODO: Design better recv buffers for crypto and stream frame
-    pub(crate) fn get_recv_cbufs_length(&self) -> u64 {
-        let length = self
-            .store_recv_cbufs
-            .iter()
-            .map(|(_, b)| b.len() as u64)
-            .sum();
-        trace!("Total receive crypto buffers length: {}", length);
-        length
+    pub(crate) fn get_crypto_recv_cbufs_length(&self) -> u64 {
+        self.crypto_recv_buf.length()
     }
 
-    pub(crate) fn insert_recv_cbufs(&mut self, buf: &[u8], offset: u64) {
-        trace!(
-            "Inserting receive crypto buffer with length {} at offset {}",
-            buf.len(),
-            offset
-        );
-        let pos = self
-            .store_recv_cbufs
-            .iter()
-            .position(|(off, _)| offset < *off)
-            .unwrap_or(self.store_recv_cbufs.len());
-        self.store_recv_cbufs.insert(pos, (offset, buf.to_vec()));
-        trace!(
-            "Inserted at position {}, total buffers: {}",
-            pos,
-            self.store_recv_cbufs.len()
-        );
+    pub(crate) fn insert_crypto_recv_cbufs(&mut self, buf: &[u8], offset: u64) {
+        self.crypto_recv_buf.insert(buf, offset);
+    }
+
+    pub(crate) fn consume_next_recv_cbufs(&mut self, offset: u64) -> Option<Vec<u8>> {
+        self.crypto_recv_buf.consume(offset, usize::max_value())
     }
 
     pub(crate) fn clear(&mut self, level: QuicLevel) -> Result<()> {
@@ -89,46 +71,6 @@ impl QuicSendContext {
         }
 
         Ok(())
-    }
-
-    pub(crate) fn consume_pre_recv_cbufs(&mut self, offset: u64) -> Option<Vec<u8>> {
-        trace!(
-            "Attempting to consume receive crypto buffers from offset {}",
-            offset
-        );
-        let mut res = vec![];
-        let mut consumed_offset = offset;
-        while let Some((off, buf)) = self.store_recv_cbufs.pop_front() {
-            if off > consumed_offset {
-                trace!(
-                    "Buffer offset {} is ahead of consumed offset {}, returning None",
-                    off,
-                    consumed_offset
-                );
-                self.store_recv_cbufs.push_front((off, buf));
-                return None;
-            }
-
-            let new_buf = if off != consumed_offset {
-                warn!(
-                    "Weird buf was sent by peer side, buf offset {}, buf len {}, expected offset {}",
-                    off, buf.len(), consumed_offset
-                );
-                if consumed_offset >= off + buf.len() as u64 {
-                    // Need to discard this useless buffer
-                    return None;
-                }
-                let (_, right) = buf.split_at(consumed_offset as usize - off as usize);
-                right
-            } else {
-                &buf
-            };
-            consumed_offset += new_buf.len() as u64;
-            res.extend(new_buf);
-        }
-
-        trace!("Consumed {} bytes from crypto buffers", res.len());
-        Some(res)
     }
 
     pub(crate) fn need_ack(&self, current_ts: &Instant, local_mad: u16) -> bool {
@@ -206,17 +148,31 @@ impl QuicSendContext {
         self.send_queue.extend(v);
     }
 
+    pub(crate) fn insert_send_queue_with_stream_data(
+        &mut self,
+        stream_data: Option<Vec<u8>>,
+        offset: u64,
+        stream_id: u64,
+        is_fin: bool,
+    ) {
+        let length = stream_data.as_ref().map_or(0, |v| v.len() as u64);
+        self.insert_send_queue_back(QuicFrame::create_stream_frame(
+            stream_data,
+            offset,
+            stream_id,
+            is_fin,
+            length,
+        ));
+    }
+
     pub(crate) fn insert_send_queue_with_crypto_data(
         &mut self,
         crypto_data: Vec<u8>,
     ) -> Result<()> {
-        if let Some(crypto_frame) = QuicFrame::create_crypto_frame(self, crypto_data)? {
-            self.insert_send_queue_back(crypto_frame);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn generate_ack(&mut self) -> Result<()> {
+        let crypto_len = crypto_data.len();
+        let frame = QuicFrame::create_crypto_frame(self.crypto_send_offset, crypto_data);
+        self.crypto_send_offset += crypto_len as u64;
+        self.insert_send_queue_back(frame);
         Ok(())
     }
 
@@ -356,14 +312,6 @@ impl QuicSendContext {
         found
     }
 
-    pub(crate) fn create_and_insert_ping_frame(&mut self) -> Result<()> {
-        let ping_frame = QuicFrame::Ping(QuicPing::default());
-        self.insert_send_queue_front(ping_frame);
-        trace!("Now we are creating ping frame");
-
-        Ok(())
-    }
-
     pub(crate) fn resend_all(&mut self) -> Result<()> {
         while let Some(mut f) = self.sent_queue.pop_front() {
             f.clear_frame_common();
@@ -378,6 +326,7 @@ impl QuicSendContext {
         smallest: u64,
         largest: u64,
         get_send_time: bool,
+        acked_stream_frames: &mut Vec<QuicFrame>,
     ) -> Result<(bool, Option<Instant>)> {
         trace!(
             "Processing ACK range [{}..{}], get_send_time: {}",
@@ -407,7 +356,22 @@ impl QuicSendContext {
                         self.ack_generator
                             .drop_ack_ranges(frame.get_largest_acknowledged());
                     }
-                    QuicFrame::Stream(_) => unimplemented!(),
+                    QuicFrame::Stream(frame) => {
+                        acked_stream_frames.push(QuicFrame::create_stream_frame(
+                            None,
+                            frame.offset,
+                            frame.stream_id,
+                            frame.is_fin,
+                            frame.length,
+                        ));
+                    }
+                    QuicFrame::ResetStream(frame) => {
+                        acked_stream_frames.push(QuicFrame::create_reset_stream_frame(
+                            frame.stream_id,
+                            frame.application_error_code,
+                            frame.final_size,
+                        ));
+                    }
                     _ => {
                         trace!("The frame {:?} is acked!", f);
                     }
@@ -477,7 +441,7 @@ impl QuicSendContext {
         level: QuicLevel,
         current_ts: &Instant,
         delay: u64,
-    ) -> Result<()> {
+    ) -> Result<Vec<QuicFrame>> {
         let mut largest = top_range;
         let mut smallest = top_range.checked_sub(first_range).ok_or_else(|| {
             anyhow!(
@@ -505,9 +469,11 @@ impl QuicSendContext {
 
         let mut index = 0;
         let mut sent_time = None;
+        let mut acked_stream_frames = vec![];
         loop {
             let get_send_time = largest_acked_updated && largest == top_range;
-            let (acked, send_time) = self.handle_ack_range(smallest, largest, get_send_time)?;
+            let (acked, send_time) =
+                self.handle_ack_range(smallest, largest, get_send_time, &mut acked_stream_frames)?;
             ackeliciting_packet_acked |= acked;
             if get_send_time && send_time.is_none() {
                 warn!("Should get our send time here for no.{top_range} packet");
@@ -561,7 +527,7 @@ impl QuicSendContext {
             }
         }
 
-        Ok(())
+        Ok(acked_stream_frames)
     }
 
     pub(crate) fn update_ack(

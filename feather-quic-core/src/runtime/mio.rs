@@ -1,16 +1,18 @@
-use anyhow::{Context, Result};
-use mio::{net::UdpSocket, Events, Interest, Poll, Token};
+use crate::runtime::QuicUserContext;
+use crate::stream::QuicStreamHandle;
+use crate::QuicCallbacks;
+use crate::QuicConnection;
+use anyhow::{anyhow, Context, Result};
+use mio::net::UdpSocket;
+use mio::{Events, Interest, Poll, Token};
 use mio_timerfd::{ClockId, TimerFd};
 use rand::Rng;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::time::Duration;
-use tracing::{info, trace, warn};
+use std::time::{Duration, Instant};
+use tracing::{error, info, span, trace, warn, Level};
 
-use crate::runtime::{QuicCallbacks, QuicUserContext};
-use crate::QuicConnection;
-
-pub(crate) struct MioEventLoop {
+pub struct MioEventLoop {
     sent_cnt: u64,
     target_address: SocketAddr,
     max_quic_packet_send_count: Option<u64>,
@@ -79,7 +81,7 @@ impl MioEventLoop {
     }
 
     fn create_client_socket(&self) -> Result<UdpSocket> {
-        let client_socket = UdpSocket::bind("0.0.0.0:0".parse()?)
+        let client_socket = UdpSocket::bind("0.0.0.0:0".parse::<SocketAddr>()?)
             .with_context(|| "Failed to bind random address".to_string())?;
 
         client_socket
@@ -291,6 +293,9 @@ impl MioEventLoop {
                             }
                         }
 
+                        // TODO: After QUIC handshake completion, the client can send application data
+                        // (e.g., HTTP/3 traffic)
+                        qconn.run_events(uctx)?;
                         if qconn.next_time().is_none() {
                             qconn.run_timer()?;
                         }
@@ -311,21 +316,6 @@ impl MioEventLoop {
                             warn!("Should not trigger the timer process immediately!");
                         }
 
-                        // TODO: After QUIC handshake completion, the client can send application data
-                        // (e.g., HTTP/3 traffic)
-                        if qconn.is_established() && !connect_done_trigger {
-                            connect_done_trigger = true;
-                            uctx.user_data.connect_done(qconn)?;
-                        }
-
-                        if qconn.is_readable() {
-                            uctx.user_data.read_event(qconn)?;
-                        }
-
-                        if qconn.is_writable() {
-                            uctx.user_data.write_event(qconn)?;
-                        }
-
                         if !self.tx_reorder_queue.is_empty() {
                             self.flush_tx_reorder_queue(&mut client_socket)?;
                         }
@@ -337,12 +327,16 @@ impl MioEventLoop {
                         if let Ok(real_timeout) = quic_timer.read() {
                             trace!("Timer event triggered {} times!", real_timeout);
                             qconn.run_timer()?;
+                            // Handling the connection close callback (e.g. idle timeout)
+                            qconn.run_events(uctx)?;
+
                             while let Some(send_buf) = qconn.consume_data() {
                                 self.socket_send(&mut client_socket, &send_buf)?;
                             }
                             if !self.tx_reorder_queue.is_empty() {
                                 self.flush_tx_reorder_queue(&mut client_socket)?;
                             }
+
                             if let Some(timeout) = qconn.next_time() {
                                 trace!("Update timeout {}ns", timeout);
                                 quic_timer.set_timeout(&Duration::from_micros(timeout))?;
