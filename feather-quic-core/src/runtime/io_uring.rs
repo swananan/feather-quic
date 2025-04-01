@@ -1,17 +1,18 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use rand::Rng;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::net::UdpSocket;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;
-use tracing::{info, trace, warn};
+use tracing::{error, info, span, trace, warn, Level};
 use types::Timespec;
 
 use io_uring::{cqueue, opcode, types, IoUring, Probe, SubmissionQueue};
 use slab::Slab;
 
 use crate::runtime::{QuicCallbacks, QuicUserContext};
+use crate::stream::QuicStreamHandle;
 use crate::QuicConnection;
 
 #[derive(Clone)]
@@ -445,6 +446,7 @@ impl IoUringEventLoop {
                         self.timer_context.token_index = None;
 
                         qconn.run_timer()?;
+                        qconn.run_events(uctx)?;
                         if let Some(timeout) = qconn.next_time() {
                             self.add_timer(&mut sq, udp_fd, timeout)?;
                         } else {
@@ -476,6 +478,7 @@ impl IoUringEventLoop {
                         } else {
                             warn!("Should not trigger the timer process immediately!");
                         }
+                        qconn.run_events(uctx)?;
                     }
                     Token::ProvideBuffers { group_id, fd } => {
                         trace!("Initializing buffer group");
@@ -557,6 +560,7 @@ impl IoUringEventLoop {
                     continue;
                 }
 
+                qconn.run_events(uctx)?;
                 // update the idle timer
                 if let Some(timeout) = qconn.next_time() {
                     self.add_timer(&mut sq, udp_fd, timeout)?;
@@ -588,21 +592,6 @@ impl IoUringEventLoop {
                         buf[..snd_len].copy_from_slice(&send_buf[..]);
                         Ok(snd_len as u16)
                     })?;
-                }
-
-                // todo: when quic handshake is completed, client can send some data.
-                // like http/3 traffic actually
-                if qconn.is_established() && !connect_done_trigger {
-                    connect_done_trigger = true;
-                    uctx.user_data.connect_done(qconn)?;
-                }
-
-                if qconn.is_readable() {
-                    uctx.user_data.read_event(qconn)?;
-                }
-
-                if qconn.is_writable() {
-                    uctx.user_data.write_event(qconn)?;
                 }
             }
         }

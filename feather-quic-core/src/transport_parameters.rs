@@ -7,6 +7,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use tracing::{error, trace, warn};
 
 use crate::config::QuicConfig;
+use crate::tls::TlsContext;
 use crate::utils::{decode_variable_length, encode_variable_length, get_variable_length};
 
 #[allow(dead_code)]
@@ -34,8 +35,16 @@ pub(crate) enum TransportParameter {
 
     InitialMaxData(u64),
 
+    // This parameter is an integer value specifying the initial flow control limit for locally initiated bidirectional streams.
+    // This limit applies to newly created bidirectional streams opened by the endpoint that sends the transport parameter.
+    // In client transport parameters, this applies to streams with an identifier with the least significant two
+    // bits set to 0x00; in server transport parameters, this applies to streams with the least significant two bits set to 0x01.
     InitialMaxStreamDataBidiLocal(u64),
 
+    // This parameter is an integer value specifying the initial flow control limit for peer-initiated bidirectional streams.
+    // This limit applies to newly created bidirectional streams opened by the endpoint that receives the transport parameter.
+    // In client transport parameters, this applies to streams with an identifier with the least significant two bits set to 0x01;
+    // in server transport parameters, this applies to streams with the least significant two bits set to 0x00
     InitialMaxStreamDataBidiRemote(u64),
 
     InitialMaxStreamDataUni(u64),
@@ -611,4 +620,82 @@ pub(crate) fn create_client_transport_parameters(
         TransportParameter::ActiveConnectionIdLimit(quic_config.get_active_connection_id_limit()),
         TransportParameter::MaxUdpPayloadSize(quic_config.get_max_udp_payload_size()),
     ]
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PeerTransportParameters {
+    max_idle_timeout: Option<u64>,
+    max_ack_delay: Option<u16>,
+    ack_delay_exponent: Option<u8>,
+    initial_max_data: Option<u64>,
+    initial_max_stream_data_bidi_local: Option<u64>,
+    initial_max_stream_data_bidi_remote: Option<u64>,
+    initial_max_stream_data_uni: Option<u64>,
+    initial_max_streams_bidi: Option<u64>,
+    initial_max_streams_uni: Option<u64>,
+    updated: bool,
+}
+
+impl PeerTransportParameters {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn update_from_tls(&mut self, tls: &TlsContext) -> Result<()> {
+        if self.updated {
+            return Ok(());
+        }
+        self.max_idle_timeout = tls.get_peer_idle_timeout();
+        self.max_ack_delay = tls.get_peer_max_ack_delay();
+        self.ack_delay_exponent = tls.get_peer_ack_delay_exponent();
+        self.initial_max_data = tls.get_peer_initial_max_data();
+        self.initial_max_stream_data_bidi_local = tls.get_peer_initial_max_stream_data_bidi_local();
+        self.initial_max_stream_data_bidi_remote =
+            tls.get_peer_initial_max_stream_data_bidi_remote();
+        self.initial_max_stream_data_uni = tls.get_peer_initial_max_stream_data_uni();
+        self.initial_max_streams_bidi = tls.get_peer_initial_max_streams_bidi();
+        self.initial_max_streams_uni = tls.get_peer_initial_max_streams_uni();
+        self.updated = true;
+        Ok(())
+    }
+
+    pub(crate) fn get_max_idle_timeout(&self) -> Option<u64> {
+        self.max_idle_timeout
+    }
+
+    pub(crate) fn get_max_ack_delay(&self) -> Option<u16> {
+        self.max_ack_delay
+    }
+
+    pub(crate) fn get_ack_delay_exponent(&self) -> Option<u8> {
+        self.ack_delay_exponent
+    }
+
+    pub(crate) fn get_initial_max_data(&self) -> Option<u64> {
+        self.initial_max_data
+    }
+
+    pub(crate) fn set_initial_max_data(&mut self, max_data: u64) {
+        self.initial_max_data = Some(max_data);
+    }
+
+    pub(crate) fn get_initial_max_stream_data_bidi_local(&self) -> Option<u64> {
+        self.initial_max_stream_data_bidi_local
+    }
+
+    pub(crate) fn get_initial_max_stream_data_bidi_remote(&self) -> Option<u64> {
+        self.initial_max_stream_data_bidi_remote
+    }
+
+    pub(crate) fn get_initial_max_stream_data_uni(&self) -> Option<u64> {
+        self.initial_max_stream_data_uni
+    }
+
+    pub(crate) fn get_initial_max_streams_bidi(&self) -> Option<u64> {
+        self.initial_max_streams_bidi
+    }
+
+    pub(crate) fn get_initial_max_streams_uni(&self) -> Option<u64> {
+        self.initial_max_streams_uni
+    }
 }
