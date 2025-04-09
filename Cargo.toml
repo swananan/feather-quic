@@ -1,13 +1,21 @@
-[package]
-name = "feather-quic"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+members = [
+    "feather-quic-core",
+    "feather-quic-tools",
+    "feather-quic-integration-tests"
+]
 
-[dependencies]
+[workspace.package]
+authors = ["swananan <jt26wzz@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/swananan/feather-quic"
+keywords = ["quic", "network", "protocol"]
+categories = ["network-programming", "protocols"]
+
+[workspace.dependencies]
 mio = { version = "1.0.2", features = ["net", "os-poll"] }
 mio-timerfd = { version = "0.3.0", git = "https://github.com/swananan/mio-timerfd.git"}
 log = "0.4.22"
-clap = { version = "4.5.21", features = ["derive"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 rand = "0.8.5"
 anyhow = "1.0.93"
@@ -17,6 +25,6 @@ libc = "0.2.169"
 aes = "0.8.4"
 ring = "0.17.8"
 byteorder = "1.5.0"
-clap-num = "1.1.1"
 tracing = "0.1.41"
 tracing-log = "0.2.0"
+thiserror = "2.0.12"

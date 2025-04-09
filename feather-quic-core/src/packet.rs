@@ -440,7 +440,12 @@ impl QuicPacket<'_> {
         let mut frame_sent_cnt = 0;
         while let Some(mut frame) = qconn.init_send.consume_send_queue() {
             let payload_len = payload_cursor.position();
-            let res = frame.serialize(&mut payload_cursor, remain_len - payload_len as u16)?;
+            let (res, new_frame) =
+                frame.serialize(&mut payload_cursor, remain_len - payload_len as u16)?;
+            if let Some(f) = new_frame {
+                qconn.init_send.insert_send_queue_front(f)
+            }
+
             if !res {
                 // Restore the send queue, if QUIC payload size is not enough
                 qconn.init_send.insert_send_queue_front(frame);
@@ -611,8 +616,11 @@ impl QuicPacket<'_> {
         let mut frame_sent_cnt = 0;
         while let Some(mut frame) = qconn.app_send.consume_send_queue() {
             let payload_len = payload_cursor.position();
-            let res =
+            let (res, new_frame) =
                 frame.serialize(&mut payload_cursor, max_payload_size - payload_len as u16)?;
+            if let Some(f) = new_frame {
+                qconn.app_send.insert_send_queue_front(f)
+            }
             if !res {
                 qconn.app_send.insert_send_queue_front(frame);
                 break;
@@ -824,8 +832,11 @@ impl QuicPacket<'_> {
         let mut frame_sent_cnt = 0;
         while let Some(mut frame) = qconn.hs_send.consume_send_queue() {
             let payload_len = payload_cursor.position();
-            let res =
+            let (res, new_frame) =
                 frame.serialize(&mut payload_cursor, max_payload_size - payload_len as u16)?;
+            if let Some(f) = new_frame {
+                qconn.hs_send.insert_send_queue_front(f)
+            }
             if !res {
                 qconn.hs_send.insert_send_queue_front(frame);
                 break;
@@ -1021,7 +1032,7 @@ impl QuicPacket<'_> {
             return Ok(());
         };
 
-        let should_send = send_ctx.update_ack(pn, need_ack, &qconn.current_ts, level)?;
+        let should_send = send_ctx.update_ack(pn, need_ack, &qconn.current_ts)?;
 
         if should_send || !send_ctx.is_send_queue_empty() {
             qconn.set_next_send_event_time(0);
