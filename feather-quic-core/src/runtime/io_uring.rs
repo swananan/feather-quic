@@ -402,7 +402,7 @@ impl IoUringEventLoop {
             warn!("Should not trigger the timer process immediately!");
         }
 
-        let mut connect_done_trigger = false;
+        let connect_done_trigger = false;
         loop {
             trace!("IoUring sumbit!");
             match submitter.submit_and_wait(1) {
@@ -445,6 +445,7 @@ impl IoUringEventLoop {
                         self.timer_context.token_index = None;
 
                         qconn.run_timer()?;
+                        qconn.run_events(uctx)?;
                         if let Some(timeout) = qconn.next_time() {
                             self.add_timer(&mut sq, udp_fd, timeout)?;
                         } else {
@@ -476,6 +477,7 @@ impl IoUringEventLoop {
                         } else {
                             warn!("Should not trigger the timer process immediately!");
                         }
+                        qconn.run_events(uctx)?;
                     }
                     Token::ProvideBuffers { group_id, fd } => {
                         trace!("Initializing buffer group");
@@ -557,6 +559,7 @@ impl IoUringEventLoop {
                     continue;
                 }
 
+                qconn.run_events(uctx)?;
                 // update the idle timer
                 if let Some(timeout) = qconn.next_time() {
                     self.add_timer(&mut sq, udp_fd, timeout)?;
@@ -588,21 +591,6 @@ impl IoUringEventLoop {
                         buf[..snd_len].copy_from_slice(&send_buf[..]);
                         Ok(snd_len as u16)
                     })?;
-                }
-
-                // todo: when quic handshake is completed, client can send some data.
-                // like http/3 traffic actually
-                if qconn.is_established() && !connect_done_trigger {
-                    connect_done_trigger = true;
-                    uctx.user_data.connect_done(qconn)?;
-                }
-
-                if qconn.is_readable() {
-                    uctx.user_data.read_event(qconn)?;
-                }
-
-                if qconn.is_writable() {
-                    uctx.user_data.write_event(qconn)?;
                 }
             }
         }

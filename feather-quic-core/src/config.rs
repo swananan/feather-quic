@@ -1,10 +1,9 @@
 use std::borrow::Cow;
 
-pub(crate) const DEFAULT_INITIAL_PACKET_SIZE: u16 = 1200;
+pub const DEFAULT_INITIAL_PACKET_SIZE: u16 = 1200;
 const DEFAULT_MAX_IDLE_TIMEOUT: u64 = 0;
 const DEFAULT_MAX_UDP_PAYLOAD_SIZE: u32 = 65527;
-const DEFAULT_MAX_DATA: u64 = 1 << 19;
-const DEFAULT_MAX_STREAM_DATA_BIDI_LOCAL: u64 = 1 << 16;
+const DEFAULT_MAX_STREAM_DATA_BIDI_LOCAL: u64 = 1 << 17;
 const DEFAULT_MAX_STREAM_DATA_BIDI_REMOTE: u64 = 1 << 16;
 const DEFAULT_MAX_STREAM_DATA_UNI: u64 = 1 << 16;
 const DEFAULT_MAX_STREAMS_BIDI: u64 = 100;
@@ -70,7 +69,12 @@ impl QuicConfig {
     }
 
     pub(crate) fn get_initial_max_data(&self) -> u64 {
-        self.initial_max_data.unwrap_or(DEFAULT_MAX_DATA)
+        self.initial_max_data.unwrap_or_else(|| {
+            self.get_initial_max_streams_bidi()
+                * (self.get_initial_max_stream_data_bidi_local()
+                    + self.get_initial_max_stream_data_bidi_remote())
+                + self.get_initial_max_streams_uni() * self.get_initial_max_stream_data_uni()
+        })
     }
 
     pub(crate) fn get_initial_max_stream_data_bidi_local(&self) -> u64 {
@@ -122,7 +126,7 @@ impl QuicConfig {
             .unwrap_or(DEFAULT_MAX_UDP_PAYLOAD_SIZE)
     }
 
-    pub(crate) fn set_server_name<'a, S>(&mut self, server_name: S)
+    pub fn set_server_name<'a, S>(&mut self, server_name: S)
     where
         S: Into<Cow<'a, str>>,
     {
@@ -133,7 +137,7 @@ impl QuicConfig {
         self.server_name.clone()
     }
 
-    pub(crate) fn set_alpn<'a, S>(&mut self, alpn: S)
+    pub fn set_alpn<'a, S>(&mut self, alpn: S)
     where
         S: Into<Cow<'a, str>>,
     {

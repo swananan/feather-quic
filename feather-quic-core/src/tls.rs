@@ -229,6 +229,45 @@ pub(crate) struct TlsContext {
     application_client_secret: Option<Vec<u8>>,
 }
 
+trait FromTransportParam {
+    fn from_param(param: &TransportParameter) -> Self;
+}
+
+impl FromTransportParam for u64 {
+    fn from_param(param: &TransportParameter) -> Self {
+        match param {
+            TransportParameter::MaxIdleTimeout(v) => *v,
+            TransportParameter::MaxAckDelay(v) => (*v).into(),
+            TransportParameter::AckDelayExponent(v) => (*v).into(),
+            TransportParameter::InitialMaxData(v) => *v,
+            TransportParameter::InitialMaxStreamDataBidiLocal(v) => *v,
+            TransportParameter::InitialMaxStreamDataBidiRemote(v) => *v,
+            TransportParameter::InitialMaxStreamDataUni(v) => *v,
+            TransportParameter::InitialMaxStreamsBidi(v) => *v,
+            TransportParameter::InitialMaxStreamsUni(v) => *v,
+            _ => panic!("Unexpected transport parameter type"),
+        }
+    }
+}
+
+impl FromTransportParam for u16 {
+    fn from_param(param: &TransportParameter) -> Self {
+        match param {
+            TransportParameter::MaxAckDelay(v) => *v,
+            _ => panic!("Unexpected transport parameter type"),
+        }
+    }
+}
+
+impl FromTransportParam for u8 {
+    fn from_param(param: &TransportParameter) -> Self {
+        match param {
+            TransportParameter::AckDelayExponent(v) => *v,
+            _ => panic!("Unexpected transport parameter type"),
+        }
+    }
+}
+
 impl TlsContext {
     #[allow(unused_variables)]
     pub(crate) fn new(quic_config: &QuicConfig, scid: &[u8]) -> Self {
@@ -318,33 +357,61 @@ impl TlsContext {
             .ok_or_else(|| anyhow!("Application server secret not available"))
     }
 
+    fn get_peer_transport_param<T, F>(&self, predicate: F) -> Option<T>
+    where
+        F: Fn(&TransportParameter) -> bool,
+        T: FromTransportParam,
+    {
+        self.s_tp.as_ref().and_then(|params| {
+            search_transport_parameters(params, predicate).map(|t| T::from_param(t))
+        })
+    }
+
     pub(crate) fn get_peer_idle_timeout(&self) -> Option<u64> {
-        search_transport_parameters(self.s_tp.as_ref()?, |item| {
-            matches!(item, TransportParameter::MaxIdleTimeout(_))
-        })
-        .map(|t| match t {
-            TransportParameter::MaxIdleTimeout(tt) => *tt,
-            _ => panic!(),
-        })
+        self.get_peer_transport_param(|item| matches!(item, TransportParameter::MaxIdleTimeout(_)))
     }
 
     pub(crate) fn get_peer_max_ack_delay(&self) -> Option<u16> {
-        search_transport_parameters(self.s_tp.as_ref()?, |item| {
-            matches!(item, TransportParameter::MaxAckDelay(_))
-        })
-        .map(|t| match t {
-            TransportParameter::MaxAckDelay(tt) => *tt,
-            _ => panic!(),
-        })
+        self.get_peer_transport_param(|item| matches!(item, TransportParameter::MaxAckDelay(_)))
     }
 
     pub(crate) fn get_peer_ack_delay_exponent(&self) -> Option<u8> {
-        search_transport_parameters(self.s_tp.as_ref()?, |item| {
+        self.get_peer_transport_param(|item| {
             matches!(item, TransportParameter::AckDelayExponent(_))
         })
-        .map(|t| match t {
-            TransportParameter::AckDelayExponent(tt) => *tt,
-            _ => panic!(),
+    }
+
+    pub(crate) fn get_peer_initial_max_data(&self) -> Option<u64> {
+        self.get_peer_transport_param(|item| matches!(item, TransportParameter::InitialMaxData(_)))
+    }
+
+    pub(crate) fn get_peer_initial_max_stream_data_bidi_local(&self) -> Option<u64> {
+        self.get_peer_transport_param(|item| {
+            matches!(item, TransportParameter::InitialMaxStreamDataBidiLocal(_))
+        })
+    }
+
+    pub(crate) fn get_peer_initial_max_stream_data_bidi_remote(&self) -> Option<u64> {
+        self.get_peer_transport_param(|item| {
+            matches!(item, TransportParameter::InitialMaxStreamDataBidiRemote(_))
+        })
+    }
+
+    pub(crate) fn get_peer_initial_max_stream_data_uni(&self) -> Option<u64> {
+        self.get_peer_transport_param(|item| {
+            matches!(item, TransportParameter::InitialMaxStreamDataUni(_))
+        })
+    }
+
+    pub(crate) fn get_peer_initial_max_streams_bidi(&self) -> Option<u64> {
+        self.get_peer_transport_param(|item| {
+            matches!(item, TransportParameter::InitialMaxStreamsBidi(_))
+        })
+    }
+
+    pub(crate) fn get_peer_initial_max_streams_uni(&self) -> Option<u64> {
+        self.get_peer_transport_param(|item| {
+            matches!(item, TransportParameter::InitialMaxStreamsUni(_))
         })
     }
 
@@ -702,10 +769,6 @@ impl TlsContext {
     pub(crate) fn get_selected_cipher_suite(&self) -> Result<u16> {
         self.selected_chipher_suite
             .ok_or_else(|| anyhow!("No cipher suite selected"))
-    }
-
-    pub(crate) fn should_send_tls(&self) -> bool {
-        !self.send_queue.is_empty()
     }
 
     pub(crate) fn send(&mut self) -> Option<(Vec<u8>, QuicLevel)> {
