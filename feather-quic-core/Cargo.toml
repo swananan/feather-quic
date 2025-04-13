@@ -1,0 +1,27 @@
+[package]
+name = "feather-quic-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["swananan <jt26wzz@gmail.com>"]
+description = "Core QUIC protocol implementation"
+license = "MIT"
+repository = "https://github.com/swananan/feather-quic"
+keywords = ["quic", "network", "protocol"]
+categories = ["network-programming", "protocols"]
+
+[dependencies]
+mio = { workspace = true }
+mio-timerfd = { workspace = true }
+log = { workspace = true }
+rand = { workspace = true }
+anyhow = { workspace = true }
+io-uring = { workspace = true }
+slab = { workspace = true }
+libc = { workspace = true }
+aes = { workspace = true }
+ring = { workspace = true }
+byteorder = { workspace = true }
+tracing = { workspace = true }
+tracing-log = { workspace = true }
+thiserror = { workspace = true }
+tracing-subscriber = { workspace = true } 

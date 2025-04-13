@@ -6,13 +6,15 @@ use std::fmt::Debug;
 use std::io::{Cursor, Read, Seek, Write};
 use std::ops::Div;
 use std::time::{Duration, Instant};
-use tracing::{info, span, trace, warn, Level};
+use tracing::{info, info_span, trace, warn};
 
 use crate::ack::QuicAckRange;
 use crate::connection::{QuicConnection, QuicLevel};
 use crate::packet::QuicPacket;
-use crate::send::QuicSendContext;
-use crate::utils::{decode_variable_length, encode_variable_length, remaining_bytes};
+use crate::utils::{
+    decode_variable_length, encode_variable_length, encode_variable_length_force_two_bytes,
+    remaining_bytes,
+};
 
 const QUIC_CRYPTO_FRAME_MAX_BUFFER_SIZE: u64 = 1 << 16;
 const QUIC_STATELESS_RESET_TOKEN_LENGTH: u16 = 16;
@@ -94,10 +96,10 @@ impl From<u8> for QuicFrameType {
             0x08..=0x0f => QuicFrameType::Stream,
             0x10 => QuicFrameType::MaxData,
             0x11 => QuicFrameType::MaxStreamData,
-            0x12 => QuicFrameType::MaxStreams,
+            0x12..=0x13 => QuicFrameType::MaxStreams,
             0x14 => QuicFrameType::DataBlocked,
             0x15 => QuicFrameType::StreamDataBlocked,
-            0x16 => QuicFrameType::StreamsBlocked,
+            0x16..=0x17 => QuicFrameType::StreamsBlocked,
             0x18 => QuicFrameType::NewConnectionId,
             0x19 => QuicFrameType::RetireConnectionId,
             0x1a => QuicFrameType::PathChallenge,
@@ -121,13 +123,13 @@ impl From<QuicFrameType> for u8 {
             QuicFrameType::StopSending => 0x05,
             QuicFrameType::Crypto => 0x06,
             QuicFrameType::NewToken => 0x07,
-            QuicFrameType::Stream => 0x08,
+            QuicFrameType::Stream => unreachable!(),
             QuicFrameType::MaxData => 0x10,
             QuicFrameType::MaxStreamData => 0x11,
-            QuicFrameType::MaxStreams => 0x12,
+            QuicFrameType::MaxStreams => unreachable!(),
             QuicFrameType::DataBlocked => 0x14,
             QuicFrameType::StreamDataBlocked => 0x15,
-            QuicFrameType::StreamsBlocked => 0x16,
+            QuicFrameType::StreamsBlocked => unreachable!(),
             QuicFrameType::NewConnectionId => 0x18,
             QuicFrameType::RetireConnectionId => 0x19,
             QuicFrameType::PathChallenge => 0x1a,
@@ -192,18 +194,18 @@ impl QuicAck {
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-struct QuicResetStream {
+pub(crate) struct QuicResetStream {
     common: QuicFrameCommon,
-    stream_id: u64,
-    application_error_code: u64,
-    final_size: u64,
+    pub(crate) stream_id: u64,
+    pub(crate) application_error_code: u64,
+    pub(crate) final_size: u64,
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-struct QuicStopSending {
+pub(crate) struct QuicStopSending {
     common: QuicFrameCommon,
-    stream_id: u64,
+    pub(crate) stream_id: u64,
     application_error_code: u64,
 }
 
@@ -223,13 +225,13 @@ struct QuicNewToken {
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-pub(crate) struct QuicStream {
+pub(crate) struct QuicStreamFrame {
     common: QuicFrameCommon,
-    stream_id: u64,
-    offset: u64,
-    length: u64,
-    is_fin: bool,
-    stream_data: Vec<u8>,
+    pub(crate) stream_id: u64,
+    pub(crate) offset: u64,
+    pub(crate) stream_data: Option<Vec<u8>>,
+    pub(crate) length: u64,
+    pub(crate) is_fin: bool,
 }
 
 #[allow(dead_code)]
@@ -241,9 +243,9 @@ struct QuicMaxData {
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-struct QuicMaxStreamData {
+pub(crate) struct QuicMaxStreamData {
     common: QuicFrameCommon,
-    stream_id: u64,
+    pub(crate) stream_id: u64,
     maximum_stream_data: u64,
 }
 
@@ -263,9 +265,9 @@ struct QuicDataBlocked {
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-struct QuicStreamDataBlocked {
+pub(crate) struct QuicStreamDataBlocked {
     common: QuicFrameCommon,
-    stream_id: u64,
+    pub(crate) stream_id: u64,
     maximum_stream_data: u64,
 }
 
@@ -274,6 +276,7 @@ struct QuicStreamDataBlocked {
 struct QuicStreamsBlocked {
     common: QuicFrameCommon,
     maximum_streams: u64,
+    is_bidirectional: bool,
 }
 
 #[allow(dead_code)]
@@ -341,7 +344,7 @@ pub(crate) enum QuicFrame {
     StopSending(QuicStopSending),
     Crypto(QuicCrypto),
     NewToken(QuicNewToken),
-    Stream(QuicStream),
+    Stream(QuicStreamFrame),
     MaxData(QuicMaxData),
     MaxStreamData(QuicMaxStreamData),
     MaxStreams(QuicMaxStreams),
@@ -357,10 +360,15 @@ pub(crate) enum QuicFrame {
 }
 
 impl QuicFrame {
-    pub(crate) fn serialize<W>(&self, cursor: &mut W, remain: u16) -> Result<bool>
+    pub(crate) fn serialize<W>(
+        &mut self,
+        cursor: &mut W,
+        remain: u16,
+    ) -> Result<(bool, Option<QuicFrame>)>
     where
         W: Write + Seek + Read,
     {
+        const MAX_VARIABLE_FIELD_SIZE: u16 = 8;
         match self {
             QuicFrame::Ack(ack_frame) => {
                 // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.3
@@ -374,12 +382,12 @@ impl QuicFrame {
                 //   [ECN Counts (..)],
                 // }
 
-                if remain < 5 * 8 {
+                if remain < 5 * MAX_VARIABLE_FIELD_SIZE {
                     warn!(
                         "Should provide more buffer for Ack frame, only got {} bytes",
                         remain
                     );
-                    return Ok(false);
+                    return Ok((false, None));
                 }
 
                 let frame_type: u8 = QuicFrameType::Ack.into();
@@ -390,7 +398,9 @@ impl QuicFrame {
                 let consumed_size = cursor.stream_position()?.saturating_sub(start_pos);
 
                 let remain_bytes = (remain as u64).saturating_sub(consumed_size);
-                let range_count = remain_bytes.saturating_sub(2 * 8).div(2 * 8);
+                let range_count = remain_bytes
+                    .saturating_sub(2 * MAX_VARIABLE_FIELD_SIZE as u64)
+                    .div(2 * MAX_VARIABLE_FIELD_SIZE as u64);
                 let ack_range_count = if range_count < ack_frame.ack_range_count {
                     warn!(
                         "remain_bytes {} is not enough, ack_range_count is {}, but \
@@ -425,18 +435,40 @@ impl QuicFrame {
                 //   Crypto Data (..),
                 // }
 
-                // TODO: check it more accurate
-                if remain < 10 + crypto_frame.crypto_data.len() as u16 {
-                    return Ok(false);
+                if remain < 3 * MAX_VARIABLE_FIELD_SIZE {
+                    return Ok((false, None));
                 }
 
+                let start_pos = cursor.stream_position()?;
                 let frame_type: u8 = QuicFrameType::Crypto.into();
                 encode_variable_length(cursor, frame_type as u64)?;
                 encode_variable_length(cursor, crypto_frame.offset)?;
-                encode_variable_length(cursor, crypto_frame.crypto_data.len() as u64)?;
-                cursor.write_all(&crypto_frame.crypto_data)?;
+                let consumed_size = cursor.stream_position()?.saturating_sub(start_pos);
+                let remain_bytes = (remain as u64).saturating_sub(consumed_size);
+                let writen_len = if (remain_bytes as usize) < crypto_frame.crypto_data.len() {
+                    remain_bytes as usize
+                } else {
+                    crypto_frame.crypto_data.len()
+                };
 
-                trace!("Serialized {:?} frame", QuicFrameType::Crypto);
+                encode_variable_length(cursor, writen_len as u64)?;
+                cursor.write_all(&crypto_frame.crypto_data[0..writen_len])?;
+                if writen_len != crypto_frame.crypto_data.len() {
+                    assert!(writen_len < crypto_frame.crypto_data.len());
+                    info!(
+                        "Have to split the crypto frame, origin len {}, consumed {} bytes",
+                        crypto_frame.crypto_data.len(),
+                        writen_len
+                    );
+                    let new_data = crypto_frame.crypto_data.split_off(writen_len);
+                    let new_frame = QuicFrame::create_crypto_frame(
+                        crypto_frame.offset + writen_len as u64,
+                        new_data,
+                    );
+                    return Ok((true, Some(new_frame)));
+                }
+
+                trace!("Serialized {:?} frame, len {}", crypto_frame, writen_len);
             }
             QuicFrame::Ping(_) => {
                 // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.2
@@ -445,10 +477,142 @@ impl QuicFrame {
 
                 trace!("Serialized {:?} frame", QuicFrameType::Ping);
             }
+            QuicFrame::Stream(stream_frame) => {
+                if remain < 4 * MAX_VARIABLE_FIELD_SIZE {
+                    return Ok((false, None));
+                }
+                /* split frame if need */
+                let mut type_bits: u8 = 0x08;
+                if stream_frame.is_fin {
+                    type_bits |= 0x01;
+                }
+
+                // Add length field no matter what
+                type_bits |= 0x02;
+                if stream_frame.offset > 0 {
+                    type_bits |= 0x04;
+                }
+
+                trace!(
+                    "Quic Stream Frame type_bits: 0x{:x}, stream_id: {}, offset: {}, \
+                    length: {}, remain_bytes {}",
+                    type_bits,
+                    stream_frame.stream_id,
+                    stream_frame.offset,
+                    stream_frame.length,
+                    remain,
+                );
+                let start_pos = cursor.stream_position()?;
+                encode_variable_length(cursor, type_bits as u64)?;
+                encode_variable_length(cursor, stream_frame.stream_id)?;
+                if stream_frame.offset > 0 {
+                    encode_variable_length(cursor, stream_frame.offset)?;
+                }
+                let consumed_size = cursor.stream_position()?.saturating_sub(start_pos);
+                let remain_bytes = (remain as u64)
+                    .saturating_sub(consumed_size + 2 /* size of length field */);
+                let writen_len = if remain_bytes < stream_frame.length {
+                    remain_bytes
+                } else {
+                    stream_frame.length
+                };
+                // Still need length field, if there are some upcoming stream frames in this
+                // datagram
+                encode_variable_length_force_two_bytes(cursor, writen_len)?;
+                if writen_len > 0 {
+                    cursor.write_all(
+                        &stream_frame.stream_data.as_ref().unwrap()[0..writen_len as usize],
+                    )?;
+                    if writen_len != stream_frame.length {
+                        assert!(writen_len < stream_frame.length);
+                        info!(
+                            "Have to split the stream frame, origin len {}, consumed {} bytes",
+                            stream_frame.length, writen_len
+                        );
+                        let new_data = stream_frame
+                            .stream_data
+                            .as_mut()
+                            .unwrap()
+                            .split_off(writen_len as usize);
+                        let new_len = new_data.len() as u64;
+                        stream_frame.length = writen_len;
+                        let new_frame = QuicFrame::create_stream_frame(
+                            Some(new_data),
+                            stream_frame.offset + writen_len,
+                            stream_frame.stream_id,
+                            stream_frame.is_fin,
+                            new_len,
+                        );
+                        return Ok((true, Some(new_frame)));
+                    }
+                }
+
+                trace!("Serialized {:?} frame", stream_frame);
+            }
+            QuicFrame::ResetStream(frame) => {
+                trace!("Serialized {:?} frame", frame);
+                encode_variable_length(
+                    cursor,
+                    Into::<u8>::into(QuicFrameType::ResetStream) as u64,
+                )?;
+                encode_variable_length(cursor, frame.stream_id)?;
+                encode_variable_length(cursor, frame.application_error_code)?;
+                encode_variable_length(cursor, frame.final_size)?;
+            }
+            QuicFrame::StopSending(frame) => {
+                trace!("Serialized {:?} frame", frame);
+                encode_variable_length(
+                    cursor,
+                    Into::<u8>::into(QuicFrameType::StopSending) as u64,
+                )?;
+                encode_variable_length(cursor, frame.stream_id)?;
+                encode_variable_length(cursor, frame.application_error_code)?;
+            }
+            QuicFrame::MaxData(frame) => {
+                trace!("Serialized {:?} frame", frame);
+                encode_variable_length(cursor, Into::<u8>::into(QuicFrameType::MaxData) as u64)?;
+                encode_variable_length(cursor, frame.maximum_data)?;
+            }
+            QuicFrame::MaxStreamData(frame) => {
+                trace!("Serialized {:?} frame", frame);
+                encode_variable_length(
+                    cursor,
+                    Into::<u8>::into(QuicFrameType::MaxStreamData) as u64,
+                )?;
+                encode_variable_length(cursor, frame.stream_id)?;
+                encode_variable_length(cursor, frame.maximum_stream_data)?;
+            }
+            QuicFrame::MaxStreams(frame) => {
+                trace!("Serialized {:?} frame", frame);
+                encode_variable_length(cursor, Into::<u8>::into(QuicFrameType::MaxStreams) as u64)?;
+                encode_variable_length(cursor, frame.maximum_streams)?;
+            }
+            QuicFrame::DataBlocked(frame) => {
+                trace!("Serialized {:?} frame", frame);
+                encode_variable_length(
+                    cursor,
+                    Into::<u8>::into(QuicFrameType::DataBlocked) as u64,
+                )?;
+                encode_variable_length(cursor, frame.maximum_data)?;
+            }
+            QuicFrame::StreamDataBlocked(frame) => {
+                trace!("Serialized {:?} frame", frame);
+                encode_variable_length(
+                    cursor,
+                    Into::<u8>::into(QuicFrameType::StreamDataBlocked) as u64,
+                )?;
+                encode_variable_length(cursor, frame.stream_id)?;
+                encode_variable_length(cursor, frame.maximum_stream_data)?;
+            }
+            QuicFrame::StreamsBlocked(frame) => {
+                trace!("Serialized {:?} frame", frame);
+                encode_variable_length(cursor, if frame.is_bidirectional { 0x16 } else { 0x17 })?;
+                encode_variable_length(cursor, frame.maximum_streams)?;
+            }
             _ => unimplemented!(),
         }
 
-        Ok(true)
+        Ok((true, None))
     }
 
     pub(crate) fn is_ack_eliciting(&self) -> bool {
@@ -708,34 +872,150 @@ impl QuicFrame {
         Ok(frame_size as u32)
     }
 
-    pub(crate) fn create_crypto_frame(
-        send_ctx: &mut QuicSendContext,
-        crypto_data: Vec<u8>,
-    ) -> Result<Option<QuicFrame>> {
-        let offset = send_ctx.crypto_send_offset;
-        send_ctx.crypto_send_offset += crypto_data.len() as u64;
-
-        let crypto_frame = QuicFrame::Crypto(QuicCrypto {
+    pub(crate) fn create_stop_sending_frame(
+        stream_id: u64,
+        application_error_code: u64,
+    ) -> QuicFrame {
+        let frame = QuicFrame::StopSending(QuicStopSending {
             common: QuicFrameCommon::default(),
-            offset,
-            crypto_data,
+            stream_id,
+            application_error_code,
         });
 
+        trace!("Now we are creating {:?} frame", frame);
+
+        frame
+    }
+
+    pub(crate) fn create_streams_blocked_frame(
+        maximum_streams: u64,
+        is_bidirectional: bool,
+    ) -> QuicFrame {
+        let frame = QuicFrame::StreamsBlocked(QuicStreamsBlocked {
+            common: QuicFrameCommon::default(),
+            maximum_streams,
+            is_bidirectional,
+        });
+
+        trace!("Now we are creating {:?} frame", frame);
+
+        frame
+    }
+
+    pub(crate) fn create_data_blocked_frame(maximum_data: u64) -> QuicFrame {
+        let frame = QuicFrame::DataBlocked(QuicDataBlocked {
+            common: QuicFrameCommon::default(),
+            maximum_data,
+        });
+
+        trace!("Now we are creating {:?} frame", frame);
+
+        frame
+    }
+
+    pub(crate) fn create_stream_data_blocked_frame(
+        stream_id: u64,
+        maximum_stream_data: u64,
+    ) -> QuicFrame {
+        let frame = QuicFrame::StreamDataBlocked(QuicStreamDataBlocked {
+            common: QuicFrameCommon::default(),
+            stream_id,
+            maximum_stream_data,
+        });
+
+        trace!("Now we are creating {:?} frame", frame);
+
+        frame
+    }
+
+    pub(crate) fn create_max_data_frame(maximum_data: u64) -> QuicFrame {
+        let frame = QuicFrame::MaxData(QuicMaxData {
+            common: QuicFrameCommon::default(),
+            maximum_data,
+        });
+
+        trace!("Now we are creating {:?} frame", frame);
+
+        frame
+    }
+
+    pub(crate) fn create_max_stream_data_frame(
+        stream_id: u64,
+        maximum_stream_data: u64,
+    ) -> QuicFrame {
+        let frame = QuicFrame::MaxStreamData(QuicMaxStreamData {
+            common: QuicFrameCommon::default(),
+            stream_id,
+            maximum_stream_data,
+        });
+
+        trace!("Now we are creating {:?} frame", frame);
+
+        frame
+    }
+
+    pub(crate) fn create_reset_stream_frame(
+        stream_id: u64,
+        application_error_code: u64,
+        final_size: u64,
+    ) -> QuicFrame {
+        let frame = QuicFrame::ResetStream(QuicResetStream {
+            common: QuicFrameCommon::default(),
+            stream_id,
+            application_error_code,
+            final_size,
+        });
+
+        trace!("Now we are creating {:?} frame", frame);
+
+        frame
+    }
+
+    pub(crate) fn create_stream_frame(
+        stream_data: Option<Vec<u8>>,
+        offset: u64,
+        stream_id: u64,
+        is_fin: bool,
+        length: u64,
+    ) -> QuicFrame {
+        trace!(
+            "Now we are creating Stream frame, offset {}, data {:?}, fin flag {}",
+            offset,
+            stream_data,
+            is_fin,
+        );
+
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.8-1
+        QuicFrame::Stream(QuicStreamFrame {
+            common: QuicFrameCommon::default(),
+            offset,
+            stream_id,
+            stream_data,
+            length,
+            is_fin,
+        })
+    }
+
+    pub(crate) fn create_crypto_frame(offset: u64, crypto_data: Vec<u8>) -> QuicFrame {
         trace!(
             "Now we are creating Crypto frame, offset {}, length {}",
             offset,
-            send_ctx.crypto_send_offset
+            crypto_data.len(),
         );
 
-        Ok(Some(crypto_frame))
+        QuicFrame::Crypto(QuicCrypto {
+            common: QuicFrameCommon::default(),
+            offset,
+            crypto_data,
+        })
     }
 
     pub(crate) fn handle_quic_frame(qconn: &mut QuicConnection, pkt: &QuicPacket) -> Result<bool> {
-        let span = span!(
-            Level::TRACE,
+        let span = info_span!(
             "handle_quic_frame",
             level = ?pkt.get_packet_level(),
-            payload_len = ?pkt.get_payload().len()
+            pn = ?pkt.get_packet_number(),
+            payload_len = ?pkt.get_payload().len(),
         );
         let _enter = span.enter();
 
@@ -767,9 +1047,23 @@ impl QuicFrame {
                 }
                 QuicFrameType::NewToken => Self::handle_new_token_frame(&mut cursor, qconn, level)?,
                 QuicFrameType::Stream => {
-                    // TODO: support QUIC stream
-                    let mut tmp = vec![0u8; pbuf.len() - cursor.position() as usize];
-                    cursor.read_exact(&mut tmp)?;
+                    Self::handle_stream_frame(&mut cursor, qconn, frame_type_val)?
+                }
+                QuicFrameType::ResetStream => Self::handle_reset_stream_frame(&mut cursor, qconn)?,
+                QuicFrameType::StopSending => Self::handle_stop_sending_frame(&mut cursor, qconn)?,
+                QuicFrameType::MaxStreams => {
+                    Self::handle_max_streams_frame(&mut cursor, qconn, frame_type_val)?
+                }
+                QuicFrameType::MaxData => Self::handle_max_data_frame(&mut cursor, qconn)?,
+                QuicFrameType::MaxStreamData => {
+                    Self::handle_max_stream_data_frame(&mut cursor, qconn)?
+                }
+                QuicFrameType::StreamsBlocked => {
+                    Self::handle_streams_blocked_frame(&mut cursor, qconn, frame_type_val)?
+                }
+                QuicFrameType::DataBlocked => Self::handle_data_blocked_frame(&mut cursor, qconn)?,
+                QuicFrameType::StreamDataBlocked => {
+                    Self::handle_stream_data_blocked_frame(&mut cursor, qconn)?
                 }
                 _ => unimplemented!(),
             }
@@ -789,7 +1083,7 @@ impl QuicFrame {
     }
 
     fn is_ack_eliciting_by_frame_type(ft: QuicFrameType) -> bool {
-        matches!(
+        !matches!(
             ft,
             QuicFrameType::Ack | QuicFrameType::Padding | QuicFrameType::ConnectionClose
         )
@@ -800,6 +1094,9 @@ impl QuicFrame {
         qconn: &mut QuicConnection,
         level: QuicLevel,
     ) -> Result<()> {
+        let span = info_span!("handle_crypto_frame", level = ?level);
+        let _enter = span.enter();
+
         let offset = decode_variable_length(cursor)?;
         let length = decode_variable_length(cursor)?;
 
@@ -836,11 +1133,13 @@ impl QuicFrame {
                     offset
                 );
                 // https://www.rfc-editor.org/rfc/rfc9000.html#section-7.5
-                if send_ctx.get_recv_cbufs_length() + length > QUIC_CRYPTO_FRAME_MAX_BUFFER_SIZE {
+                if send_ctx.get_crypto_recv_cbufs_length() + length
+                    > QUIC_CRYPTO_FRAME_MAX_BUFFER_SIZE
+                {
                     // TODO: Need to close connection with `CRYPTO_BUFFER_EXCEEDED`
-                    return Ok(());
+                    return Err(anyhow!("Too much crypto frame data"));
                 }
-                send_ctx.insert_recv_cbufs(
+                send_ctx.insert_crypto_recv_cbufs(
                     &cursor.get_ref()
                         [crypto_start_pos as usize..crypto_start_pos as usize + length as usize],
                     offset,
@@ -849,13 +1148,13 @@ impl QuicFrame {
                 return Ok(());
             }
             Ordering::Greater => {
-                trace!(
+                info!(
                     "Out-of-order CRYPTO frame has been received: expected offset={}, got={}",
-                    send_ctx.crypto_recv_offset,
-                    offset
+                    send_ctx.crypto_recv_offset, offset
                 );
 
                 // https://www.rfc-editor.org/rfc/rfc9002.html#section-6.2.3
+                cursor.seek_relative(length as i64)?;
                 send_ctx.resend_all()?;
                 qconn.set_next_send_event_time(0);
 
@@ -873,7 +1172,7 @@ impl QuicFrame {
         )?;
         cursor.seek_relative(length as i64)?;
 
-        if let Some(pre_buf) = send_ctx.consume_pre_recv_cbufs(offset + length) {
+        if let Some(pre_buf) = send_ctx.consume_next_recv_cbufs(offset + length) {
             trace!(
                 "Continue to consume pre restored crypto bufs, offset {}, length {}, crypto_recv_offset {}",
                 offset + length,
@@ -907,10 +1206,12 @@ impl QuicFrame {
         }
 
         if qconn.tls.have_server_transport_params() {
+            qconn.handle_encrypted_extensions();
+
             if qconn.idle_timeout.is_none() {
                 // Max_idle_timeout: Idle timeout is disabled when both endpoints
                 // omit this transport parameter or specify a value of 0.
-                let peer_idle_timeout = qconn.tls.get_peer_idle_timeout().unwrap_or(0);
+                let peer_idle_timeout = qconn.get_peer_max_idle_timeout().unwrap_or(0);
                 let local_idle_timeout = qconn.quic_config.get_idle_timeout();
 
                 qconn.idle_timeout = if local_idle_timeout == 0 {
@@ -930,13 +1231,15 @@ impl QuicFrame {
             }
 
             if qconn.rtt.max_ack_delay.is_none() {
-                if let Some(mad) = qconn.tls.get_peer_max_ack_delay() {
+                if let Some(mad) = qconn.get_peer_max_ack_delay() {
+                    info!("Update max_ack_delay to {} from peer", mad);
                     qconn.rtt.max_ack_delay = Some(mad);
                 }
             }
 
             if qconn.rtt.ack_delay_exponent.is_none() {
-                if let Some(ade) = qconn.tls.get_peer_ack_delay_exponent() {
+                if let Some(ade) = qconn.get_peer_ack_delay_exponent() {
+                    info!("Update ack_delay_exponent to {} from peer", ade);
                     qconn.rtt.ack_delay_exponent = Some(ade);
                 }
             }
@@ -945,6 +1248,196 @@ impl QuicFrame {
         qconn.consume_tls_send_queue()?;
 
         Ok(())
+    }
+
+    fn handle_reset_stream_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+    ) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.4
+        // RESET_STREAM Frame {
+        //   Type (i) = 0x04,
+        //   Stream ID (i),
+        //   Application Protocol Error Code (i),
+        //   Final Size (i),
+        // }
+        let span = info_span!("handle_reset_stream_frame");
+        let _enter = span.enter();
+
+        let stream_id = decode_variable_length(cursor)?;
+        let application_error_code = decode_variable_length(cursor)?;
+        let final_size = decode_variable_length(cursor)?;
+
+        trace!(
+            "Got reset stream frame, stream id {}, error code {}, final_size {}",
+            stream_id,
+            application_error_code,
+            final_size,
+        );
+
+        qconn.handle_reset_stream_frame(stream_id, application_error_code, final_size)
+    }
+
+    fn handle_stop_sending_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+    ) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.5
+        // STOP_SENDING Frame {
+        //   Type (i) = 0x05,
+        //   Stream ID (i),
+        //   Application Protocol Error Code (i),
+        // }
+        let span = info_span!("handle_stop_sending_frame");
+        let _enter = span.enter();
+
+        let stream_id = decode_variable_length(cursor)?;
+        let application_error_code = decode_variable_length(cursor)?;
+
+        trace!(
+            "Got stop sending frame, stream id {}, error code {}",
+            stream_id,
+            application_error_code
+        );
+
+        qconn.handle_stop_sending_frame(stream_id, application_error_code)
+    }
+
+    fn handle_max_streams_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+        frame_type: u64,
+    ) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.11
+        // MAX_STREAMS Frame {
+        //   Type (i) = 0x12..0x13,
+        //   Maximum Streams (i),
+        // }
+        let span = info_span!("handle_max_streams_frame", frame_type = ?frame_type);
+        let _enter = span.enter();
+
+        let is_bidirectional = if frame_type == 0x12 {
+            true
+        } else if frame_type == 0x13 {
+            false
+        } else {
+            // TODO: QUIC Termination
+            panic!("Invalid frame_type {}", frame_type);
+        };
+        let max_streams = decode_variable_length(cursor)?;
+
+        trace!(
+            "Got max streams frame, is_bidirectional {}, max_streams {}",
+            is_bidirectional,
+            max_streams
+        );
+
+        qconn.handle_max_streams_frame(is_bidirectional, max_streams)
+    }
+
+    fn handle_max_stream_data_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+    ) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.10
+        // MAX_STREAM_DATA Frame {
+        //   Type (i) = 0x11,
+        //   Stream ID (i),
+        //   Maximum Stream Data (i),
+        // }
+        let span = info_span!("handle_max_stream_data_frame");
+        let _enter = span.enter();
+
+        let stream_id = decode_variable_length(cursor)?;
+        let maximum_stream_data = decode_variable_length(cursor)?;
+
+        trace!(
+            "Got max stream data frame, stream_id {}, maximum_stream_data {}",
+            stream_id,
+            maximum_stream_data
+        );
+
+        qconn.handle_max_stream_data_frame(stream_id, maximum_stream_data)
+    }
+
+    fn handle_streams_blocked_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+        frame_type: u64,
+    ) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.14
+        let span = info_span!("handle_streams_blocked_frame");
+        let _enter = span.enter();
+
+        let maximum_streams = decode_variable_length(cursor)?;
+
+        let is_bidirectional = if frame_type == 0x17 {
+            false
+        } else if frame_type == 0x16 {
+            true
+        } else {
+            // TODO: QUIC Termination
+            panic!("Invalid frame_type {}", frame_type);
+        };
+        trace!(
+            "Got streams blocked frame, maximum_streams {}, is_bidirectional {}",
+            maximum_streams,
+            is_bidirectional
+        );
+
+        qconn.handle_streams_blocked_frame(maximum_streams, is_bidirectional)
+    }
+
+    fn handle_data_blocked_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+    ) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.12
+        let span = info_span!("handle_data_blocked_frame");
+        let _enter = span.enter();
+
+        let maximum_data = decode_variable_length(cursor)?;
+
+        trace!("Got data blocked frame, maximum_data {}", maximum_data);
+
+        qconn.handle_data_blocked_frame(maximum_data)
+    }
+
+    fn handle_stream_data_blocked_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+    ) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.13
+        let span = info_span!("handle_stream_data_blocked_frame");
+        let _enter = span.enter();
+
+        let stream_id = decode_variable_length(cursor)?;
+        let maximum_stream_data = decode_variable_length(cursor)?;
+
+        trace!(
+            "Got stream data blocked frame, stream_id {}, maximum_stream_data {}",
+            stream_id,
+            maximum_stream_data
+        );
+
+        qconn.handle_stream_data_blocked_frame(stream_id, maximum_stream_data)
+    }
+
+    fn handle_max_data_frame(cursor: &mut Cursor<&[u8]>, qconn: &mut QuicConnection) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.9
+        // MAX_DATA Frame {
+        //   Type (i) = 0x10,
+        //   Maximum Data (i),
+        // }
+
+        let span = info_span!("handle_max_data_frame");
+        let _enter = span.enter();
+
+        let maximum_data = decode_variable_length(cursor)?;
+
+        trace!("Got max data frame, maximum_data {}", maximum_data);
+
+        qconn.handle_max_data_frame(maximum_data)
     }
 
     fn handle_new_token_frame(
@@ -958,6 +1451,9 @@ impl QuicFrame {
         //  Token Length (i),
         //  Token (..),
         //}
+
+        let span = info_span!("handle_new_token_frame", level = ?level);
+        let _enter = span.enter();
 
         assert_eq!(level, QuicLevel::Application);
 
@@ -986,6 +1482,9 @@ impl QuicFrame {
         //   Connection ID (8..160),
         //   Stateless Reset Token (128),
         // }
+
+        let span = info_span!("handle_new_conncetion_id_frame", level = ?level);
+        let _enter = span.enter();
 
         assert_eq!(level, QuicLevel::Application);
 
@@ -1029,6 +1528,9 @@ impl QuicFrame {
         //    Type (i) = 0x1e,
         // }
 
+        let span = info_span!("handle_handshake_done_frame", level = ?level);
+        let _enter = span.enter();
+
         assert_eq!(level, QuicLevel::Application);
         info!("Now we can say that QUIC handshake was performed perfectly!");
 
@@ -1063,7 +1565,7 @@ impl QuicFrame {
         let ping_frame = QuicFrame::Ping(QuicPing::default());
         send_ctx.insert_send_queue_front(ping_frame);
 
-        trace!("Now we are creating {:?} ping frame", level,);
+        trace!("Created {:?} ping frame", level);
 
         Ok(())
     }
@@ -1074,6 +1576,9 @@ impl QuicFrame {
         qconn: &mut QuicConnection,
         level: QuicLevel,
     ) -> Result<()> {
+        let span = info_span!("handle_padding_frame", level = ?level);
+        let _enter = span.enter();
+
         // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.1
 
         // Padding frame doesn't have length field, but it must be the last QUIC frame in the packet
@@ -1090,14 +1595,25 @@ impl QuicFrame {
         qconn: &mut QuicConnection,
         level: QuicLevel,
     ) -> Result<()> {
+        let span = info_span!("handle_ping_frame", level = ?level);
+        let _enter = span.enter();
+
         // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.2
         // The receiver of a PING frame simply needs to acknowledge the packet containing this frame.
         // The PING frame can be used to keep a connection alive when an application or application
         // protocol wishes to prevent the connection from timing out; see Section 10.1.2.
-
-        // TODO: need to ack
-
         Ok(())
+    }
+
+    fn handle_stream_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+        type_bits: u64,
+    ) -> Result<()> {
+        let span = info_span!("handle_stream_frame", type_bits = ?type_bits);
+        let _enter = span.enter();
+
+        qconn.handle_stream_frame(cursor, type_bits)
     }
 
     fn handle_ack_frame(
@@ -1115,6 +1631,8 @@ impl QuicFrame {
         //   ACK Range (..) ...,
         //   [ECN Counts (..)],
         // }
+        let span = info_span!("handle_ack_frame", level = ?level);
+        let _enter = span.enter();
 
         let largest_acked = decode_variable_length(cursor)?;
         // https://www.rfc-editor.org/rfc/rfc9000.html#section-13.2.5
@@ -1155,16 +1673,16 @@ impl QuicFrame {
 
         // Clean the Acked frames in sent queue
         // and retire the old ack ranges in the ack generator
-        send_ctx.handle_ack_frame(
+        let stream_frames = send_ctx.handle_ack_frame(
             first_ack_range,
             largest_acked,
             &ack_ranges,
             &mut qconn.rtt,
-            level,
             &qconn.current_ts,
             ack_delay,
         )?;
 
+        qconn.handle_acked_stream_frame(stream_frames)?;
         qconn.reset_pto_backoff_factor();
         qconn.detect_lost()?;
         qconn.set_loss_or_pto_timer()?;

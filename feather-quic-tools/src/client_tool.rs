@@ -5,22 +5,9 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use tracing::{info, trace};
 use tracing_subscriber::EnvFilter;
 
-mod ack;
-mod config;
-mod connection;
-mod crypto;
-mod frame;
-mod packet;
-mod rtt;
-mod runtime;
-mod send;
-mod tls;
-mod transport_parameters;
-mod utils;
-
-use crate::config::{QuicConfig, DEFAULT_INITIAL_PACKET_SIZE};
-use crate::connection::QuicConnection;
-use crate::runtime::{QuicCallbacks, QuicRuntime, QuicUserContext, RuntimeConfig};
+use feather_quic_core::prelude::*;
+mod echo_context;
+use echo_context::FeatherQuicEchoContext;
 
 fn limitation_initial_packet_size(s: &str) -> Result<u16, String> {
     number_range(s, DEFAULT_INITIAL_PACKET_SIZE, u16::MAX)
@@ -64,19 +51,72 @@ impl QuicCallbacks for FeatherQuicClientContext {
 
     fn connect_done(&mut self, qconn: &mut QuicConnection) -> Result<()> {
         info!("QUIC connection established successfully");
-        // TODO: Initiate application data transfer (e.g., HTTP/3)
+
+        let new_stream = qconn.open_stream(true)?;
+
+        let buf = vec![1u8; 10];
+        match qconn.stream_send(new_stream, &buf) {
+            Ok(sent_bytes) => {
+                trace!(
+                    "Quic stream {:?} sent {} bytes successfully",
+                    new_stream,
+                    sent_bytes
+                );
+            }
+            Err(e) => match e {
+                QuicConnectionError::StreamNotExist(_) => {}
+                QuicConnectionError::QuicStreamError(e) => {
+                    if matches!(e, QuicStreamError::WouldBlock) {
+                        qconn.set_stream_write_active(new_stream, true)?;
+                    }
+                }
+                _ => panic!(),
+            },
+        }
+
+        let recv_len = 1024;
+        match qconn.stream_recv(new_stream, recv_len) {
+            Ok(recv_bytes) => {
+                trace!(
+                    "Quic stream {:?} received {} bytes successfully",
+                    new_stream,
+                    recv_bytes.len()
+                );
+            }
+            Err(e) => match e {
+                QuicConnectionError::StreamNotExist(_) => {}
+                QuicConnectionError::QuicStreamError(e) => {
+                    if matches!(e, QuicStreamError::WouldBlock) {
+                        qconn.set_stream_read_active(new_stream, true)?;
+                    }
+                }
+                _ => panic!(),
+            },
+        }
+
+        qconn.stream_finish(new_stream)?;
+        qconn.stream_shutdown_read(new_stream, 0x01 /* Test Application Error Code */)?;
+
         Ok(())
     }
 
-    fn read_event(&mut self, qconn: &mut QuicConnection) -> Result<()> {
-        trace!("QUIC stream readable event received");
+    fn read_event(
+        &mut self,
+        qconn: &mut QuicConnection,
+        stream_handle: QuicStreamHandle,
+    ) -> Result<()> {
+        trace!("QUIC stream {:?} readable event received", stream_handle);
         // TODO: Handle incoming stream data from QUIC stack
         // TODO: Optionally send response data
         Ok(())
     }
 
-    fn write_event(&mut self, qconn: &mut QuicConnection) -> Result<()> {
-        trace!("QUIC stream writable event received");
+    fn write_event(
+        &mut self,
+        qconn: &mut QuicConnection,
+        stream_handle: QuicStreamHandle,
+    ) -> Result<()> {
+        trace!("QUIC stream {:?} writable event received", stream_handle);
         // TODO: Resume sending data if previously blocked since QUIC stack send queue is full
         Ok(())
     }
@@ -104,6 +144,13 @@ fn main() -> Result<()> {
                 .long("target-address")
                 .help("Target address to establish QUIC connection with")
                 .required(true)
+                .num_args(1),
+        )
+        .arg(
+            Arg::new("echo_file")
+                .short('e')
+                .long("echo")
+                .help("File path to read lines from for echo testing")
                 .num_args(1),
         )
         .arg(
@@ -301,11 +348,47 @@ fn main() -> Result<()> {
                 .help("Maximum delay in milliseconds for reordered packets (default: 10) Not implemented yet!")
                 .value_parser(clap::value_parser!(u64)),
         )
+        .arg(
+            Arg::new("echo_stream_number")
+                .long("echo-stream-number")
+                .help("Number of QUIC streams to use in echo mode (default: 1)")
+                .default_value("1")
+                .value_parser(more_then_zero),
+        )
+        .arg(
+            Arg::new("log_file")
+                .long("log-file")
+                .help("Path to write all logs to (default: stdout/stderr)")
+                .num_args(1),
+        )
+        .arg(
+            Arg::new("debug")
+                .long("debug")
+                .help("Enable debug mode to include source code line numbers in logs")
+                .action(clap::ArgAction::SetTrue),
+        )
         .get_matches();
 
     let env_filter = EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()));
 
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    let is_debug = matches.get_flag("debug");
+
+    if let Some(log_file) = matches.get_one::<String>("log_file") {
+        let file = std::fs::File::create(log_file)
+            .with_context(|| format!("Failed to create log file: {}", log_file))?;
+        tracing_subscriber::fmt::SubscriberBuilder::default()
+            .with_env_filter(env_filter)
+            .with_writer(file)
+            .with_ansi(false)
+            .with_line_number(is_debug)
+            .init();
+    } else {
+        tracing_subscriber::fmt::SubscriberBuilder::default()
+            .with_env_filter(env_filter)
+            .with_ansi(true)
+            .with_line_number(is_debug)
+            .init();
+    }
 
     let use_io_uring = matches.get_flag("use_io_uring");
     let target_address = matches.get_one::<String>("target_address").unwrap().clone();
@@ -446,10 +529,21 @@ fn main() -> Result<()> {
     };
 
     let mut qconn = QuicConnection::new(config);
-    let mut uctx = QuicUserContext::new(FeatherQuicClientContext::default());
+
     let mut runtime = QuicRuntime::new(runtime_config);
 
-    runtime.run(&mut qconn, &mut uctx)?;
+    // Create appropriate context based on echo option
+    if let Some(echo_file) = matches.get_one::<String>("echo_file") {
+        let num_streams = matches.get_one::<u64>("echo_stream_number").unwrap_or(&1);
+        let mut uctx = QuicUserContext::new(FeatherQuicEchoContext::new(
+            echo_file.clone(),
+            *num_streams,
+        )?);
+        runtime.run(&mut qconn, &mut uctx)?;
+    } else {
+        let mut uctx = QuicUserContext::new(FeatherQuicClientContext::default());
+        runtime.run(&mut qconn, &mut uctx)?;
+    };
 
     Ok(())
 }
