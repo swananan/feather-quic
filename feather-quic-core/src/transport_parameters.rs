@@ -1,12 +1,12 @@
 use anyhow::{anyhow, Result};
-use byteorder::ReadBytesExt;
 use byteorder::{BigEndian, WriteBytesExt};
 use std::fmt;
 use std::io::{Cursor, Read, Seek, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use tracing::{error, trace, warn};
+use tracing::{trace, warn};
 
 use crate::config::QuicConfig;
+use crate::tls::TlsContext;
 use crate::utils::{decode_variable_length, encode_variable_length, get_variable_length};
 
 #[allow(dead_code)]
@@ -34,8 +34,16 @@ pub(crate) enum TransportParameter {
 
     InitialMaxData(u64),
 
+    // This parameter is an integer value specifying the initial flow control limit for locally initiated bidirectional streams.
+    // This limit applies to newly created bidirectional streams opened by the endpoint that sends the transport parameter.
+    // In client transport parameters, this applies to streams with an identifier with the least significant two
+    // bits set to 0x00; in server transport parameters, this applies to streams with the least significant two bits set to 0x01.
     InitialMaxStreamDataBidiLocal(u64),
 
+    // This parameter is an integer value specifying the initial flow control limit for peer-initiated bidirectional streams.
+    // This limit applies to newly created bidirectional streams opened by the endpoint that receives the transport parameter.
+    // In client transport parameters, this applies to streams with an identifier with the least significant two bits set to 0x01;
+    // in server transport parameters, this applies to streams with the least significant two bits set to 0x00
     InitialMaxStreamDataBidiRemote(u64),
 
     InitialMaxStreamDataUni(u64),
@@ -162,9 +170,9 @@ impl TransportParameter {
     }
 
     pub(crate) fn deserialize(cursor: &mut Cursor<&[u8]>) -> Result<Option<TransportParameter>> {
-        let type_id = cursor.read_u8()?;
+        let type_id = decode_variable_length(cursor)?;
         trace!(
-            "Deserializing transport parameter type 0x{:02x} at position {}",
+            "Deserializing transport parameter type 0x{:x} at position {}",
             type_id,
             cursor.position() - 1
         );
@@ -371,9 +379,9 @@ impl TransportParameter {
                 );
                 TransportParameter::DisableActiveMigration(value == 0)
             }
-            0x0D => {
-                unimplemented!();
-            }
+            // 0x0D => {
+            //     unimplemented!();
+            // }
             0x0E => {
                 let len = decode_variable_length(cursor)?;
                 trace!(
@@ -426,10 +434,13 @@ impl TransportParameter {
                 // https://www.rfc-editor.org/info/rfc9368
                 // or Ack frequency
                 // https://datatracker.ietf.org/doc/html/draft-ietf-quic-ack-frequency
-                error!(
-                    "Invalid or unsupported transport parameter type id: 0x{:x}",
-                    type_id,
+                let len = decode_variable_length(cursor)?;
+                warn!(
+                    "Invalid or unsupported transport parameter type id: 0x{:x}, len {}",
+                    type_id, len,
                 );
+                let mut value = vec![0; len as usize];
+                cursor.read_exact(&mut value)?;
 
                 return Ok(None);
             }
@@ -568,10 +579,6 @@ pub(crate) fn parse_server_transport_parameters(
     while cursor.position() - tp_start_pos < length as u64 {
         if let Some(t) = TransportParameter::deserialize(cursor)? {
             tp.push(t);
-        } else {
-            warn!("We will skip the next QUIC parameters due to the current invalid or unsupported parameter");
-            cursor.set_position(length as u64 + tp_start_pos);
-            break;
         }
     }
 
@@ -611,4 +618,77 @@ pub(crate) fn create_client_transport_parameters(
         TransportParameter::ActiveConnectionIdLimit(quic_config.get_active_connection_id_limit()),
         TransportParameter::MaxUdpPayloadSize(quic_config.get_max_udp_payload_size()),
     ]
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PeerTransportParameters {
+    max_idle_timeout: Option<u64>,
+    max_ack_delay: Option<u16>,
+    ack_delay_exponent: Option<u8>,
+    initial_max_data: Option<u64>,
+    initial_max_stream_data_bidi_local: Option<u64>,
+    initial_max_stream_data_bidi_remote: Option<u64>,
+    initial_max_stream_data_uni: Option<u64>,
+    initial_max_streams_bidi: Option<u64>,
+    initial_max_streams_uni: Option<u64>,
+    updated: bool,
+}
+
+impl PeerTransportParameters {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn update_from_tls(&mut self, tls: &TlsContext) {
+        if self.updated {
+            return;
+        }
+        self.max_idle_timeout = tls.get_peer_idle_timeout();
+        self.max_ack_delay = tls.get_peer_max_ack_delay();
+        self.ack_delay_exponent = tls.get_peer_ack_delay_exponent();
+        self.initial_max_data = tls.get_peer_initial_max_data();
+        self.initial_max_stream_data_bidi_local = tls.get_peer_initial_max_stream_data_bidi_local();
+        self.initial_max_stream_data_bidi_remote =
+            tls.get_peer_initial_max_stream_data_bidi_remote();
+        self.initial_max_stream_data_uni = tls.get_peer_initial_max_stream_data_uni();
+        self.initial_max_streams_bidi = tls.get_peer_initial_max_streams_bidi();
+        self.initial_max_streams_uni = tls.get_peer_initial_max_streams_uni();
+        self.updated = true;
+    }
+
+    pub(crate) fn get_max_idle_timeout(&self) -> Option<u64> {
+        self.max_idle_timeout
+    }
+
+    pub(crate) fn get_max_ack_delay(&self) -> Option<u16> {
+        self.max_ack_delay
+    }
+
+    pub(crate) fn get_ack_delay_exponent(&self) -> Option<u8> {
+        self.ack_delay_exponent
+    }
+
+    pub(crate) fn get_initial_max_data(&self) -> Option<u64> {
+        self.initial_max_data
+    }
+
+    pub(crate) fn get_initial_max_stream_data_bidi_local(&self) -> Option<u64> {
+        self.initial_max_stream_data_bidi_local
+    }
+
+    pub(crate) fn get_initial_max_stream_data_bidi_remote(&self) -> Option<u64> {
+        self.initial_max_stream_data_bidi_remote
+    }
+
+    pub(crate) fn get_initial_max_stream_data_uni(&self) -> Option<u64> {
+        self.initial_max_stream_data_uni
+    }
+
+    pub(crate) fn get_initial_max_streams_bidi(&self) -> Option<u64> {
+        self.initial_max_streams_bidi
+    }
+
+    pub(crate) fn get_initial_max_streams_uni(&self) -> Option<u64> {
+        self.initial_max_streams_uni
+    }
 }

@@ -47,9 +47,14 @@ jobs:
         if: matrix.rust == 'stable'
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      # Step 6: Run Miri (Test memory safety)
+      # Step 5: Run Clippy (Lint checks)
+      - name: Run Intergration Tests
+        if: matrix.rust == 'stable'
+        run: PRINT_TO_STDOUT=1 cargo test -p feather-quic-integration-tests -- --test-threads=1
+
+      # Step 7: Run Miri (Test memory safety)
       - name: Run Miri
         if: matrix.rust == 'nightly'
         run: |
           cargo miri setup
-          cargo miri test
+          cargo miri test -p feather-quic-core

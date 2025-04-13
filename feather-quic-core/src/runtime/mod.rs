@@ -1,6 +1,5 @@
-use crate::runtime::io_uring::IoUringEventLoop;
-use crate::runtime::mio::MioEventLoop;
-use crate::QuicConnection;
+use crate::connection::QuicConnection;
+use crate::stream::QuicStreamHandle;
 
 use anyhow::Result;
 use std::net::SocketAddr;
@@ -8,20 +7,61 @@ use std::net::SocketAddr;
 mod io_uring;
 mod mio;
 
-pub struct QuicUserContext<T> {
+pub(crate) use io_uring::IoUringEventLoop;
+pub(crate) use mio::MioEventLoop;
+
+pub struct QuicUserContext<T>
+where
+    T: QuicCallbacks,
+{
     user_data: T,
 }
 
-impl<T> QuicUserContext<T> {
+impl<T> QuicUserContext<T>
+where
+    T: QuicCallbacks,
+{
     pub fn new(user_data: T) -> Self {
         Self { user_data }
+    }
+
+    pub(crate) fn run_connect_done_event(&mut self, qconn: &mut QuicConnection) -> Result<()> {
+        self.user_data.connect_done(qconn)
+    }
+
+    pub(crate) fn run_read_event(
+        &mut self,
+        qconn: &mut QuicConnection,
+        stream_handle: QuicStreamHandle,
+    ) -> Result<()> {
+        self.user_data.read_event(qconn, stream_handle)
+    }
+
+    pub(crate) fn run_write_event(
+        &mut self,
+        qconn: &mut QuicConnection,
+        stream_handle: QuicStreamHandle,
+    ) -> Result<()> {
+        self.user_data.write_event(qconn, stream_handle)
     }
 }
 
 pub trait QuicCallbacks {
+    // TODO: add QUIC connect result to parameter
     fn connect_done(&mut self, qconn: &mut QuicConnection) -> Result<()>;
-    fn read_event(&mut self, qconn: &mut QuicConnection) -> Result<()>;
-    fn write_event(&mut self, qconn: &mut QuicConnection) -> Result<()>;
+
+    fn read_event(
+        &mut self,
+        qconn: &mut QuicConnection,
+        stream_handle: QuicStreamHandle,
+    ) -> Result<()>;
+
+    fn write_event(
+        &mut self,
+        qconn: &mut QuicConnection,
+        stream_handle: QuicStreamHandle,
+    ) -> Result<()>;
+
     fn close(&mut self, qconn: &mut QuicConnection) -> Result<()>;
 }
 

@@ -2,15 +2,15 @@ use anyhow::{anyhow, Result};
 use std::collections::{HashSet, VecDeque};
 use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
-use tracing::{error, info, trace, warn};
+use tracing::{info, trace, warn};
 
 use crate::ack::{QuicAckGenerator, QuicAckRange};
+use crate::buffer::QuicBuffer;
 use crate::connection::QuicLevel;
-use crate::frame::{QuicFrame, QuicPing};
+use crate::frame::QuicFrame;
 use crate::rtt::QuicRttGenerator;
 
 #[allow(dead_code)]
-#[derive(Default)]
 pub(crate) struct QuicSendContext {
     // These fields are used for storing info from peer Ack frame
     // largest_pn is the largest packet number that has been successfully processed in the current packet number space.
@@ -28,10 +28,10 @@ pub(crate) struct QuicSendContext {
     pub(crate) ack_generator: QuicAckGenerator,
     packet_threshold: Option<u16>,
 
-    recv_cbuf_len: u64,
-    store_recv_cbufs: VecDeque<(u64, Vec<u8>)>, // Sorted by first elem of tuple
+    crypto_recv_buf: QuicBuffer, // Sorted by first elem of tuple
     pub(crate) crypto_recv_offset: u64,
     pub(crate) crypto_send_offset: u64,
+    pub(crate) quic_level: QuicLevel,
 }
 
 // https://www.rfc-editor.org/rfc/rfc9002.html#section-6.1.1
@@ -39,41 +39,39 @@ const QUIC_PACKET_THRESHOLD: u16 = 3;
 
 #[allow(dead_code)]
 impl QuicSendContext {
-    // TODO: Design better recv buffers for crypto and stream frame
-    pub(crate) fn get_recv_cbufs_length(&self) -> u64 {
-        let length = self
-            .store_recv_cbufs
-            .iter()
-            .map(|(_, b)| b.len() as u64)
-            .sum();
-        trace!("Total receive crypto buffers length: {}", length);
-        length
+    pub(crate) fn new(quic_level: QuicLevel) -> Self {
+        Self {
+            quic_level,
+            largest_pn: None,
+            largest_acked: None,
+            send_queue: VecDeque::new(),
+            sent_queue: VecDeque::new(),
+            next_pn: 0,
+            ack_generator: QuicAckGenerator::default(),
+            packet_threshold: None,
+            crypto_recv_buf: QuicBuffer::default(),
+            crypto_recv_offset: 0,
+            crypto_send_offset: 0,
+        }
     }
 
-    pub(crate) fn insert_recv_cbufs(&mut self, buf: &[u8], offset: u64) {
-        trace!(
-            "Inserting receive crypto buffer with length {} at offset {}",
-            buf.len(),
-            offset
-        );
-        let pos = self
-            .store_recv_cbufs
-            .iter()
-            .position(|(off, _)| offset < *off)
-            .unwrap_or(self.store_recv_cbufs.len());
-        self.store_recv_cbufs.insert(pos, (offset, buf.to_vec()));
-        trace!(
-            "Inserted at position {}, total buffers: {}",
-            pos,
-            self.store_recv_cbufs.len()
-        );
+    pub(crate) fn get_crypto_recv_cbufs_length(&self) -> u64 {
+        self.crypto_recv_buf.length()
     }
 
-    pub(crate) fn clear(&mut self, level: QuicLevel) -> Result<()> {
+    pub(crate) fn insert_crypto_recv_cbufs(&mut self, buf: &[u8], offset: u64) {
+        self.crypto_recv_buf.insert(buf, offset);
+    }
+
+    pub(crate) fn consume_next_recv_cbufs(&mut self, offset: u64) -> Option<Vec<u8>> {
+        self.crypto_recv_buf.consume(offset, usize::MAX)
+    }
+
+    pub(crate) fn clear(&mut self) -> Result<()> {
         if !self.sent_queue.is_empty() {
             warn!(
                 "{:?} sent queue is not empty {}",
-                level,
+                self.quic_level,
                 self.sent_queue.len()
             );
             self.sent_queue.clear();
@@ -82,7 +80,7 @@ impl QuicSendContext {
         if !self.send_queue.is_empty() {
             warn!(
                 "{:?} send queue is not empty {}",
-                level,
+                self.quic_level,
                 self.send_queue.len()
             );
             self.send_queue.clear();
@@ -91,50 +89,11 @@ impl QuicSendContext {
         Ok(())
     }
 
-    pub(crate) fn consume_pre_recv_cbufs(&mut self, offset: u64) -> Option<Vec<u8>> {
-        trace!(
-            "Attempting to consume receive crypto buffers from offset {}",
-            offset
-        );
-        let mut res = vec![];
-        let mut consumed_offset = offset;
-        while let Some((off, buf)) = self.store_recv_cbufs.pop_front() {
-            if off > consumed_offset {
-                trace!(
-                    "Buffer offset {} is ahead of consumed offset {}, returning None",
-                    off,
-                    consumed_offset
-                );
-                self.store_recv_cbufs.push_front((off, buf));
-                return None;
-            }
-
-            let new_buf = if off != consumed_offset {
-                warn!(
-                    "Weird buf was sent by peer side, buf offset {}, buf len {}, expected offset {}",
-                    off, buf.len(), consumed_offset
-                );
-                if consumed_offset >= off + buf.len() as u64 {
-                    // Need to discard this useless buffer
-                    return None;
-                }
-                let (_, right) = buf.split_at(consumed_offset as usize - off as usize);
-                right
-            } else {
-                &buf
-            };
-            consumed_offset += new_buf.len() as u64;
-            res.extend(new_buf);
-        }
-
-        trace!("Consumed {} bytes from crypto buffers", res.len());
-        Some(res)
-    }
-
     pub(crate) fn need_ack(&self, current_ts: &Instant, local_mad: u16) -> bool {
         let need = self.ack_generator.need_ack(current_ts, local_mad);
         trace!(
-            "Checking if ACK is needed: {}, details {}",
+            "Checking if ACK is needed for {:?}: {}, details {}",
+            self.quic_level,
             need,
             self.ack_generator
         );
@@ -142,7 +101,7 @@ impl QuicSendContext {
     }
 
     pub(crate) fn reset_ack(&mut self) {
-        trace!("Resetting ACK generator");
+        trace!("Resetting ACK generator for {:?}", self.quic_level);
         self.ack_generator.reset_ack();
     }
 
@@ -206,25 +165,69 @@ impl QuicSendContext {
         self.send_queue.extend(v);
     }
 
+    pub(crate) fn clear_stream_frame_from_sent_queue(&mut self, stream_id: u64) {
+        let original_len = self.sent_queue.len();
+
+        self.sent_queue.retain(|f| {
+            let should_retain = match f {
+                QuicFrame::Stream(s) => s.stream_id != stream_id,
+                QuicFrame::StopSending(s) => s.stream_id != stream_id,
+                QuicFrame::ResetStream(s) => s.stream_id != stream_id,
+                QuicFrame::MaxStreamData(s) => s.stream_id != stream_id,
+                QuicFrame::StreamDataBlocked(s) => s.stream_id != stream_id,
+                _ => true,
+            };
+
+            if !should_retain {
+                trace!("Removing frame for stream {}: {:?}", stream_id, f);
+            }
+
+            should_retain
+        });
+
+        let removed_count = original_len - self.sent_queue.len();
+        if removed_count > 0 {
+            info!("Removed {} frames for stream {}", removed_count, stream_id);
+        }
+    }
+
+    pub(crate) fn insert_send_queue_with_stream_data(
+        &mut self,
+        stream_data: Option<Vec<u8>>,
+        offset: u64,
+        stream_id: u64,
+        is_fin: bool,
+    ) {
+        let length = stream_data.as_ref().map_or(0, |v| v.len() as u64);
+        self.insert_send_queue_back(QuicFrame::create_stream_frame(
+            stream_data,
+            offset,
+            stream_id,
+            is_fin,
+            length,
+        ));
+    }
+
     pub(crate) fn insert_send_queue_with_crypto_data(
         &mut self,
         crypto_data: Vec<u8>,
     ) -> Result<()> {
-        if let Some(crypto_frame) = QuicFrame::create_crypto_frame(self, crypto_data)? {
-            self.insert_send_queue_back(crypto_frame);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn generate_ack(&mut self) -> Result<()> {
+        let crypto_len = crypto_data.len();
+        let frame = QuicFrame::create_crypto_frame(self.crypto_send_offset, crypto_data);
+        self.crypto_send_offset += crypto_len as u64;
+        self.insert_send_queue_back(frame);
         Ok(())
     }
 
     pub(crate) fn calculate_loss(&mut self, time_threshold: Duration) -> Result<Option<Instant>> {
-        if let Some(first) = self.sent_queue.front() {
-            let pn = first
+        for f in self.sent_queue.iter() {
+            if !f.is_ack_eliciting() {
+                continue;
+            }
+
+            let pn = f
                 .get_packet_number()
-                .ok_or_else(|| anyhow!("Frame must have packet number {:?}", first))?;
+                .ok_or_else(|| anyhow!("Frame must have packet number {:?}", f))?;
 
             // The packet is unacknowledged, in flight, and was sent prior to an acknowledged packet.
             let largest_acked = if let Some(la) = self.largest_acked {
@@ -237,14 +240,14 @@ impl QuicSendContext {
                 return Ok(None);
             }
 
-            let send_time = first
+            let send_time = f
                 .get_send_time()
-                .ok_or_else(|| anyhow!("Frame must have send time {:?}", first))?;
+                .ok_or_else(|| anyhow!("Frame must have send time {:?}", f))?;
 
-            Ok(Some(send_time + time_threshold))
-        } else {
-            Ok(None)
+            return Ok(Some(send_time + time_threshold));
         }
+
+        Ok(None)
     }
 
     pub(crate) fn detect_lost(
@@ -252,7 +255,11 @@ impl QuicSendContext {
         rtt: &QuicRttGenerator,
         current_ts: Instant,
     ) -> Result<bool> {
-        trace!("Starting packet loss detection at {:?}", current_ts);
+        trace!(
+            "{:?} starting packet loss detection at {:?}",
+            self.quic_level,
+            current_ts
+        );
 
         // Acknowledgement-Based Detection
         // https://www.rfc-editor.org/rfc/rfc9002.html#section-6.1
@@ -261,7 +268,10 @@ impl QuicSendContext {
             la
         } else {
             // The packet is unacknowledged, in flight, and was sent prior to an acknowledged packet.
-            info!("Ack frame has not been received yet, skip the lost detection");
+            info!(
+                "{:?} ack frame has not been received yet, skip the lost detection",
+                self.quic_level
+            );
             return Ok(false);
         };
 
@@ -269,18 +279,19 @@ impl QuicSendContext {
 
         let mut split_index = None;
         self.sent_queue.iter().try_for_each(|f| {
+            trace!("Loss Detection, current {:?}", f);
             if matches!(f, QuicFrame::Ack(_)) {
+                split_index = Some(split_index.unwrap_or(0) + 1);
                 return ControlFlow::Continue(());
             }
 
             let pn = if let Some(pn) = f.get_packet_number() {
                 pn
             } else {
-                error!(
+                panic!(
                     "Frame in the sent queue must have the packet number {:?}",
                     f
                 );
-                return ControlFlow::Break(());
             };
 
             if pn > largest_acked {
@@ -295,20 +306,21 @@ impl QuicSendContext {
             let send_time = if let Some(send_time) = f.get_send_time() {
                 send_time
             } else {
-                error!("Frame in the sent queue must have the send_time {:?}", f);
-                return ControlFlow::Break(());
+                panic!("Frame in the sent queue must have the send_time {:?}", f);
             };
 
             let packets_threshold = self.packet_threshold.unwrap_or(QUIC_PACKET_THRESHOLD);
 
             // The packet was sent kPacketThreshold packets before an acknowledged packet (Section 6.1.1),
             // or it was sent long enough in the past
-            if pn < largest_acked.saturating_sub(packets_threshold as u64)
+            if pn > largest_acked.saturating_sub(packets_threshold as u64)
                 && send_time + time_threshold > current_ts
             {
+                trace!("Loss Detection, no need to resend the frame {:?}, send_time {:?}, packet_threshold {}", f, send_time, packets_threshold);
                 return ControlFlow::Break(());
             }
 
+            trace!("Loss Detection, plan to resend the frame {:?}, send_time {:?}, packet_threshold {}", f, send_time, packets_threshold);
             split_index = Some(split_index.unwrap_or(0) + 1);
 
             ControlFlow::Continue(())
@@ -329,10 +341,15 @@ impl QuicSendContext {
                 })?;
                 if matches!(frame, QuicFrame::Ack(_)) || matches!(frame, QuicFrame::Ping(_)) {
                     trace!("Drop the frame {:?} from the sent queue", frame);
+                    index -= 1;
                     continue;
                 }
                 trace!("Moving lost frame back to send queue: {:?}", frame);
+                let saved_send_ts = frame
+                    .get_send_time()
+                    .ok_or_else(|| anyhow!("Frame {:?} must have send_time", frame))?;
                 frame.clear_frame_common();
+                frame.set_send_time(saved_send_ts);
                 index -= 1;
                 self.insert_send_queue_front(frame);
             }
@@ -344,7 +361,7 @@ impl QuicSendContext {
     pub(crate) fn resend_first_eliciting_frame(&mut self) -> bool {
         let mut found = false;
         while let Some(mut frame) = self.sent_queue.pop_front() {
-            if matches!(frame, QuicFrame::Ack(_)) || matches!(frame, QuicFrame::Ping(_)) {
+            if !frame.is_ack_eliciting() || matches!(frame, QuicFrame::Ping(_)) {
                 trace!("Drop the frame {:?} from the sent queue", frame);
                 continue;
             }
@@ -354,14 +371,6 @@ impl QuicSendContext {
             self.insert_send_queue_front(frame);
         }
         found
-    }
-
-    pub(crate) fn create_and_insert_ping_frame(&mut self) -> Result<()> {
-        let ping_frame = QuicFrame::Ping(QuicPing::default());
-        self.insert_send_queue_front(ping_frame);
-        trace!("Now we are creating ping frame");
-
-        Ok(())
     }
 
     pub(crate) fn resend_all(&mut self) -> Result<()> {
@@ -378,6 +387,8 @@ impl QuicSendContext {
         smallest: u64,
         largest: u64,
         get_send_time: bool,
+        acked_stream_frames: &mut Vec<QuicFrame>,
+        current_ts: &Instant,
     ) -> Result<(bool, Option<Instant>)> {
         trace!(
             "Processing ACK range [{}..{}], get_send_time: {}",
@@ -391,8 +402,7 @@ impl QuicSendContext {
             let pn = if let Some(pn) = f.get_packet_number() {
                 pn
             } else {
-                error!("Frame {:?} must have the packet number!", f);
-                return false;
+                panic!("Frame {:?} must have the packet number!", f);
             };
 
             if pn > largest {
@@ -407,21 +417,51 @@ impl QuicSendContext {
                         self.ack_generator
                             .drop_ack_ranges(frame.get_largest_acknowledged());
                     }
-                    QuicFrame::Stream(_) => unimplemented!(),
+                    QuicFrame::Stream(frame) => {
+                        acked_stream_frames.push(QuicFrame::create_stream_frame(
+                            None,
+                            frame.offset,
+                            frame.stream_id,
+                            frame.is_fin,
+                            frame.length,
+                        ));
+                    }
+                    QuicFrame::ResetStream(frame) => {
+                        acked_stream_frames.push(QuicFrame::create_reset_stream_frame(
+                            frame.stream_id,
+                            frame.application_error_code,
+                            frame.final_size,
+                        ));
+                    }
                     _ => {
                         trace!("The frame {:?} is acked!", f);
                     }
                 }
+
                 if pn == largest && get_send_time {
                     send_time = f.get_send_time();
                     trace!("Get the acked largest packet sent time {:?}", send_time);
                 }
 
+                if f.is_ack_eliciting() {
+                    ackeliciting_packet_acked = true;
+                }
+
                 return false;
             }
-            if f.is_ack_eliciting() {
-                ackeliciting_packet_acked = true;
+
+            if !f.is_ack_eliciting() {
+                if let Some(send_time) = f.get_send_time() {
+                    if let Some(d) = current_ts.checked_duration_since(send_time) {
+                        const QUIC_FRAME_RETIRE_INTERVAL: u64 = 6666;
+                        if d > Duration::from_millis(QUIC_FRAME_RETIRE_INTERVAL) {
+                            info!("Clear this frame {:?} from the send queue", f);
+                            return false;
+                        }
+                    }
+                }
             }
+
             true
         });
 
@@ -440,19 +480,22 @@ impl QuicSendContext {
     pub(crate) fn calculate_pto(
         &mut self,
         pto_time: Duration,
-        level: QuicLevel,
         check_eliciting: bool,
     ) -> Result<Option<Instant>> {
         trace!(
             "Calculating {:?} PTO with duration {:?}, sent queue size {}",
-            level,
+            self.quic_level,
             pto_time,
             self.sent_queue.len()
         );
         let mut pto = None;
         let iter = self.sent_queue.iter();
         for f in iter {
-            trace!("Loop the sent queue in {:?} space, {:?}", level, f);
+            trace!(
+                "Loop the sent queue in {:?} space, {:?}",
+                self.quic_level,
+                f
+            );
             if check_eliciting && !f.is_ack_eliciting() {
                 continue;
             }
@@ -474,16 +517,16 @@ impl QuicSendContext {
         top_range: u64,
         ranges: &[QuicAckRange],
         rtt: &mut QuicRttGenerator,
-        level: QuicLevel,
         current_ts: &Instant,
         delay: u64,
-    ) -> Result<()> {
+    ) -> Result<Vec<QuicFrame>> {
         let mut largest = top_range;
         let mut smallest = top_range.checked_sub(first_range).ok_or_else(|| {
             anyhow!(
-                "The top_range {} must be larger then first_range {}",
+                "The top_range {} must be larger then first_range {}, level {:?}",
                 top_range,
-                first_range
+                first_range,
+                self.quic_level
             )
         })?;
 
@@ -497,7 +540,8 @@ impl QuicSendContext {
             }
         } else {
             trace!(
-                "Processing ack frame, largest_acked was updated to {}",
+                "Processing ack frame for the first time {:?}, largest_acked was updated to {}",
+                self.quic_level,
                 top_range
             );
             self.largest_acked = Some(top_range);
@@ -505,9 +549,16 @@ impl QuicSendContext {
 
         let mut index = 0;
         let mut sent_time = None;
+        let mut acked_stream_frames = vec![];
         loop {
             let get_send_time = largest_acked_updated && largest == top_range;
-            let (acked, send_time) = self.handle_ack_range(smallest, largest, get_send_time)?;
+            let (acked, send_time) = self.handle_ack_range(
+                smallest,
+                largest,
+                get_send_time,
+                &mut acked_stream_frames,
+                current_ts,
+            )?;
             ackeliciting_packet_acked |= acked;
             if get_send_time && send_time.is_none() {
                 warn!("Should get our send time here for no.{top_range} packet");
@@ -547,31 +598,26 @@ impl QuicSendContext {
         //      2. at least one of the newly acknowledged packets was ack-eliciting.
         if largest_acked_updated && ackeliciting_packet_acked {
             if let Some(sent_time) = sent_time {
-                let latest_rtt =
-                    sent_time
-                        .checked_duration_since(*current_ts)
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "Current ts {:?} must be larger then sent_time {:?}",
-                                current_ts,
-                                sent_time
-                            )
-                        })?;
-                rtt.update(level, delay, latest_rtt)?;
+                let latest_rtt = current_ts
+                    .checked_duration_since(sent_time)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Current ts {:?} must be larger then sent_time {:?}",
+                            current_ts,
+                            sent_time
+                        )
+                    })?;
+                rtt.update(self.quic_level, delay, latest_rtt)?;
             }
         }
 
-        Ok(())
+        Ok(acked_stream_frames)
     }
 
-    pub(crate) fn update_ack(
-        &mut self,
-        pn: u64,
-        need_ack: bool,
-        now: &Instant,
-        level: QuicLevel,
-    ) -> Result<bool> {
-        let should_ack = self.ack_generator.update_ack(pn, need_ack, now, level)?;
+    pub(crate) fn update_ack(&mut self, pn: u64, need_ack: bool, now: &Instant) -> Result<bool> {
+        let should_ack = self
+            .ack_generator
+            .update_ack(pn, need_ack, now, self.quic_level)?;
         // Single old packet should be acked sperately
 
         // https://www.rfc-editor.org/rfc/rfc9000.html#section-13.2.3
@@ -585,7 +631,7 @@ impl QuicSendContext {
 
         trace!(
             "Update {:?} packet space pn {}, largest_pn {:?}, is_ack_eliciting {}, should_ack {}",
-            level,
+            self.quic_level,
             pn,
             self.largest_pn,
             need_ack,
@@ -600,13 +646,23 @@ impl QuicSendContext {
 mod tests {
     use super::*;
     use crate::frame::QuicAck;
+    use crate::frame::QuicPing;
     use std::time::Duration;
 
     fn setup_test_context() -> QuicSendContext {
-        QuicSendContext {
-            next_pn: 100, // Set initial packet number
-            ..Default::default()
-        }
+        QuicSendContext::new(QuicLevel::Initial)
+    }
+
+    use std::sync::Once;
+    #[allow(unused)]
+    static TRACING: Once = Once::new();
+
+    #[allow(dead_code)]
+    fn init_tracing() {
+        TRACING.call_once(|| {
+            let env_filter = tracing_subscriber::EnvFilter::from_default_env();
+            tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        });
     }
 
     #[test]
@@ -627,13 +683,14 @@ mod tests {
         ctx.sent_queue.push_back(frame1);
         ctx.sent_queue.push_back(frame2);
 
+        ctx.next_pn = 97;
+
         // Test basic ACK frame handling
         let result = ctx.handle_ack_frame(
             1,   // first_range
             96,  // top_range
             &[], // no additional ranges
             &mut rtt,
-            QuicLevel::Initial,
             &current_ts,
             1000, // delay in microseconds
         );
@@ -657,6 +714,8 @@ mod tests {
             ctx.sent_queue.push_back(frame);
         }
 
+        ctx.next_pn = 100;
+
         // Create ACK ranges: [98-99], [95-96]
         let ranges = vec![
             QuicAckRange::new(0, 1), // Gap: 0, Length: 1 for packet 95-96
@@ -667,7 +726,6 @@ mod tests {
             99, // top_range
             &ranges,
             &mut rtt,
-            QuicLevel::Initial,
             &current_ts,
             1000,
         );
@@ -689,7 +747,6 @@ mod tests {
             5,  // top_range
             &[],
             &mut rtt,
-            QuicLevel::Initial,
             &current_ts,
             1000,
         );
@@ -708,13 +765,13 @@ mod tests {
         frame.set_packet_number(95);
         frame.set_send_time(current_ts - Duration::from_secs(1));
         ctx.sent_queue.push_back(frame);
+        ctx.next_pn = 96;
 
         let result = ctx.handle_ack_frame(
             0,  // first_range
             95, // top_range
             &[],
             &mut rtt,
-            QuicLevel::Initial,
             &current_ts,
             1000,
         );
@@ -726,6 +783,7 @@ mod tests {
 
     #[test]
     fn test_handle_ack_frame_multiple_packets() {
+        // init_tracing();
         let mut ctx = setup_test_context();
         let mut rtt = QuicRttGenerator::default();
         let current_ts = Instant::now();
@@ -740,6 +798,8 @@ mod tests {
         ack_frame.set_packet_number(96);
         ack_frame.set_send_time(current_ts - Duration::from_secs(1));
 
+        ctx.next_pn = 97;
+
         ctx.sent_queue.push_back(ping_frame);
         ctx.sent_queue.push_back(ack_frame);
 
@@ -748,7 +808,6 @@ mod tests {
             96, // top_range
             &[],
             &mut rtt,
-            QuicLevel::Initial,
             &current_ts,
             1000,
         );

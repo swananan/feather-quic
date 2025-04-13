@@ -440,7 +440,20 @@ impl QuicPacket<'_> {
         let mut frame_sent_cnt = 0;
         while let Some(mut frame) = qconn.init_send.consume_send_queue() {
             let payload_len = payload_cursor.position();
-            let res = frame.serialize(&mut payload_cursor, remain_len - payload_len as u16)?;
+            let (res, new_frame) = frame.serialize(
+                &mut payload_cursor,
+                remain_len.checked_sub(payload_len as u16).ok_or_else(|| {
+                    anyhow!(
+                        "Payload size {} must be lower than max_payload_size {}",
+                        payload_len,
+                        remain_len
+                    )
+                })?,
+            )?;
+            if let Some(f) = new_frame {
+                qconn.init_send.insert_send_queue_front(f)
+            }
+
             if !res {
                 // Restore the send queue, if QUIC payload size is not enough
                 qconn.init_send.insert_send_queue_front(frame);
@@ -449,7 +462,9 @@ impl QuicPacket<'_> {
 
             // Sent queue also contain non-ack-eliciting frame
             frame.set_packet_number(qconn.init_send.next_pn);
-            frame.set_send_time(qconn.current_ts);
+            if frame.get_send_time().is_none() {
+                frame.set_send_time(qconn.current_ts);
+            }
             qconn.init_send.insert_sent_queue_back(frame);
             frame_sent_cnt += 1;
             if frame_count > 0 && frame_sent_cnt >= frame_count {
@@ -611,8 +626,21 @@ impl QuicPacket<'_> {
         let mut frame_sent_cnt = 0;
         while let Some(mut frame) = qconn.app_send.consume_send_queue() {
             let payload_len = payload_cursor.position();
-            let res =
-                frame.serialize(&mut payload_cursor, max_payload_size - payload_len as u16)?;
+            let (res, new_frame) = frame.serialize(
+                &mut payload_cursor,
+                max_payload_size
+                    .checked_sub(payload_len as u16)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Payload size {} must be lower than max_payload_size {}",
+                            payload_len,
+                            max_payload_size
+                        )
+                    })?,
+            )?;
+            if let Some(f) = new_frame {
+                qconn.app_send.insert_send_queue_front(f)
+            }
             if !res {
                 qconn.app_send.insert_send_queue_front(frame);
                 break;
@@ -620,7 +648,9 @@ impl QuicPacket<'_> {
 
             // Sent queue also contain non-ack-eliciting frame
             frame.set_packet_number(qconn.app_send.next_pn);
-            frame.set_send_time(qconn.current_ts);
+            if frame.get_send_time().is_none() {
+                frame.set_send_time(qconn.current_ts);
+            }
             qconn.app_send.insert_sent_queue_back(frame);
             frame_sent_cnt += 1;
             if frame_count > 0 && frame_sent_cnt >= frame_count {
@@ -824,8 +854,21 @@ impl QuicPacket<'_> {
         let mut frame_sent_cnt = 0;
         while let Some(mut frame) = qconn.hs_send.consume_send_queue() {
             let payload_len = payload_cursor.position();
-            let res =
-                frame.serialize(&mut payload_cursor, max_payload_size - payload_len as u16)?;
+            let (res, new_frame) = frame.serialize(
+                &mut payload_cursor,
+                max_payload_size
+                    .checked_sub(payload_len as u16)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Payload size {} must be lower than max_payload_size {}",
+                            payload_len,
+                            max_payload_size
+                        )
+                    })?,
+            )?;
+            if let Some(f) = new_frame {
+                qconn.hs_send.insert_send_queue_front(f)
+            }
             if !res {
                 qconn.hs_send.insert_send_queue_front(frame);
                 break;
@@ -833,7 +876,9 @@ impl QuicPacket<'_> {
 
             // Sent queue also contain non-ack-eliciting frame
             frame.set_packet_number(qconn.hs_send.next_pn);
-            frame.set_send_time(qconn.current_ts);
+            if frame.get_send_time().is_none() {
+                frame.set_send_time(qconn.current_ts);
+            }
             qconn.hs_send.insert_sent_queue_back(frame);
             frame_sent_cnt += 1;
             if frame_count > 0 && frame_sent_cnt >= frame_count {
@@ -1021,7 +1066,7 @@ impl QuicPacket<'_> {
             return Ok(());
         };
 
-        let should_send = send_ctx.update_ack(pn, need_ack, &qconn.current_ts, level)?;
+        let should_send = send_ctx.update_ack(pn, need_ack, &qconn.current_ts)?;
 
         if should_send || !send_ctx.is_send_queue_empty() {
             qconn.set_next_send_event_time(0);
