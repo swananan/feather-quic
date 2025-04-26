@@ -101,10 +101,10 @@ impl FeatherQuicEchoContext {
                     QuicConnectionError::QuicStreamError(e) => {
                         if matches!(e, QuicStreamError::WouldBlock) {
                             qconn.set_stream_read_active(stream_handle, true)?;
-                            break;
                         } else {
-                            error!("Quic stream error: {:?}", e);
+                            warn!("Quic stream error: {:?}", e);
                         }
+                        break;
                     }
                     _ => panic!("Unknown error: {:?}", e),
                 },

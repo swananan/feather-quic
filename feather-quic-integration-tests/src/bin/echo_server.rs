@@ -6,14 +6,14 @@ use quinn::{Endpoint, ServerConfig};
 use quinn_proto::{crypto::rustls::QuicServerConfig, VarInt};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
-use tokio::task::JoinHandle;
+use tokio::{task::JoinHandle, time::sleep};
 use tracing::{error, info, info_span, trace};
 use tracing_futures::Instrument as _;
 use tracing_subscriber::EnvFilter;
 
 const ALPN_QUIC_HTTP: &[&[u8]] = &[b"echo"];
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[clap(name = "server")]
 struct Opt {
     /// file to log TLS keys to for debugging
@@ -46,6 +46,12 @@ struct Opt {
     /// Maximum idle timeout for the connection (in milliseconds)
     #[clap(long = "max-idle-timeout", default_value = "30000")]
     max_idle_timeout: u64,
+    /// Reset stream after this many echo messages (0 means never reset)
+    #[clap(long = "reset-after-messages", default_value = "0")]
+    reset_after_messages: usize,
+    /// Finish stream after this many echo messages (0 means never finish)
+    #[clap(long = "finish-after-messages", default_value = "0")]
+    finish_after_messages: usize,
     /// File to write logs to (if not specified, logs go to stdout/stderr)
     #[clap(long = "log-file")]
     log_file: Option<PathBuf>,
@@ -174,7 +180,7 @@ async fn run(options: Opt) -> Result<()> {
             conn.retry().unwrap();
         } else {
             info!("accepting connection");
-            let fut = handle_connection(conn);
+            let fut = handle_connection(conn, options.clone());
             tokio::spawn(async move {
                 if let Err(e) = fut.await {
                     error!("connection failed: {reason}", reason = e.to_string())
@@ -186,7 +192,7 @@ async fn run(options: Opt) -> Result<()> {
     Ok(())
 }
 
-async fn handle_connection(conn: quinn::Incoming) -> Result<()> {
+async fn handle_connection(conn: quinn::Incoming, options: Opt) -> Result<()> {
     let connection = conn.await?;
     let span = info_span!(
         "connection",
@@ -212,9 +218,10 @@ async fn handle_connection(conn: quinn::Incoming) -> Result<()> {
                     match stream {
                         Ok(stream) => {
                             info!("New bidirectional stream accepted");
+                            let stream_options = options.clone(); // Clone options for this specific stream
                             let handle = tokio::spawn(
                                 async move {
-                                    if let Err(e) = handle_request(stream).await {
+                                    if let Err(e) = handle_request(stream, stream_options).await {
                                         error!("stream failed: {reason}", reason = e.to_string());
                                     }
                                 }
@@ -273,9 +280,11 @@ async fn handle_connection(conn: quinn::Incoming) -> Result<()> {
 
 async fn handle_request(
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
+    options: Opt,
 ) -> Result<()> {
     let mut buffer = Vec::with_capacity(8192); // Increased buffer size
     let mut temp_buf = [0u8; 4096]; // Increased read buffer size
+    let mut message_count = 0;
 
     loop {
         trace!("Start to read from quic stream");
@@ -312,6 +321,25 @@ async fn handle_request(
                     send.write_all(line)
                         .await
                         .map_err(|e| anyhow!("failed to send response: {}", e))?;
+
+                    message_count += 1;
+                    if message_count == options.reset_after_messages
+                        && options.reset_after_messages > 0
+                    {
+                        info!("Resetting stream after {} messages", message_count);
+                        send.reset(8u32.into())
+                            .map_err(|e| anyhow!("failed to reset stream: {}", e))?;
+                        return Ok(());
+                    }
+                    if message_count == options.finish_after_messages
+                        && options.finish_after_messages > 0
+                    {
+                        info!("Finishing stream after {} messages", message_count);
+                        send.finish()?;
+                        sleep(Duration::from_millis(4000)).await;
+
+                        return Ok(());
+                    }
 
                     // Keep the remaining data
                     info!(

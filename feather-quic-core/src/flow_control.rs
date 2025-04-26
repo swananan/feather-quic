@@ -519,6 +519,10 @@ impl QuicStreamFlowControl {
         );
     }
 
+    pub(crate) fn get_recv_final_size(&self) -> Option<u64> {
+        self.recv_final_size
+    }
+
     pub(crate) fn set_recv_final_size(&mut self, size: u64) -> Result<()> {
         if size < self.recv_largest {
             return Err(anyhow!(

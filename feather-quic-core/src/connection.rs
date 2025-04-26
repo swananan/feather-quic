@@ -797,12 +797,28 @@ impl QuicConnection {
         final_size: u64,
     ) -> Result<()> {
         let handle = QuicStreamHandle::new(stream_id);
-        let stream = self
-            .streams
-            .get_mut(&handle)
-            .ok_or_else(|| anyhow!("The receiving stream doesn't exist {}", stream_id))?;
+        let stream = self.streams.get_mut(&handle);
 
-        stream.handle_reset_stream_frame(application_error_code, final_size)
+        match stream {
+            Some(stream) => {
+                info!(
+                    "Handling RESET_STREAM frame for stream {} with error code {} and final size {}",
+                    handle, application_error_code, final_size
+                );
+                stream
+                    .handle_reset_stream_frame(application_error_code, final_size)
+                    .with_context(|| {
+                        format!("Failed to handle RESET_STREAM frame for stream {}", handle)
+                    })
+            }
+            None => {
+                warn!(
+                    "Received RESET_STREAM frame for non-existent stream {} with error code {}",
+                    handle, application_error_code
+                );
+                Ok(())
+            }
+        }
     }
 
     pub(crate) fn handle_stop_sending_frame(
@@ -811,16 +827,32 @@ impl QuicConnection {
         application_error_code: u64,
     ) -> Result<()> {
         let handle = QuicStreamHandle::new(stream_id);
-        let stream = self
-            .streams
-            .get_mut(&handle)
-            .ok_or_else(|| anyhow!("The sending stream doesn't exist {}", stream_id))?;
+        let stream = self.streams.get_mut(&handle);
 
-        if let Some(frame) = stream.handle_stop_sending_frame(application_error_code)? {
-            self.app_send.insert_send_queue_back(frame);
+        match stream {
+            Some(stream) => {
+                info!(
+                    "Handling STOP_SENDING frame for stream {} with error code {}",
+                    handle, application_error_code
+                );
+                if let Some(frame) = stream
+                    .handle_stop_sending_frame(application_error_code)
+                    .with_context(|| {
+                        format!("Failed to handle STOP_SENDING frame for stream {}", handle)
+                    })?
+                {
+                    self.app_send.insert_send_queue_back(frame);
+                }
+                Ok(())
+            }
+            None => {
+                warn!(
+                    "Received STOP_SENDING frame for non-existent stream {} with error code {}",
+                    handle, application_error_code
+                );
+                Ok(())
+            }
         }
-
-        Ok(())
     }
 
     pub(crate) fn handle_max_streams_frame(
@@ -841,19 +873,25 @@ impl QuicConnection {
         stream_id: u64,
         max_stream_data: u64,
     ) -> Result<()> {
+        let handle = QuicStreamHandle::new(stream_id);
+
         info!(
             "Handling MAX_STREAM_DATA frame: stream_id={}, max_stream_data={}",
-            stream_id, max_stream_data
+            handle, max_stream_data
         );
-        let stream = self
-            .streams
-            .get_mut(&QuicStreamHandle::new(stream_id))
-            .ok_or_else(|| anyhow!("The stream doesn't exist {}", stream_id))?;
 
-        // Update the stream's max data limit
-        stream.update_max_stream_data(max_stream_data)?;
-
-        Ok(())
+        match self.streams.get_mut(&handle) {
+            Some(stream) => stream
+                .update_max_stream_data(max_stream_data)
+                .with_context(|| format!("Failed to update max stream data for stream {}", handle)),
+            None => {
+                warn!(
+                    "Received MAX_STREAM_DATA frame for non-existent stream {} with max_stream_data={}",
+                    handle, max_stream_data
+                );
+                Ok(())
+            }
+        }
     }
 
     pub(crate) fn handle_max_data_frame(&mut self, max_data: u64) -> Result<()> {
@@ -891,25 +929,36 @@ impl QuicConnection {
         stream_id: u64,
         max_stream_data: u64,
     ) -> Result<()> {
-        let stream_id = QuicStreamHandle::new(stream_id);
+        let handle = QuicStreamHandle::new(stream_id);
+
         info!(
             "Handling STREAM_DATA_BLOCKED frame: stream_id={}, max_stream_data={}",
-            stream_id, max_stream_data
+            handle, max_stream_data
         );
-        if let Some(stream) = self.streams.get_mut(&stream_id) {
-            let res = stream.check_if_update_max_recv_data(true);
-            let stream_max_size = stream.get_new_max_recv_size();
-            if res {
-                self.create_and_insert_max_data_stream(Some(stream_id), stream_max_size)
-                    .map_err(|e| {
-                        QuicConnectionError::InternerError(format!(
-                            "Stream {} failure, due to {}",
-                            stream_id, e
-                        ))
-                    })?;
+
+        match self.streams.get_mut(&handle) {
+            Some(stream) => {
+                let res = stream.check_if_update_max_recv_data(true);
+                let stream_max_size = stream.get_new_max_recv_size();
+                if res {
+                    self.create_and_insert_max_data_stream(Some(handle), stream_max_size)
+                        .with_context(|| {
+                            format!(
+                                "Failed to create MAX_STREAM_DATA frame for stream {}",
+                                handle
+                            )
+                        })?;
+                }
+                Ok(())
+            }
+            None => {
+                warn!(
+                    "Received STREAM_DATA_BLOCKED frame for non-existent stream {} with max_stream_data={}",
+                    handle, max_stream_data
+                );
+                Ok(())
             }
         }
-        Ok(())
     }
 
     pub(crate) fn handle_stream_frame(
