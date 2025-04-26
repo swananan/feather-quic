@@ -65,10 +65,10 @@ pub enum QuicStreamError {
     #[error("Receiver was shutdown by the peer")]
     ReceiverShutdown,
 
-    #[error("Receiver was reset by the peer")]
-    ReceiverReset,
+    #[error("Receiver was reset by the peer, application error code {0}")]
+    ReceiverReset(u64),
 
-    #[error("Sender was rest by the peer")]
+    #[error("Sender was shut down")]
     SenderReset,
 
     #[error("Must not send data on the unidirectional and server-initiated stream")]
@@ -187,6 +187,7 @@ pub(crate) struct QuicStream {
     // Receiver
     recv_state: QuicReceivingStreamState,
     recv_bufs: QuicBuffer,
+    recv_app_err_code: Option<u64>,
 
     // Sender
     send_state: QuicSendingStreamState,
@@ -229,6 +230,7 @@ impl QuicStream {
         let stream = Self {
             stream_id,
             read_event_active: false,
+            recv_app_err_code: None,
             write_event_active: false,
             send_state: QuicSendingStreamState::Ready,
             send_queue: None,
@@ -549,6 +551,16 @@ impl QuicStream {
         // Like epoll ET mode
         self.flow_control.set_readable(false);
 
+        if matches!(self.recv_state, QuicReceivingStreamState::ResetRecvd)
+            || matches!(self.recv_state, QuicReceivingStreamState::ResetRead)
+        {
+            self.set_recv_state(QuicReceivingStreamState::ResetRead);
+            trace!("Stream {} was reset by peer", self.stream_id);
+            return Err(QuicStreamError::ReceiverReset(
+                self.recv_app_err_code.unwrap(),
+            ));
+        }
+
         match self
             .recv_bufs
             .consume(self.flow_control.get_recv_pos(), rcv_size)
@@ -570,11 +582,7 @@ impl QuicStream {
                 Ok(v)
             }
             None => {
-                if matches!(self.recv_state, QuicReceivingStreamState::ResetRecvd) {
-                    self.set_recv_state(QuicReceivingStreamState::ResetRead);
-                    error!("Stream {} was reset by peer", self.stream_id);
-                    Err(QuicStreamError::ReceiverReset)
-                } else if matches!(self.recv_state, QuicReceivingStreamState::DataRecvd) {
+                if matches!(self.recv_state, QuicReceivingStreamState::DataRecvd) {
                     self.set_recv_state(QuicReceivingStreamState::DataRead);
                     trace!("Stream {} has no more data to receive", self.stream_id);
                     Err(QuicStreamError::ReceiverShutdown)
@@ -700,8 +708,8 @@ impl QuicStream {
         }
 
         if !matches!(self.recv_state, QuicReceivingStreamState::Recv)
-            || !matches!(self.recv_state, QuicReceivingStreamState::SizeKnown)
-            || !matches!(self.recv_state, QuicReceivingStreamState::DataRecvd)
+            && !matches!(self.recv_state, QuicReceivingStreamState::SizeKnown)
+            && !matches!(self.recv_state, QuicReceivingStreamState::DataRecvd)
         {
             warn!(
                 "Stream {} in state {:?} doesn't need to reply with reset stream frame, \
@@ -715,6 +723,7 @@ impl QuicStream {
 
         self.set_recv_state(QuicReceivingStreamState::ResetRecvd);
         self.flow_control.set_readable(true);
+        self.recv_app_err_code = Some(application_error_code);
         trace!(
             "Stream {} receiving was reset by peer with error code {}",
             self.stream_id,
@@ -796,6 +805,17 @@ impl QuicStream {
             ));
         }
 
+        if matches!(self.recv_state, QuicReceivingStreamState::ResetRecvd)
+            || matches!(self.recv_state, QuicReceivingStreamState::ResetRead)
+        {
+            trace!(
+                "Just skip the {} stream frame handle, since recv state is {:?}",
+                self.stream_id,
+                self.recv_state
+            );
+            return Ok(());
+        }
+
         let last = offset + length;
         // Check receive flow control before processing the frame
         self.flow_control.check_recv_flow_control(last)?;
@@ -836,9 +856,6 @@ impl QuicStream {
             self.flow_control
                 .set_recv_final_size(last)
                 .with_context(|| format!("Stream {}", self.stream_id))?;
-            if self.flow_control.get_recv_offset() == last {
-                self.set_recv_state(QuicReceivingStreamState::DataRecvd);
-            }
         }
 
         let pos = cursor.position();
@@ -854,6 +871,15 @@ impl QuicStream {
                 self.recv_bufs
                     .get_recv_offset_increament_size(self.flow_control.get_recv_offset()),
             );
+        }
+
+        if self
+            .flow_control
+            .get_recv_final_size()
+            .map(|final_size| final_size == self.flow_control.get_recv_offset())
+            .unwrap_or(false)
+        {
+            self.set_recv_state(QuicReceivingStreamState::DataRecvd);
         }
 
         trace!(
