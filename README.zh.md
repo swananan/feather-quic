@@ -13,6 +13,10 @@ feather-quic 是一个个人实验性质项目，使用 Rust 实现 QUIC 协议�
 
 [用 Rust 从零开始写 QUIC：实现 TLS 1.3 握手和 QUIC-TLS Key Update](https://jt26wzz.com/posts/0004-implement-quic-in-rust/)
 
+[用 Rust 从零开始写 QUIC：Reliability](https://jt26wzz.com/posts/0005-implement-quic-in-rust/)
+
+[用 Rust 从零开始写 QUIC：实现 QUIC 多路复用流传输和流量控制](https://jt26wzz.com/posts/0006-implement-quic-in-rust/)
+
 未完待续
 
 ---
