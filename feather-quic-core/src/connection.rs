@@ -44,6 +44,18 @@ pub enum QuicConnectionState {
 }
 
 #[derive(Error, Debug)]
+pub enum QuicConnectResult {
+    #[error("Connection established successfully")]
+    Success,
+
+    #[error("Connection establishment timed out {0}ms")]
+    Timeout(u64),
+
+    #[error("Connection establishment failed, due to {0}")]
+    Failed(String),
+}
+
+#[derive(Error, Debug)]
 pub enum QuicConnectionError {
     #[error("Stream {0} doesn't exist!")]
     StreamNotExist(QuicStreamHandle),
@@ -74,6 +86,7 @@ pub struct QuicConnection {
     pub(crate) current_ts: Instant,
     pub(crate) idle_timeout: Option<u64>,
     idle_timeout_threshold: Option<Instant>,
+    idle_close_trigger: bool,
 
     pub(crate) datagram_size: u16,
     pub(crate) scid: Vec<u8>,
@@ -155,6 +168,7 @@ impl QuicConnection {
             tls: TlsContext::new(&quic_config, &scid),
             current_ts: now,
             idle_timeout_threshold: None,
+            idle_close_trigger: false,
             scid,
             dcid: None,
             retry_token: None,
@@ -262,6 +276,7 @@ impl QuicConnection {
                     self.current_ts, idle_timeout_threshold
                 );
                 self.idle_timeout_threshold = None;
+                self.idle_close_trigger = true;
 
                 // https://www.rfc-editor.org/rfc/rfc9000.html#section-10.1-1
                 // Sliently close
@@ -1583,11 +1598,28 @@ impl QuicConnection {
         );
         let _enter = span.enter();
 
-        // TODO: connect could fail
-        if self.is_established() && !self.connect_done_called {
-            trace!("Connection established, calling connect done event");
-            self.connect_done_called = true;
-            uctx.run_connect_done_event(self)?;
+        if !self.connect_done_called {
+            if self.is_established() {
+                trace!("Connection established, calling connect done event");
+                self.connect_done_called = true;
+                uctx.run_connect_done_event(self, QuicConnectResult::Success)?;
+            } else if self.is_closed() || self.is_draining() {
+                self.connect_done_called = true;
+                if self.idle_close_trigger {
+                    uctx.run_connect_done_event(
+                        self,
+                        QuicConnectResult::Timeout(self.get_idle_timeout()),
+                    )?;
+                } else {
+                    uctx.run_connect_done_event(
+                        self,
+                        QuicConnectResult::Failed(format!(
+                            "{:?}, {:?}",
+                            self.peer_error_code, self.peer_reason_phrase
+                        )),
+                    )?;
+                }
+            }
         }
 
         if !self.is_closed() && !self.is_closing() && !self.is_draining() {
@@ -1869,14 +1901,14 @@ impl QuicConnection {
                     // datagrams containing ack-eliciting packets to avoid an expensive consecutive PTO
                     // expiration due to a single lost datagram or to transmit data from multiple packet
                     // number spaces.
-                    let tries = if self.pto_backoff > 1 { 2 } else { 1 };
+                    let tries = if self.pto_backoff >= 1 { 2 } else { 1 };
                     for _ in 0..tries {
                         self.recreate_quic_packet_for_pto(level)?;
                     }
 
                     // https://www.rfc-editor.org/rfc/rfc9000.html#section-10.1-3
                     // Also update the idle timer, when PTO timer fires
-                    if self.pto_backoff <= 1 {
+                    if self.pto_backoff == 0 {
                         self.update_idle_timeout_threshold();
                     }
                 } else {

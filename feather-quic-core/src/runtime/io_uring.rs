@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use rand::Rng;
 use std::fmt::Debug;
 use std::net::SocketAddr;
@@ -371,9 +371,23 @@ impl IoUringEventLoop {
         let udp_socket = UdpSocket::bind("0.0.0.0:0")?;
         udp_socket.connect(self.target_address)?;
         let udp_fd = udp_socket.as_raw_fd();
+        let local_addr = udp_socket.local_addr().with_context(|| {
+            format!(
+                "Failed to get local address from native socket {:?}",
+                udp_socket
+            )
+        })?;
+        let _span = tracing::span!(
+            tracing::Level::TRACE,
+            "udp",
+            local=?format!("{}:{}", local_addr.ip(), local_addr.port()),
+            peer=?format!("{}:{}", self.target_address.ip(), self.target_address.port())
+        )
+        .entered();
+
         trace!(
             "Created UDP socket with local address: {}, file descriptor: {}",
-            udp_socket.local_addr()?,
+            local_addr,
             udp_fd
         );
 

@@ -54,8 +54,27 @@ impl QuicCallbacks for FeatherQuicClientContext {
         Ok(())
     }
 
-    fn connect_done(&mut self, qconn: &mut QuicConnection) -> Result<()> {
-        info!("QUIC connection established successfully");
+    fn connect_done(
+        &mut self,
+        qconn: &mut QuicConnection,
+        result: QuicConnectResult,
+    ) -> Result<()> {
+        match result {
+            QuicConnectResult::Success => {
+                info!("QUIC connection established successfully");
+            }
+            QuicConnectResult::Timeout(duration) => {
+                info!(
+                    "QUIC connection establishment timed out after {}ms",
+                    duration
+                );
+                return Ok(());
+            }
+            QuicConnectResult::Failed(reason) => {
+                info!("QUIC connection establishment failed, due to {}", reason);
+                return Ok(());
+            }
+        }
 
         let new_stream = qconn.open_stream(true)?;
 
