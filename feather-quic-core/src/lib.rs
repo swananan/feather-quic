@@ -1,7 +1,7 @@
 // Re-export commonly used types and functions
 pub mod prelude {
     pub use crate::config::{QuicConfig, DEFAULT_INITIAL_PACKET_SIZE};
-    pub use crate::connection::{QuicConnection, QuicConnectionError};
+    pub use crate::connection::{QuicConnectResult, QuicConnection, QuicConnectionError};
     pub use crate::runtime::{QuicCallbacks, QuicRuntime, QuicUserContext, RuntimeConfig};
     pub use crate::stream::{QuicStreamError, QuicStreamHandle};
 }

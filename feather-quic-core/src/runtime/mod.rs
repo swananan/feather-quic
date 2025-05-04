@@ -1,3 +1,4 @@
+use crate::connection::QuicConnectResult;
 use crate::connection::QuicConnection;
 use crate::stream::QuicStreamHandle;
 
@@ -25,8 +26,12 @@ where
         Self { user_data }
     }
 
-    pub(crate) fn run_connect_done_event(&mut self, qconn: &mut QuicConnection) -> Result<()> {
-        self.user_data.connect_done(qconn)
+    pub(crate) fn run_connect_done_event(
+        &mut self,
+        qconn: &mut QuicConnection,
+        result: QuicConnectResult,
+    ) -> Result<()> {
+        self.user_data.connect_done(qconn, result)
     }
 
     pub(crate) fn run_close_event(
@@ -56,22 +61,53 @@ where
 }
 
 pub trait QuicCallbacks {
-    // TODO: add QUIC connect result to parameter
-    fn connect_done(&mut self, qconn: &mut QuicConnection) -> Result<()>;
+    /// Called when connection establishment completes, either successfully or with an error.
+    ///
+    /// # Parameters
+    /// * `qconn` - The QUIC connection object
+    /// * `result` - The connection result:
+    ///   - `QuicConnectResult::Success` - Connection established successfully
+    ///   - `QuicConnectResult::Timeout` - Connection timed out after specified duration
+    ///   - `QuicConnectResult::Failed` - Connection failed with error message
+    ///
+    /// # Returns
+    /// `Result<()>` indicating if the callback completed successfully
+    fn connect_done(&mut self, qconn: &mut QuicConnection, result: QuicConnectResult)
+        -> Result<()>;
 
+    /// Called when a stream is opened by the peer, has data available to read,
+    /// or is closed by the peer for reading.
+    ///
+    /// # Parameters
+    /// * `qconn` - The QUIC connection object
+    /// * `stream_handle` - Handle identifying the affected stream
+    ///
+    /// # Returns
+    /// `Result<()>` indicating if the callback completed successfully
     fn read_event(
         &mut self,
         qconn: &mut QuicConnection,
         stream_handle: QuicStreamHandle,
     ) -> Result<()>;
 
+    /// Called when a stream is ready for writing data,
+    /// or is closed by the peer for writing.
+    ///
+    /// # Parameters
+    /// * `qconn` - The QUIC connection object
+    /// * `stream_handle` - Handle identifying the stream to write to
+    ///
     fn write_event(
         &mut self,
         qconn: &mut QuicConnection,
         stream_handle: QuicStreamHandle,
     ) -> Result<()>;
 
-    // Only when this connection was closed by the peer side
+    /// Called when the connection is closed by the peer or due to idle timeout.
+    ///
+    /// # Parameters
+    /// * `error_code` - Optional error code provided by peer
+    /// * `reason` - Optional reason string provided by peer
     fn close(
         &mut self,
         qconn: &mut QuicConnection,
