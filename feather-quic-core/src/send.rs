@@ -67,7 +67,7 @@ impl QuicSendContext {
         self.crypto_recv_buf.consume(offset, usize::MAX)
     }
 
-    pub(crate) fn clear(&mut self) -> Result<()> {
+    pub(crate) fn clear(&mut self) {
         if !self.sent_queue.is_empty() {
             warn!(
                 "{:?} sent queue is not empty {}",
@@ -85,8 +85,6 @@ impl QuicSendContext {
             );
             self.send_queue.clear();
         }
-
-        Ok(())
     }
 
     pub(crate) fn need_ack(&self, current_ts: &Instant, local_mad: u16) -> bool {
@@ -339,7 +337,7 @@ impl QuicSendContext {
                 let mut frame = self.sent_queue.pop_front().ok_or_else(|| {
                     anyhow!("Must have the frame in the sent queue, count {}", index)
                 })?;
-                if matches!(frame, QuicFrame::Ack(_)) || matches!(frame, QuicFrame::Ping(_)) {
+                if !frame.is_ack_eliciting() || matches!(frame, QuicFrame::Ping(_)) {
                     trace!("Drop the frame {:?} from the sent queue", frame);
                     index -= 1;
                     continue;
@@ -466,7 +464,6 @@ impl QuicSendContext {
         });
 
         if largest >= self.next_pn {
-            // TODO: QUIC connection termination
             return Err(anyhow!(
                 "Received invalid ack frame, never sent this packet {}, current pn {}",
                 largest,

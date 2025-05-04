@@ -6,6 +6,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use tracing::{trace, warn};
 
 use crate::config::QuicConfig;
+use crate::connection::QUIC_STATELESS_RESET_TOKEN_SIZE;
 use crate::tls::TlsContext;
 use crate::utils::{decode_variable_length, encode_variable_length, get_variable_length};
 
@@ -25,7 +26,7 @@ pub(crate) enum TransportParameter {
     // This parameter is a sequence of 16 bytes. This transport parameter MUST NOT be sent by a client but MAY be sent by a server.
     // A server that does not send this transport parameter cannot use stateless reset (Section 10.3)
     // for the connection ID negotiated during the handshake.
-    StatelessResetToken([u8; 16]),
+    StatelessResetToken([u8; QUIC_STATELESS_RESET_TOKEN_SIZE as usize]),
 
     // The maximum UDP payload size parameter is an integer value that limits the size of UDP payloads
     // that the endpoint is willing to receive.
@@ -631,6 +632,7 @@ pub(crate) struct PeerTransportParameters {
     initial_max_stream_data_uni: Option<u64>,
     initial_max_streams_bidi: Option<u64>,
     initial_max_streams_uni: Option<u64>,
+    stateless_reset_token: Option<[u8; QUIC_STATELESS_RESET_TOKEN_SIZE as usize]>,
     updated: bool,
 }
 
@@ -653,6 +655,7 @@ impl PeerTransportParameters {
         self.initial_max_stream_data_uni = tls.get_peer_initial_max_stream_data_uni();
         self.initial_max_streams_bidi = tls.get_peer_initial_max_streams_bidi();
         self.initial_max_streams_uni = tls.get_peer_initial_max_streams_uni();
+        self.stateless_reset_token = tls.get_peer_stateless_reset_token();
         self.updated = true;
     }
 
@@ -690,5 +693,11 @@ impl PeerTransportParameters {
 
     pub(crate) fn get_initial_max_streams_uni(&self) -> Option<u64> {
         self.initial_max_streams_uni
+    }
+
+    pub(crate) fn get_stateless_reset_token(
+        &self,
+    ) -> Option<[u8; QUIC_STATELESS_RESET_TOKEN_SIZE as usize]> {
+        self.stateless_reset_token
     }
 }

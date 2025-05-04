@@ -481,6 +481,11 @@ impl IoUringEventLoop {
                         } else {
                             warn!("Should not trigger the timer process immediately!");
                         }
+
+                        if qconn.is_closed() {
+                            info!("Now we exit the runtime");
+                            return Ok(());
+                        }
                     }
                     Token::ProvideBuffers { group_id, fd } => {
                         trace!("Initializing buffer group");
@@ -594,6 +599,11 @@ impl IoUringEventLoop {
                 self.add_timer(&mut sq, udp_fd, timeout)?;
             } else {
                 warn!("Should not trigger the timer process immediately!");
+            }
+
+            if qconn.is_closed() {
+                info!("Now we exit the runtime");
+                return Ok(());
             }
         }
     }

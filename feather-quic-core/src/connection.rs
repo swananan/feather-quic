@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use rand::Rng;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use tracing::{error, info, span, trace, warn, Level};
 
 use crate::config::QuicConfig;
 use crate::crypto::QuicCrypto;
+use crate::error_code::{QuicConnectionErrorCode, TransportErrorCode};
 use crate::flow_control::QuicConnectionFlowControl;
 use crate::frame::{QuicFrame, QuicPing};
 use crate::packet::QuicPacket;
@@ -21,6 +22,10 @@ use crate::transport_parameters::PeerTransportParameters;
 use crate::utils::{decode_variable_length, format_instant, remaining_bytes};
 use crate::QuicCallbacks;
 
+// https://www.rfc-editor.org/rfc/rfc9000.html#section-10.3-11
+const QUIC_RESET_PACKET_MIN_SIZE: u16 = 21;
+pub(crate) const QUIC_STATELESS_RESET_TOKEN_SIZE: u16 = 16;
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum QuicLevel {
     Initial,
@@ -29,11 +34,13 @@ pub(crate) enum QuicLevel {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum QuicConnectionState {
+pub enum QuicConnectionState {
     Init,
     Connecting,
     Established,
-    _ConnectionClose,
+    ConnectionDraining,
+    ConnectionClosing,
+    ConnectionClosed,
 }
 
 #[derive(Error, Debug)]
@@ -46,13 +53,19 @@ pub enum QuicConnectionError {
     StreamLimitations(String, Option<u64>),
 
     #[error("Can not send any byte, current connection max data is {0}!")]
-    StreamConnectionMaxDataLimitations(u64),
+    ConnectionMaxDataLimitations(u64),
 
     #[error("Error from QUIC stream")]
     QuicStreamError(#[from] QuicStreamError),
 
-    #[error("Interner implementation error {0}")]
-    InternerError(String),
+    #[error("Internal implementation error {0}")]
+    InternalError(String),
+
+    #[error("Can not support for this operation, {0}")]
+    ConnectionWrongState(String),
+
+    #[error("QUIC Connection was closed {0:?}")]
+    ConnectionLost(QuicConnectionState),
 }
 
 pub struct QuicConnection {
@@ -70,7 +83,11 @@ pub struct QuicConnection {
     pub(crate) tls: TlsContext,
     pub(crate) retry_token: Option<Vec<u8>>,
     pub(crate) new_token: Option<Vec<u8>>,
-    pub(crate) new_conn_ids: Vec<(Vec<u8>, Vec<u8>)>,
+
+    conn_ids: HashSet<Vec<u8>>,
+    reset_tokens: HashSet<Vec<u8>>,
+    peer_conn_ids: HashSet<Vec<u8>>,
+    peer_reset_tokens: HashSet<Vec<u8>>,
 
     pub(crate) key_phase: u8,
     discard_oldkey_threshold: Option<Instant>,
@@ -89,8 +106,15 @@ pub struct QuicConnection {
 
     pub(crate) rtt: QuicRttGenerator,
 
-    connect_done: bool,
+    connect_done_called: bool,
     peer_transport_params: PeerTransportParameters,
+
+    close_called: bool,
+    close_threshold: Option<Instant>,
+    error_code: Option<QuicConnectionErrorCode>,
+    peer_error_code: Option<QuicConnectionErrorCode>,
+    reason_phrase: Option<String>,
+    peer_reason_phrase: Option<String>,
 
     // QUIC Streams
     streams: HashMap<QuicStreamHandle, QuicStream>,
@@ -123,6 +147,8 @@ impl QuicConnection {
 
         let now = Instant::now();
 
+        let mut scids = HashSet::new();
+        scids.insert(scid.clone());
         QuicConnection {
             state: QuicConnectionState::Init,
             crypto: QuicCrypto::default(),
@@ -136,7 +162,11 @@ impl QuicConnection {
             idle_timeout: None,
             org_dcid,
             quic_config,
-            new_conn_ids: vec![],
+
+            conn_ids: scids,
+            reset_tokens: HashSet::new(),
+            peer_conn_ids: HashSet::new(),
+            peer_reset_tokens: HashSet::new(),
 
             datagram_size: 1200,
             key_phase: 0,
@@ -159,22 +189,34 @@ impl QuicConnection {
             next_bidi_local_stream_id: 0,
             next_uni_local_stream_id: 2,
             max_remote_stream_id: None,
-            connect_done: false,
+            connect_done_called: false,
+
+            close_called: false,
+            close_threshold: None,
+            error_code: None,
+            peer_error_code: None,
+            reason_phrase: None,
+            peer_reason_phrase: None,
+
             peer_transport_params: PeerTransportParameters::new(),
             flow_control: QuicConnectionFlowControl::new(),
         }
     }
 
-    pub fn is_readable(&self) -> bool {
-        false
-    }
-
-    pub fn is_writable(&self) -> bool {
-        false
-    }
-
     pub fn is_established(&self) -> bool {
         self.state == QuicConnectionState::Established
+    }
+
+    pub fn is_closing(&self) -> bool {
+        self.state == QuicConnectionState::ConnectionClosing
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.state == QuicConnectionState::ConnectionClosed
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.state == QuicConnectionState::ConnectionDraining
     }
 
     pub(crate) fn set_connected(&mut self) -> Result<()> {
@@ -187,14 +229,19 @@ impl QuicConnection {
     }
 
     // TODO: Support custom timestamp callback
-    pub fn update_current_time(&mut self) {
+    pub(crate) fn update_current_time(&mut self) {
         self.current_ts = Instant::now();
     }
 
-    pub fn run_timer(&mut self) -> Result<()> {
-        let span = span!(Level::TRACE, "processing timers");
+    pub(crate) fn run_timer(&mut self) -> Result<()> {
+        let span = span!(
+            Level::TRACE,
+            "quic_timer",
+            scid = ?self.scid.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""),
+            dcid = ?self.dcid.as_ref().map(|d| d.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""))
+        );
         let _enter = span.enter();
-        trace!("Enter processing timers, current_ts {:?}", self.current_ts);
+        trace!("Processing timers at {:?}", self.current_ts);
 
         let compare_ts = |current_ts: &Instant, threshold: &Instant| -> bool {
             if *current_ts == *threshold {
@@ -215,8 +262,11 @@ impl QuicConnection {
                     self.current_ts, idle_timeout_threshold
                 );
                 self.idle_timeout_threshold = None;
-                // TODO: Implement QUIC connection termination
-                unimplemented!();
+
+                // https://www.rfc-editor.org/rfc/rfc9000.html#section-10.1-1
+                // Sliently close
+                self.real_close_handler();
+                return Ok(());
             }
         }
 
@@ -272,14 +322,47 @@ impl QuicConnection {
             QuicPacket::update_quic_send_queue(self)?;
         }
 
+        if self.is_draining() {
+            info!("Only need to reply the QUIC connection close frame, since got connection close");
+            self.real_close_handler();
+            return Ok(());
+        }
+
+        if let Some(close_event) = self.close_threshold.as_ref() {
+            if compare_ts(&self.current_ts, close_event) {
+                self.close_threshold = None;
+                self.real_close_handler();
+            }
+        }
+
         trace!("Leave processing timers");
 
         Ok(())
     }
 
-    pub fn next_time(&self) -> Option<u64> {
-        let span = span!(Level::TRACE, "calculating next timer");
-        let _enter = span.enter();
+    fn real_close_handler(&mut self) {
+        if self.is_closed() {
+            warn!(
+                "Attempting to call this method multiple times, which may indicate \
+            a potential issue in the connection state management"
+            );
+            return;
+        }
+
+        self.state = QuicConnectionState::ConnectionClosed;
+        self.discard_keys_safely(QuicLevel::Application);
+        self.discard_keys_safely(QuicLevel::Handshake);
+        self.discard_keys_safely(QuicLevel::Initial);
+        info!("Now our QUIC connection has been closed");
+    }
+
+    pub(crate) fn next_time(&self) -> Option<u64> {
+        let _span =
+            span!(Level::TRACE, "calculating next timer", 
+                scid = ?self.scid.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""), 
+                dcid = ?self.dcid.as_ref().map(|d| d.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""))
+            )
+            .entered();
 
         // Helper closure to calculate duration until threshold
         let time_until = |name: &str, threshold: Option<Instant>| -> u64 {
@@ -308,6 +391,7 @@ impl QuicConnection {
         let detect_lost = time_until("Loss detection", self.detect_lost_threshold);
         let pto = time_until("PTO", self.pto_threshold);
         let ack_delay = time_until("ACK delay", self.ack_delay_threshold);
+        let close = time_until("Close event", self.close_threshold);
 
         // Special handling for send threshold due to should_send_asap flag
         let send = if self.should_send_asap {
@@ -323,7 +407,8 @@ impl QuicConnection {
             .min(send)
             .min(detect_lost)
             .min(pto)
-            .min(ack_delay);
+            .min(ack_delay)
+            .min(close);
 
         // Log the result
         match timeout {
@@ -342,10 +427,34 @@ impl QuicConnection {
         }
     }
 
+    fn update_idle_timeout_threshold(&mut self) {
+        let idle_timeout = self.get_idle_timeout();
+        self.idle_timeout_threshold = if idle_timeout != 0 {
+            trace!(
+                "Update the idle timeout threshold to next {}ms",
+                idle_timeout,
+            );
+            self.current_ts
+                .checked_add(Duration::from_millis(idle_timeout))
+        } else {
+            None
+        };
+    }
+
     #[allow(unused_variables)]
-    pub fn provide_data(&mut self, rcvbuf: &[u8], source_addr: SocketAddr) -> Result<()> {
-        let span = span!(Level::TRACE, "providing data");
+    pub(crate) fn provide_data(&mut self, rcvbuf: &[u8], source_addr: SocketAddr) -> Result<()> {
+        let span = span!(
+            Level::TRACE,
+            "providing_data",
+            scid = ?self.scid.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""),
+            dcid = ?self.dcid.as_ref().map(|d| d.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""))
+        );
         let _enter = span.enter();
+
+        if self.is_closed() || self.is_draining() {
+            trace!("No need to take care the incoming UDP datagram");
+            return Ok(());
+        }
 
         QuicPacket::handle_quic_packet(rcvbuf, self, &source_addr).with_context(|| {
             format!(
@@ -354,21 +463,20 @@ impl QuicConnection {
             )
         })?;
 
-        // Update idle timeout threshold
-        let idle_timeout = self.get_idle_timeout();
-        self.idle_timeout_threshold = if idle_timeout != 0 {
-            self.current_ts
-                .checked_add(Duration::from_millis(idle_timeout))
-        } else {
-            None
-        };
+        self.update_idle_timeout_threshold();
 
         Ok(())
     }
 
-    pub fn consume_data(&mut self) -> Option<Vec<u8>> {
-        let span = span!(Level::TRACE, "consuming data");
+    pub(crate) fn consume_data(&mut self) -> Option<Vec<u8>> {
+        let span = span!(
+            Level::TRACE,
+            "consuming data",
+            scid = ?self.scid.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""),
+            dcid = ?self.dcid.as_ref().map(|d| d.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""))
+        );
         let _enter = span.enter();
+
         if !self.send_queue.is_empty() {
             if let Err(e) = self.set_loss_or_pto_timer() {
                 error!("Failed to set loss or pto timer during consuming send queue, due to {e}");
@@ -380,7 +488,7 @@ impl QuicConnection {
             .map(|v| v.into_iter().flat_map(|v| v.into_iter()).collect())
     }
 
-    pub fn connect(&mut self) -> Result<()> {
+    pub fn connect(&mut self) -> Result<(), QuicConnectionError> {
         let span = span!(
             Level::TRACE,
             "connecting",
@@ -394,24 +502,126 @@ impl QuicConnection {
                     "Quic connection scid {:x?}, dcid {:x?}, org dcid {:x?}",
                     self.scid, self.dcid, self.org_dcid
                 )
-            })?;
+            })
+            .map_err(|e| QuicConnectionError::ConnectionWrongState(format!("Due to {}", e)))?;
+
         self.state = QuicConnectionState::Connecting;
         self.update_current_time();
-        QuicPacket::start_tls_handshake(self, false).with_context(|| {
+        QuicPacket::start_tls_handshake(self, false)
+            .with_context(|| {
+                format!(
+                    "Quic connection scid {:x?}, dcid {:x?}, org dcid {:x?}",
+                    self.scid, self.dcid, self.org_dcid
+                )
+            })
+            .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
+
+        self.update_idle_timeout_threshold();
+
+        Ok(())
+    }
+
+    pub(crate) fn send_transport_connection_close_frame(
+        &mut self,
+        levels: &[QuicLevel],
+        error_code: u64,
+        reason: Option<String>,
+        frame_type: Option<u64>,
+    ) {
+        if self.is_closing() || self.is_draining() {
+            warn!(
+                "Should not send connection close frame, since we have \
+                already close the QUIC connection"
+            );
+            return;
+        }
+
+        self.error_code = Some(QuicConnectionErrorCode::create_transport_error_code(
+            error_code, frame_type,
+        ));
+        self.reason_phrase = reason;
+
+        self.send_connection_close_frame(levels);
+    }
+
+    pub(crate) fn send_connection_close_frame(&mut self, levels: &[QuicLevel]) {
+        trace!("Send connection close frame on the levels {:?}", levels);
+
+        let cc_frame = match self.error_code {
+            Some(error_code) => {
+                QuicFrame::create_connection_close_frame(error_code, self.reason_phrase.clone())
+            }
+            None => {
+                panic!("Must have error_code here");
+            }
+        };
+
+        self.set_next_send_event_time(0);
+
+        for level in levels {
+            let send_ctx = match level {
+                QuicLevel::Initial => &mut self.init_send,
+                QuicLevel::Handshake => &mut self.hs_send,
+                QuicLevel::Application => &mut self.app_send,
+            };
+            send_ctx.insert_send_queue_back(cc_frame.clone());
+        }
+    }
+
+    // Unit is millisecond
+    pub(crate) fn three_times_pto(&self) -> u64 {
+        3 * self.rtt.get_pto(QuicLevel::Application).as_millis() as u64 * (1 << self.pto_backoff)
+    }
+
+    pub(crate) fn close_helper(&mut self) {
+        if self.is_closing() || self.is_draining() || self.is_draining() {
+            return;
+        }
+        // Intention of calling close doesn't trigger the close callback
+        self.close_called = true;
+        self.state = QuicConnectionState::ConnectionClosing;
+        self.close_threshold = self
+            .current_ts
+            .checked_add(Duration::from_millis(self.three_times_pto()));
+    }
+
+    pub fn close(
+        &mut self,
+        error_code: u64,
+        reason_phrase: Option<String>,
+    ) -> Result<(), QuicConnectionError> {
+        let span = span!(Level::TRACE, "trying close the QUIC connection",);
+        let _enter = span.enter();
+
+        self.expected_states(vec![
+            QuicConnectionState::Connecting,
+            QuicConnectionState::Established,
+        ])
+        .with_context(|| {
             format!(
                 "Quic connection scid {:x?}, dcid {:x?}, org dcid {:x?}",
                 self.scid, self.dcid, self.org_dcid
             )
-        })?;
+        })
+        .map_err(|e| QuicConnectionError::ConnectionWrongState(format!("Due to {}", e)))?;
 
-        // Update idle timeout threshold
-        let idle_timeout = self.get_idle_timeout();
-        self.idle_timeout_threshold = if idle_timeout != 0 {
-            self.current_ts
-                .checked_add(Duration::from_millis(idle_timeout))
+        self.error_code = Some(QuicConnectionErrorCode::create_application_error_code(
+            error_code,
+        ));
+        self.reason_phrase = reason_phrase;
+
+        if self.is_established() {
+            self.send_connection_close_frame(&[QuicLevel::Application]);
         } else {
-            None
-        };
+            self.send_connection_close_frame(&[QuicLevel::Initial, QuicLevel::Handshake]);
+        }
+
+        self.close_helper();
+
+        info!(
+            "Close event will be triggered at {}",
+            format_instant(self.close_threshold.unwrap(), self.current_ts)
+        );
 
         Ok(())
     }
@@ -438,7 +648,7 @@ impl QuicConnection {
                 true,
                 self.flow_control.get_max_streams_bidi_remote().unwrap_or(0),
             )
-            .map_err(|e| QuicConnectionError::InternerError(format!("Due to {}", e)))?;
+            .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
             return Err(QuicConnectionError::StreamLimitations(
                 "Bidirectional".to_string(),
                 self.flow_control.get_max_streams_bidi_remote(),
@@ -456,12 +666,20 @@ impl QuicConnection {
                 false,
                 self.flow_control.get_max_streams_uni_remote().unwrap_or(0),
             )
-            .map_err(|e| QuicConnectionError::InternerError(format!("Due to {}", e)))?;
+            .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
 
             return Err(QuicConnectionError::StreamLimitations(
                 "Unidirectional".to_string(),
                 self.flow_control.get_max_streams_uni_remote(),
             ));
+        }
+
+        if self.is_closed() || self.is_closing() || self.is_draining() {
+            info!(
+                "Connection is in {:?}, so we can't open a new stream",
+                self.state
+            );
+            return Err(QuicConnectionError::ConnectionLost(self.state));
         }
 
         let new_id = if is_bidirectional {
@@ -532,6 +750,14 @@ impl QuicConnection {
         let span = span!(Level::TRACE, "finishing stream", stream = ?stream_handle);
         let _enter = span.enter();
 
+        if self.is_closed() || self.is_closing() || self.is_draining() {
+            info!(
+                "Connection is in {:?}, so we can't finish the stream",
+                self.state
+            );
+            return Err(QuicConnectionError::ConnectionLost(self.state));
+        }
+
         let stream = self.streams.get_mut(&stream_handle).ok_or_else(|| {
             error!("Stream {:?} not found when trying to finish", stream_handle);
             QuicConnectionError::StreamNotExist(stream_handle)
@@ -553,6 +779,14 @@ impl QuicConnection {
         );
         let _enter = span.enter();
 
+        if self.is_closed() || self.is_closing() || self.is_draining() {
+            info!(
+                "Connection is in {:?}, so we can't shutdown write",
+                self.state
+            );
+            return Err(QuicConnectionError::ConnectionLost(self.state));
+        }
+
         let stream = self.streams.get_mut(&stream_handle).ok_or_else(|| {
             error!(
                 "Stream {:?} not found when trying to shutdown write",
@@ -567,6 +801,7 @@ impl QuicConnection {
         );
         let reset_frame = stream.reset(application_error_code)?;
         self.app_send.insert_send_queue_back(reset_frame);
+        self.set_next_send_event_time(0);
 
         // Shall we discard the all related stream frames in the send queue?
         // Yes
@@ -582,12 +817,20 @@ impl QuicConnection {
         &mut self,
         stream_handle: QuicStreamHandle,
         application_error_code: u64,
-    ) -> Result<()> {
+    ) -> Result<(), QuicConnectionError> {
         let span = span!(Level::TRACE, "shutting down stream read",
             stream = ?stream_handle,
             error_code = application_error_code
         );
         let _enter = span.enter();
+
+        if self.is_closed() || self.is_closing() || self.is_draining() {
+            info!(
+                "Connection is in {:?}, so we can't shutdown read",
+                self.state
+            );
+            return Err(QuicConnectionError::ConnectionLost(self.state));
+        }
 
         let stream = self.streams.get_mut(&stream_handle).ok_or_else(|| {
             error!(
@@ -603,6 +846,7 @@ impl QuicConnection {
         );
         let frame = stream.stop_sending(application_error_code)?;
         self.app_send.insert_send_queue_back(frame);
+        self.set_next_send_event_time(0);
 
         Ok(())
     }
@@ -617,6 +861,11 @@ impl QuicConnection {
             length = recv_len
         );
         let _enter = span.enter();
+
+        if self.is_closed() || self.is_closing() || self.is_draining() {
+            info!("Connection is in {:?}, so we can't receive", self.state);
+            return Err(QuicConnectionError::ConnectionLost(self.state));
+        }
 
         let stream = self.streams.get_mut(&stream_handle).ok_or_else(|| {
             error!(
@@ -646,7 +895,7 @@ impl QuicConnection {
             if res {
                 self.create_and_insert_max_data_stream(Some(stream_handle), stream_max_size)
                     .map_err(|e| {
-                        QuicConnectionError::InternerError(format!(
+                        QuicConnectionError::InternalError(format!(
                             "Stream {} failure, due to {}",
                             stream_handle, e
                         ))
@@ -662,7 +911,7 @@ impl QuicConnection {
                     None,
                     self.flow_control.get_new_max_recv_size(),
                 )
-                .map_err(|e| QuicConnectionError::InternerError(format!("Due to {}", e)))?;
+                .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
             }
         }
 
@@ -688,6 +937,11 @@ impl QuicConnection {
         );
         let _enter = span.enter();
 
+        if self.is_closed() || self.is_closing() || self.is_draining() {
+            info!("Connection is in {:?}, so we can't send", self.state);
+            return Err(QuicConnectionError::ConnectionLost(self.state));
+        }
+
         let stream = self.streams.get_mut(&stream_handle).ok_or_else(|| {
             error!("Stream {:?} not found when trying to send", stream_handle);
             QuicConnectionError::StreamNotExist(stream_handle)
@@ -700,16 +954,16 @@ impl QuicConnection {
         let available_bytes = self
             .flow_control
             .get_sent_available_bytes()
-            .map_err(|e| QuicConnectionError::InternerError(format!("Due to {}", e)))?;
+            .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
 
         if available_bytes == 0 {
             // Actually QUIC stream frame length can be zero, but we provide the `finish` api
             warn!("Connection flow control was triggered here");
             let max_send_size = self.flow_control.get_max_send_size();
             self.create_and_insert_data_blocked_stream(None, max_send_size)
-                .map_err(|e| QuicConnectionError::InternerError(format!("Due to {}", e)))?;
+                .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
 
-            return Err(QuicConnectionError::StreamConnectionMaxDataLimitations(
+            return Err(QuicConnectionError::ConnectionMaxDataLimitations(
                 self.flow_control.get_max_send_size(),
             ));
         }
@@ -741,7 +995,7 @@ impl QuicConnection {
             Err(e) => {
                 if matches!(e, QuicStreamError::WouldBlock) {
                     self.create_and_insert_data_blocked_stream(Some(stream_handle), max_send_size)
-                        .map_err(|e| QuicConnectionError::InternerError(format!("Due to {}", e)))?;
+                        .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
                 }
                 Err(QuicConnectionError::QuicStreamError(e))
             }
@@ -753,6 +1007,14 @@ impl QuicConnection {
         stream_handle: QuicStreamHandle,
         flag: bool,
     ) -> Result<(), QuicConnectionError> {
+        if self.is_closed() || self.is_closing() || self.is_draining() {
+            info!(
+                "Connection is in {:?}, so we can't set write active",
+                self.state
+            );
+            return Err(QuicConnectionError::ConnectionLost(self.state));
+        }
+
         match self.streams.entry(stream_handle) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
                 e.get_mut().set_write_active(flag);
@@ -774,6 +1036,14 @@ impl QuicConnection {
         stream_handle: QuicStreamHandle,
         flag: bool,
     ) -> Result<(), QuicConnectionError> {
+        if self.is_closed() || self.is_closing() || self.is_draining() {
+            info!(
+                "Connection is in {:?}, so we can't set read active",
+                self.state
+            );
+            return Err(QuicConnectionError::ConnectionLost(self.state));
+        }
+
         match self.streams.entry(stream_handle) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
                 e.get_mut().set_read_active(flag);
@@ -788,6 +1058,87 @@ impl QuicConnection {
             }
         };
         Ok(())
+    }
+
+    pub(crate) fn check_dcid(&self, dcid: &[u8]) -> bool {
+        self.conn_ids.contains(dcid)
+    }
+
+    pub(crate) fn check_scid(&self, scid: &[u8]) -> bool {
+        self.peer_conn_ids.contains(scid)
+    }
+
+    fn draining(&mut self, level: QuicLevel) {
+        if self.is_draining() {
+            return;
+        }
+
+        info!("Entering draining state, level {:?}", level);
+
+        // Stop sending any packet and notify the application layer
+        self.app_send.clear();
+        self.hs_send.clear();
+        self.init_send.clear();
+        self.send_queue.clear();
+
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-10.2.2-2
+        TransportErrorCode::send_no_error_cc_frame(self, level);
+
+        self.state = QuicConnectionState::ConnectionDraining;
+    }
+
+    pub(crate) fn handle_stateless_reset(&mut self, rcv_buf: &[u8]) {
+        if rcv_buf.len() < QUIC_RESET_PACKET_MIN_SIZE as usize {
+            return;
+        }
+
+        let reset_token = &rcv_buf[(rcv_buf.len() - QUIC_STATELESS_RESET_TOKEN_SIZE as usize)..];
+        trace!(
+            "Processing potential stateless reset packet, tokens: {:x?}",
+            reset_token
+        );
+
+        if self.peer_reset_tokens.contains(reset_token) {
+            self.peer_error_code = None;
+            self.peer_reason_phrase = Some("quic stateless reset packet detected".to_string());
+            self.draining(QuicLevel::Application);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn add_reset_token(&mut self, reset_token: &[u8]) {
+        if reset_token.len() as u16 != QUIC_STATELESS_RESET_TOKEN_SIZE {
+            error!(
+                "Attempting to add invalid reset token length: {}",
+                reset_token.len()
+            );
+            return;
+        }
+        info!("Adding reset token: {:x?}", reset_token);
+        self.reset_tokens.insert(reset_token.into());
+    }
+
+    pub(crate) fn add_connection_id(&mut self, new_scid: &[u8]) {
+        self.conn_ids.insert(new_scid.into());
+    }
+
+    pub(crate) fn add_peer_reset_token(&mut self, reset_token: &[u8]) {
+        if reset_token.len() as u16 != QUIC_STATELESS_RESET_TOKEN_SIZE {
+            error!("Invalid reset token length: {}", reset_token.len());
+            return;
+        }
+        info!("Adding peer reset token: {:x?}", reset_token);
+        self.peer_reset_tokens.insert(reset_token.into());
+    }
+
+    pub(crate) fn add_peer_connection_id(&mut self, new_scid: &[u8]) {
+        self.peer_conn_ids.insert(new_scid.into());
+    }
+
+    pub(crate) fn handle_new_conncetion_id_frame(&mut self, new_scid: &[u8], reset_token: &[u8]) {
+        self.add_peer_connection_id(new_scid);
+        self.add_peer_reset_token(reset_token);
+        // TODO: https://www.rfc-editor.org/rfc/rfc9000.html#section-19.15-8
     }
 
     pub(crate) fn handle_reset_stream_frame(
@@ -842,6 +1193,7 @@ impl QuicConnection {
                     })?
                 {
                     self.app_send.insert_send_queue_back(frame);
+                    self.set_next_send_event_time(0);
                 }
                 Ok(())
             }
@@ -899,6 +1251,54 @@ impl QuicConnection {
         self.flow_control.handle_max_data_frame(max_data)
     }
 
+    pub(crate) fn handle_connection_close_frame(
+        &mut self,
+        error_code: QuicConnectionErrorCode,
+        reason: String,
+        level: QuicLevel,
+    ) -> Result<()> {
+        if self.is_draining() {
+            info!(
+                "Got another error code {:?} from connection close frame, reason {}",
+                error_code, reason
+            );
+            return Ok(());
+        }
+
+        if self.is_closing() {
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-10.2.2-3
+            trace!(
+                "As we are closing QUIC connection, peer side did the same, error_code {:?} \
+                reason {}",
+                error_code,
+                reason
+            );
+            return Ok(());
+        }
+
+        if self.is_closed() {
+            error!(
+                "As we closed QUIC connection, should not handle QUIC packet, error_code {:?} \
+                reason {}",
+                error_code, reason
+            );
+            return Ok(());
+        }
+
+        info!(
+            "Received the Connection close frame, starting to enter Draining state, \
+            error_code {:?}, reason {}",
+            error_code, reason
+        );
+
+        self.peer_error_code = Some(error_code);
+        self.peer_reason_phrase = Some(reason);
+
+        self.draining(level);
+
+        Ok(())
+    }
+
     pub(crate) fn handle_streams_blocked_frame(
         &mut self,
         max_streams: u64,
@@ -919,7 +1319,7 @@ impl QuicConnection {
         info!("Handling DATA_BLOCKED frame: max_data={}", max_data);
         if self.flow_control.check_if_update_max_recv_data(true) {
             self.create_and_insert_max_data_stream(None, self.flow_control.get_new_max_recv_size())
-                .map_err(|e| QuicConnectionError::InternerError(format!("Due to {}", e)))?;
+                .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
         }
         Ok(())
     }
@@ -1058,8 +1458,10 @@ impl QuicConnection {
                 .map(|max| self.flow_control.get_bi_stream_remote_cnt() >= max)
                 .unwrap_or(true)
         {
-            // TODO: https://www.rfc-editor.org/rfc/rfc9000.html#section-4.6-3
-            // QUIC Termination
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-4.6-3
+
+            TransportErrorCode::send_stream_limit_error_cc_frame(self);
+            self.close_helper();
             return Err(anyhow!(
                 "Can not open bidirectional stream, current limitation is {:?}!",
                 self.flow_control.get_max_streams_bidi_remote()
@@ -1073,8 +1475,9 @@ impl QuicConnection {
                 .map(|max| self.flow_control.get_uni_stream_remote_cnt() >= max)
                 .unwrap_or(true)
         {
-            // TODO: https://www.rfc-editor.org/rfc/rfc9000.html#section-4.6-3
-            // QUIC Termination
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-4.6-3
+            TransportErrorCode::send_stream_limit_error_cc_frame(self);
+            self.close_helper();
             return Err(anyhow!(
                 "Can not open unidirectional stream, current limitation is {:?}!",
                 self.flow_control.get_max_streams_uni_local()
@@ -1172,39 +1575,76 @@ impl QuicConnection {
     where
         T: QuicCallbacks,
     {
-        let span = span!(Level::TRACE, "handling Quic streams");
+        let span = span!(
+            Level::TRACE,
+            "quic_streams",
+            scid = ?self.scid.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""),
+            dcid = ?self.dcid.as_ref().map(|d| d.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""))
+        );
         let _enter = span.enter();
 
         // TODO: connect could fail
-        if self.is_established() && !self.connect_done {
-            self.connect_done = true;
+        if self.is_established() && !self.connect_done_called {
+            trace!("Connection established, calling connect done event");
+            self.connect_done_called = true;
             uctx.run_connect_done_event(self)?;
         }
 
-        let mut read_ready_streams = vec![];
-        let mut write_ready_streams = vec![];
+        if !self.is_closed() && !self.is_closing() && !self.is_draining() {
+            let mut read_ready_streams = vec![];
+            let mut write_ready_streams = vec![];
 
-        self.streams
-            .iter_mut()
-            .try_for_each(|(stream_id, stream)| -> Result<()> {
-                if stream.is_readable() {
-                    read_ready_streams.push(*stream_id);
-                }
-                if stream.is_writable() {
-                    write_ready_streams.push(*stream_id);
-                }
-                Ok(())
-            })?;
+            self.streams
+                .iter_mut()
+                .try_for_each(|(stream_id, stream)| -> Result<()> {
+                    if stream.is_readable() {
+                        trace!("Stream {} is readable", stream_id);
+                        read_ready_streams.push(*stream_id);
+                    }
+                    if stream.is_writable() {
+                        trace!("Stream {} is writable", stream_id);
+                        write_ready_streams.push(*stream_id);
+                    }
+                    Ok(())
+                })?;
 
-        read_ready_streams
-            .iter()
-            .try_for_each(|stream_id| -> Result<()> { uctx.run_read_event(self, *stream_id) })?;
+            trace!(
+                "Processing {} readable streams and {} writable streams",
+                read_ready_streams.len(),
+                write_ready_streams.len()
+            );
 
-        write_ready_streams
-            .iter()
-            .try_for_each(|stream_id| -> Result<()> { uctx.run_write_event(self, *stream_id) })?;
+            read_ready_streams
+                .iter()
+                .try_for_each(|stream_id| -> Result<()> {
+                    trace!("Running read event for stream {}", stream_id);
+                    uctx.run_read_event(self, *stream_id)
+                })?;
 
-        self.consume_stream_send_queue()?;
+            write_ready_streams
+                .iter()
+                .try_for_each(|stream_id| -> Result<()> {
+                    trace!("Running write event for stream {}", stream_id);
+                    uctx.run_write_event(self, *stream_id)
+                })?;
+        }
+
+        if !self.is_draining() {
+            self.consume_stream_send_queue()?;
+        }
+
+        if (self.is_draining()
+            || self.is_closed()) // Could be idle timeout
+            && !self.close_called
+        {
+            trace!("Connection closed, calling close event");
+            self.close_called = true;
+            uctx.run_close_event(
+                self,
+                self.peer_error_code.map(|e| e.get_error_code()),
+                self.peer_reason_phrase.clone(),
+            )?;
+        }
 
         Ok(())
     }
@@ -1433,6 +1873,12 @@ impl QuicConnection {
                     for _ in 0..tries {
                         self.recreate_quic_packet_for_pto(level)?;
                     }
+
+                    // https://www.rfc-editor.org/rfc/rfc9000.html#section-10.1-3
+                    // Also update the idle timer, when PTO timer fires
+                    if self.pto_backoff <= 1 {
+                        self.update_idle_timeout_threshold();
+                    }
                 } else {
                     trace!(
                         "Skip this action {}",
@@ -1464,6 +1910,12 @@ impl QuicConnection {
     }
 
     pub(crate) fn set_loss_or_pto_timer(&mut self) -> Result<()> {
+        if self.is_closed() || self.is_closing() || self.is_draining() {
+            self.pto_threshold = None;
+            self.detect_lost_threshold = None;
+            return Ok(());
+        }
+
         let span = span!(Level::TRACE, "setting Loss or PTO timer");
         let _enter = span.enter();
 
@@ -1565,7 +2017,7 @@ impl QuicConnection {
             QuicLevel::Handshake => &mut self.hs_send,
             QuicLevel::Application => &mut self.app_send,
         };
-        send_ctx.clear()?;
+        send_ctx.clear();
 
         self.reset_pto_backoff_factor();
         self.set_loss_or_pto_timer()?;
@@ -1592,6 +2044,18 @@ impl QuicConnection {
         self.send_event_threshold = self.current_ts.checked_add(Duration::from_millis(ts));
     }
 
+    fn expected_states(&self, s: Vec<QuicConnectionState>) -> Result<()> {
+        if s.iter().any(|s| *s == self.state) {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "Invalid QUIC connection state {:?}, expected {:?}",
+                self.state,
+                s
+            ))
+        }
+    }
+
     fn expected_state(&self, s: QuicConnectionState) -> Result<()> {
         if s != self.state {
             return Err(anyhow!(
@@ -1606,6 +2070,10 @@ impl QuicConnection {
 
     pub(crate) fn handle_encrypted_extensions(&mut self) {
         self.peer_transport_params.update_from_tls(&self.tls);
+
+        if let Some(rt) = self.peer_transport_params.get_stateless_reset_token() {
+            self.add_peer_reset_token(&rt);
+        }
         self.flow_control.set_initial_limits(
             self.quic_config.get_initial_max_data(),
             self.get_peer_initial_max_data().unwrap_or(0),
@@ -1653,5 +2121,11 @@ impl QuicConnection {
 
     pub(crate) fn get_peer_initial_max_data(&self) -> Option<u64> {
         self.peer_transport_params.get_initial_max_data()
+    }
+
+    fn discard_keys_safely(&mut self, level: QuicLevel) {
+        if let Err(e) = self.discard_keys(level) {
+            error!("Failed to discard {:?} keys: {}", level, e);
+        }
     }
 }

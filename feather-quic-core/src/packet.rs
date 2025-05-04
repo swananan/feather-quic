@@ -2,12 +2,13 @@ use anyhow::{anyhow, Error, Result};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read, Seek, Write};
 use std::net::SocketAddr;
-use tracing::{info, span, trace, warn, Level};
+use tracing::{error, info, span, trace, warn, Level};
 
 use crate::connection::{QuicConnection, QuicLevel};
 use crate::crypto::{
     DecryptKeyMode, QuicCrypto, QUIC_PN_OFFSET, QUIC_SAMPLE_LENGTH, QUIC_TAG_LENGTH,
 };
+use crate::error_code::{TlsError, TransportErrorCode};
 use crate::frame::QuicFrame;
 use crate::tls::TLS_AES_128_GCM_SHA256;
 use crate::utils::{
@@ -44,8 +45,29 @@ const QUIC_VERSION: u32 = 1;
 // https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2.5
 const QUIC_RETRY_INTEGRITY_TAG_SIZE: u16 = 16;
 
-// TODO: three times the PTO
-const QUIC_DISCARD_OLD_KEY_TIMEOUT: u64 = 800; // Unit is millisecond
+macro_rules! read_or_none {
+    ($expr:expr) => {
+        match $expr {
+            Ok(val) => val,
+            Err(e) => {
+                warn!("Long Header Packet Read failed: {}", e);
+                return Ok(None);
+            }
+        }
+    };
+}
+
+macro_rules! decode_or_none {
+    ($expr:expr) => {
+        match $expr {
+            Ok(val) => val,
+            Err(e) => {
+                warn!("Failed to decode variable length: {}", e);
+                return Ok(None);
+            }
+        }
+    };
+}
 
 #[derive(Debug)]
 struct QuicPacketNumber {
@@ -154,6 +176,10 @@ impl QuicPacket<'_> {
         level: QuicLevel,
         frame_count: u16,
     ) -> Result<Option<Vec<u8>>> {
+        if qconn.is_closed() {
+            return Ok(None);
+        }
+
         let remain = qconn.datagram_size;
         let datagram_buf = match level {
             QuicLevel::Initial => Self::create_initial_packet(qconn, remain, frame_count)?,
@@ -175,6 +201,10 @@ impl QuicPacket<'_> {
         remain: u16,
         bufs: &mut Vec<Vec<u8>>,
     ) -> Result<u16> {
+        if qconn.is_closed() {
+            return Ok(remain);
+        }
+
         // https://www.rfc-editor.org/rfc/rfc9000.html#section-13.2.1
         // An endpoint MUST acknowledge all ack-eliciting Initial and Handshake packets immediately
         // and all ack-eliciting 0-RTT and 1-RTT packets within its advertised max_ack_delay
@@ -254,7 +284,7 @@ impl QuicPacket<'_> {
                 qconn.update_packet_send_queue(datagram_bufs);
             }
 
-            if qconn.is_all_send_queue_empty() {
+            if qconn.is_all_send_queue_empty() || qconn.is_closed() {
                 break;
             }
         }
@@ -265,6 +295,7 @@ impl QuicPacket<'_> {
         {
             // https://www.rfc-editor.org/rfc/rfc9001#section-4.9.1
             qconn.discard_keys(QuicLevel::Initial)?;
+            qconn.init_send.clear();
         }
 
         Ok(())
@@ -275,10 +306,23 @@ impl QuicPacket<'_> {
         udp_datagram_remaining: u16,
         frame_count: u16,
     ) -> Result<Option<Vec<u8>>> {
-        let span = span!(Level::TRACE, "create_initial_packet");
+        let span = span!(
+            Level::TRACE,
+            "create_initial_packet",
+            datagram_size = udp_datagram_remaining,
+            next_pn = qconn.init_send.next_pn,
+            frames_sent = tracing::field::Empty,
+            packet_length = tracing::field::Empty
+        );
         let _enter = span.enter();
 
         if qconn.init_send.is_send_queue_empty() {
+            return Ok(None);
+        }
+
+        if !qconn.crypto.is_key_available(QuicLevel::Initial) {
+            error!("After discarding Initial keys, should not insert frame into the send queue",);
+            qconn.init_send.clear();
             return Ok(None);
         }
 
@@ -525,6 +569,7 @@ impl QuicPacket<'_> {
         cursor.set_position(length_pos);
         encode_variable_length_force_two_bytes(&mut cursor, packet_length)?;
         cursor.set_position(end_pos);
+        span.record("packet_length", packet_length);
         trace!("Finish initial packet with length {}", packet_length);
 
         // Encrypt
@@ -561,10 +606,25 @@ impl QuicPacket<'_> {
         udp_datagram_remaining: u16,
         frame_count: u16,
     ) -> Result<Option<Vec<u8>>> {
-        let span = span!(Level::TRACE, "create_application_packet");
+        let span = span!(
+            Level::TRACE,
+            "create_application_packet",
+            datagram_size = udp_datagram_remaining,
+            next_pn = qconn.app_send.next_pn,
+            frames_sent = tracing::field::Empty,
+            packet_length = tracing::field::Empty
+        );
         let _enter = span.enter();
 
         if qconn.app_send.is_send_queue_empty() {
+            return Ok(None);
+        }
+
+        if !qconn.crypto.is_key_available(QuicLevel::Application) {
+            error!(
+                "After discarding Application keys, should not insert frame into the send queue",
+            );
+            qconn.app_send.clear();
             return Ok(None);
         }
 
@@ -657,6 +717,7 @@ impl QuicPacket<'_> {
                 break;
             }
         }
+        span.record("frames_sent", frame_sent_cnt);
 
         let payload_len = payload_cursor.position();
         if payload_len == 0 {
@@ -693,7 +754,7 @@ impl QuicPacket<'_> {
             qconn
                 .tls
                 .append_key_update_sslkey(&client_secret, &server_secret)?;
-            qconn.set_oldkey_discard_time(QUIC_DISCARD_OLD_KEY_TIMEOUT);
+            qconn.set_oldkey_discard_time(qconn.three_times_pto());
         }
 
         flag |= qconn.key_phase;
@@ -744,11 +805,24 @@ impl QuicPacket<'_> {
         udp_datagram_remaining: u16,
         frame_count: u16,
     ) -> Result<Option<Vec<u8>>> {
-        let span = span!(Level::TRACE, "create_handshake_packet");
+        let span = span!(
+            Level::TRACE,
+            "create_handshake_packet",
+            datagram_size = udp_datagram_remaining,
+            next_pn = qconn.hs_send.next_pn,
+            frames_sent = tracing::field::Empty,
+            packet_length = tracing::field::Empty
+        );
         let _enter = span.enter();
 
         if qconn.hs_send.is_send_queue_empty() {
             trace!("Handshake send queue is empty, can not create QUIC packet");
+            return Ok(None);
+        }
+
+        if !qconn.crypto.is_key_available(QuicLevel::Handshake) {
+            error!("After discarding Handshake keys, should not insert frame into the send queue",);
+            qconn.hs_send.clear();
             return Ok(None);
         }
 
@@ -885,6 +959,7 @@ impl QuicPacket<'_> {
                 break;
             }
         }
+        span.record("frames_sent", frame_sent_cnt);
 
         let payload_len = payload_cursor.position();
         if payload_len == 0 {
@@ -966,33 +1041,58 @@ impl QuicPacket<'_> {
                 offset,
                 flag
             );
-            let packet_size = if is_long_header(flag) {
-                Self::handle_long_header_packet(&rcvbuf[offset..], qconn, source_addr)?
+            let handler_result = if is_long_header(flag) {
+                Self::handle_long_header_packet(&rcvbuf[offset..], qconn, source_addr)
             } else {
-                Self::handle_short_header_packet(&rcvbuf[offset..], qconn, source_addr)?
+                // Short header packet can be coalesced with the other long header packets,
+                // but short header packet must be the last one
+                Self::handle_short_header_packet(&rcvbuf[offset..], qconn, source_addr, offset == 0)
             };
+
+            let packet_size = match handler_result {
+                Ok(ps) => ps as usize,
+                Err(e) => {
+                    error!("Handle packet failure, due to {}", e);
+                    TransportErrorCode::send_frame_encoding_error_cc_frame(
+                        qconn,
+                        !is_long_header(flag),
+                    );
+                    qconn.close_helper();
+                    rcvbuf.len() - offset
+                }
+            };
+
             trace!(
-                "Handle the last QUIC packet with size {packet_size}, offset {offset}, udp datagram size {}",
+                "Handle the last QUIC packet with size {packet_size}, offset {offset}, \
+                udp datagram size {}",
                 rcvbuf.len()
             );
-            offset += packet_size as usize;
-            if !is_long_header(flag) {
+
+            offset += packet_size;
+            if offset < rcvbuf.len() && !is_long_header(flag) {
                 // UDP datagram must contain only one QUIC short packet
+                // or QUIC short header packet must be the last one
+                error!(
+                    "Received invalid QUIC short packet here, datagram size {}, offset {}",
+                    rcvbuf.len(),
+                    offset
+                );
                 break;
             }
         }
 
         if offset != rcvbuf.len() {
-            return Err(anyhow!(
+            warn!(
                 "Now we got invalid QUIC packet, offset {}, udp datagram len {}",
                 offset,
                 rcvbuf.len()
-            ));
+            );
         }
 
         // TODO: MTU Discovery
         qconn.datagram_size = DEFAULT_MTU;
-        qconn.set_next_send_event_time(0);
+        // ?
+        // qconn.set_next_send_event_time(0);
 
         Ok(())
     }
@@ -1002,14 +1102,6 @@ impl QuicPacket<'_> {
         qconn: &mut QuicConnection,
         source_addr: &SocketAddr,
     ) -> Result<u16> {
-        let span = span!(
-            Level::TRACE,
-            "handle_long_header_packet",
-            scid = ?qconn.scid.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""),
-            source = ?source_addr
-        );
-        let _enter = span.enter();
-
         if let Some((pkt, consumed_size)) =
             Self::handle_long_header_packet_helper(rcvbuf, qconn, source_addr)?
         {
@@ -1087,6 +1179,7 @@ impl QuicPacket<'_> {
         rcvbuf: &[u8],
         qconn: &mut QuicConnection,
         source_addr: &SocketAddr,
+        first_packet: bool,
     ) -> Result<u16> {
         let span = span!(
             Level::TRACE,
@@ -1096,6 +1189,23 @@ impl QuicPacket<'_> {
         );
         let _enter = span.enter();
 
+        if let Some(consumed_size) =
+            Self::handle_short_header_packet_helper(rcvbuf, qconn, source_addr)?
+        {
+            Ok(consumed_size)
+        } else {
+            if first_packet && !qconn.is_closed() && !qconn.is_closing() && !qconn.is_draining() {
+                qconn.handle_stateless_reset(rcvbuf);
+            }
+            Ok(rcvbuf.len() as u16)
+        }
+    }
+
+    fn handle_short_header_packet_helper(
+        rcvbuf: &[u8],
+        qconn: &mut QuicConnection,
+        source_addr: &SocketAddr,
+    ) -> Result<Option<u16>> {
         //  https://www.rfc-editor.org/rfc/rfc9000.html#section-17.3
         //  1-RTT Packet {
         //   Header Form (1) = 0,
@@ -1109,14 +1219,31 @@ impl QuicPacket<'_> {
         //   Packet Payload (8..),
         // }
 
+        let span = span!(
+            Level::TRACE,
+            "short_header_packet",
+            pn = tracing::field::Empty,
+            current_key_mode = tracing::field::Empty,
+        );
+        let _enter = span.enter();
+
         let rcvbuf_len = rcvbuf.len();
         let mut cursor = Cursor::new(rcvbuf);
-        let flag = cursor.read_u8()?;
+        let flag = read_or_none!(cursor.read_u8());
 
-        // TODO: Check dcid
+        // TODO: assume all the scid share the same length
         let dcid_len = qconn.scid.len();
         let mut dcid = vec![0u8; dcid_len];
-        cursor.read_exact(&mut dcid)?;
+        read_or_none!(cursor.read_exact(&mut dcid));
+
+        if !qconn.check_dcid(&dcid) {
+            trace!(
+                "Got invalid QUIC short header packet, wrong packet dcid {:?}, expected {:?}",
+                dcid,
+                qconn.scid,
+            );
+            return Ok(None);
+        }
 
         trace!(
             "Processing the short QUIC packet, protected flag 0x{:x}, dcid {:x?}, UDP datagram size {}",
@@ -1125,24 +1252,14 @@ impl QuicPacket<'_> {
             rcvbuf_len
         );
 
-        // TODO: QUIC migration
-        if dcid != qconn.scid {
-            // TODO: QUIC termination
-            return Err(anyhow!(
-                "Got invalid QUIC short header packet, wrong packet dcid {:?}, expected {:?}",
-                dcid,
-                qconn.scid,
-            ));
-        }
-
         let pn_offset = 1 + dcid_len;
         if pn_offset + QUIC_PN_OFFSET as usize + QUIC_SAMPLE_LENGTH > rcvbuf_len {
-            // TODO: QUIC termination
-            return Err(anyhow!(
+            trace!(
                 "Got invalid QUIC short header packet, wrong UDP datagram size {}, pn_offset {}",
                 rcvbuf_len,
                 pn_offset
-            ));
+            );
+            return Ok(None);
         }
 
         // Remove header protection and get packet number
@@ -1155,14 +1272,21 @@ impl QuicPacket<'_> {
             Ok((a, b, c)) => (a, b, c),
             Err(e) => {
                 warn!("remove_header_protection failure due to {e}");
-                return Ok(rcvbuf.len() as u16);
+                return Ok(Some(rcvbuf.len() as u16));
             }
         };
+
+        // After successfully decrypting the packet header and validating the connection IDs,
+        // we are now processing the actual packet content from the peer.
+        // Any errors from this point forward indicate a protocol violation or security issue,
+        // so we should terminate the connection rather than just discarding the packet.
         let real_pn = decode_packet_number_field_size(
             qconn.app_send.largest_pn.as_ref(),
             truncated_pn,
             pn_length << 3,
         )?;
+
+        span.record("pn", real_pn);
 
         let key_phase = unprotected_flag & KEY_PHASE;
         trace!(
@@ -1189,29 +1313,30 @@ impl QuicPacket<'_> {
         aad[pn_offset..pn_offset + pn_length as usize]
             .copy_from_slice(&pn_bytes[4 - pn_length as usize..]);
 
-        let key_modes = if key_phase != qconn.key_phase {
-            warn!(
+        let key_modes = if key_phase != qconn.key_phase && !qconn.is_closing()
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-10.2.1-8
+        {
+            info!(
                 "Could be key update, got key phase {}, orignal {}",
                 key_phase, qconn.key_phase,
             );
             if qconn.app_send.largest_acked.is_none() {
-                // TODO: should response a KEY_UPDATE_ERROR connection close message
-                unimplemented!();
+                TransportErrorCode::send_key_update_error_cc_frame(qconn);
+                qconn.close_helper();
+                return Ok(None);
             }
             if qconn.crypto.is_last_key_available() {
-                vec![
-                    DecryptKeyMode::Current,
-                    DecryptKeyMode::Last,
-                    DecryptKeyMode::Next,
-                ]
+                vec![DecryptKeyMode::Last, DecryptKeyMode::Next]
             } else {
-                vec![DecryptKeyMode::Current, DecryptKeyMode::Next]
+                vec![DecryptKeyMode::Next]
             }
         } else {
             vec![DecryptKeyMode::Current]
         };
 
         for m in key_modes.iter() {
+            span.record("current_key_mode", format!("{:?}", m));
+
             match qconn.crypto.decrypt_packet(
                 QuicLevel::Application,
                 qconn.tls.get_selected_cipher_suite()?,
@@ -1232,13 +1357,20 @@ impl QuicPacket<'_> {
                         qconn
                             .tls
                             .append_key_update_sslkey(&client_secret, &server_secret)?;
-                        qconn.set_oldkey_discard_time(QUIC_DISCARD_OLD_KEY_TIMEOUT);
+                        qconn.set_oldkey_discard_time(qconn.three_times_pto());
                         qconn.key_phase = key_phase;
                     } else if matches!(*m, DecryptKeyMode::Last) {
                         info!("The out of order packet was decrypted by the last key");
                     }
 
                     cursor.seek_relative((d.len() + QUIC_TAG_LENGTH) as i64)?;
+
+                    if qconn.is_closing() {
+                        // Consider defenses against amplification attacks;
+                        // however, since our close-state duration is very short, this is not required for now.
+                        qconn.send_connection_close_frame(&[QuicLevel::Application]);
+                        return Ok(None);
+                    }
 
                     let spkt = QuicShortHeaderPacket {
                         from: *source_addr,
@@ -1259,7 +1391,7 @@ impl QuicPacket<'_> {
                     // and all frames contained in the packet have been processed.
                     Self::update_packet_space(qconn, &pkt, need_ack)?;
 
-                    return Ok(cursor.position() as u16);
+                    return Ok(Some(cursor.position() as u16));
                 }
                 Err(e) => {
                     if e.downcast_ref::<ring::error::Unspecified>().is_some() {
@@ -1272,7 +1404,7 @@ impl QuicPacket<'_> {
         }
 
         // Discard the QUIC short header packet
-        Ok(decrypted_end_pos as u16)
+        Ok(None)
     }
 
     pub(crate) fn handle_long_header_packet_helper<'b>(
@@ -1317,16 +1449,42 @@ impl QuicPacket<'_> {
         //   Packet Number (8..32),            # Protected
         //   Packet Payload (8..),             # Encrypted
         // }
+
+        let span = span!(
+            Level::TRACE,
+            "long_header_packet",
+            header_type = tracing::field::Empty,
+            level = tracing::field::Empty,
+            packet_length = tracing::field::Empty,
+            pn = tracing::field::Empty
+        );
+        let _enter = span.enter();
+
         let rcvbuf_len = rcvbuf.len();
         let mut cursor = Cursor::new(rcvbuf);
-        let flag = cursor.read_u8()?;
-        let header_type = LongHeaderType::try_from(flag)?;
-        let (level, send_ctx) = match header_type {
-            LongHeaderType::Initial => (QuicLevel::Initial, &qconn.init_send),
-            LongHeaderType::Retry => (QuicLevel::Initial, &qconn.init_send),
-            LongHeaderType::Handshake => (QuicLevel::Handshake, &qconn.hs_send),
-            _ => unimplemented!(),
+        let flag = read_or_none!(cursor.read_u8());
+        let header_type = match LongHeaderType::try_from(flag) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("Unexpected header_type {e}, flag {}, just ignore it", flag);
+                return Ok(None);
+            }
         };
+
+        span.record("header_type", format!("{:?}", header_type));
+
+        let level = match header_type {
+            LongHeaderType::Initial => QuicLevel::Initial,
+            LongHeaderType::Retry => QuicLevel::Initial,
+            LongHeaderType::Handshake => QuicLevel::Handshake,
+            LongHeaderType::ZeroRtt => {
+                // TODO: Support Zero RTT
+                warn!("Zero RTT header_type is not supported, just ignore it");
+                return Ok(None);
+            }
+        };
+
+        span.record("level", format!("{:?}", level));
 
         if !qconn.crypto.is_key_available(level) {
             warn!(
@@ -1336,36 +1494,69 @@ impl QuicPacket<'_> {
             return Ok(None);
         }
 
-        let version = cursor.read_u32::<BigEndian>()?;
-        let dcid_len = cursor.read_u8()?;
+        let version = read_or_none!(cursor.read_u32::<BigEndian>());
+
+        let dcid_len = read_or_none!(cursor.read_u8());
         if dcid_len > QUIC_MAX_CONNECTION_ID_LENGTH {
-            return Err(anyhow!(
-                "Invalid QUIC connection id in {:?}, bad dcid length {}",
-                level,
-                dcid_len
-            ));
+            warn!(
+                "Invalid QUIC connection id in {:?}, invalid dcid length {}, \
+                maximumu length is {}",
+                level, dcid_len, QUIC_MAX_CONNECTION_ID_LENGTH
+            );
+            return Ok(None);
         }
         let mut dcid = vec![0u8; dcid_len as usize];
-        cursor.read_exact(&mut dcid)?;
+        read_or_none!(cursor.read_exact(&mut dcid));
 
-        let scid_len = cursor.read_u8()?;
+        let scid_len = read_or_none!(cursor.read_u8());
         if scid_len > QUIC_MAX_CONNECTION_ID_LENGTH {
-            return Err(anyhow!(
+            warn!(
                 "Invalid QUIC connection id in {:?}, bad scid length {}",
-                level,
-                scid_len
-            ));
+                level, scid_len
+            );
+            return Ok(None);
         }
         let mut scid = vec![0u8; scid_len as usize];
-        cursor.read_exact(&mut scid)?;
+        read_or_none!(cursor.read_exact(&mut scid));
 
-        // TODO: should verify dcid, scid, version and other staff
-        if qconn.dcid.is_none() || qconn.retry_token.is_some() {
+        if qconn.dcid.is_some() && qconn.retry_token.is_none() {
+            // After retry verification, server will change the scid usually
+            if !qconn.check_scid(&scid) {
+                warn!(
+                    "Invalid QUIC connection id in {:?}, bad scid {:x?}",
+                    level, scid
+                );
+                return Ok(None);
+            }
+        }
+
+        if !qconn.check_dcid(&dcid) {
             trace!(
+                "Invalid QUIC connection id in {:?}, bad dcid {:x?}",
+                level,
+                dcid
+            );
+            return Ok(None);
+        }
+
+        // TODO: QUIC version negotiation
+        if version != QUIC_VERSION {
+            /* only support version 1 */
+            trace!(
+                "QUIC version negotiation failed, got version {}, expected {}",
+                version,
+                QUIC_VERSION
+            );
+            return Ok(None);
+        }
+
+        if qconn.dcid.is_none() || qconn.retry_token.is_some() {
+            info!(
                 "Switched to dcid {:x?}, is retry {}",
                 &scid,
                 qconn.retry_token.is_some()
             );
+            qconn.add_peer_connection_id(&scid);
             qconn.dcid = Some(scid.clone());
             qconn.retry_token = None;
         }
@@ -1388,10 +1579,11 @@ impl QuicPacket<'_> {
                 remain_len
             );
             if (remain_len as u16) < QUIC_RETRY_INTEGRITY_TAG_SIZE + 1 {
-                return Err(anyhow!(
+                warn!(
                     "Received retry packet must have a token, lack of remain_len {}",
                     remain_len
-                ));
+                );
+                return Ok(None);
             }
 
             let tag =
@@ -1409,42 +1601,64 @@ impl QuicPacket<'_> {
             // Construct retry pseudo-packet for tag validation
             let mut add = vec![];
             let mut add_cursor = Cursor::new(&mut add);
-            add_cursor.write_u8(qconn.org_dcid.len() as u8)?;
-            add_cursor.write_all(&qconn.org_dcid)?;
-            add_cursor.write_u8(flag)?;
-            add_cursor.write_u32::<BigEndian>(QUIC_VERSION)?;
-            add_cursor.write_u8(dcid.len() as u8)?;
-            add_cursor.write_all(&dcid)?;
-            add_cursor.write_u8(scid.len() as u8)?;
-            add_cursor.write_all(&scid)?;
-            add_cursor.write_all(retry_token)?;
 
-            if !QuicCrypto::validate_retry_packet_tag(&add, tag)? {
-                warn!(
-                    "Retry packet tag is invalid, discarding this packet, add size {} {:x?}",
-                    add.len(),
-                    add,
-                );
+            let mut write_ops = || -> Result<(), Error> {
+                add_cursor.write_u8(qconn.org_dcid.len() as u8)?;
+                add_cursor.write_all(&qconn.org_dcid)?;
+                add_cursor.write_u8(flag)?;
+                add_cursor.write_u32::<BigEndian>(QUIC_VERSION)?;
+                add_cursor.write_u8(dcid.len() as u8)?;
+                add_cursor.write_all(&dcid)?;
+                add_cursor.write_u8(scid.len() as u8)?;
+                add_cursor.write_all(&scid)?;
+                add_cursor.write_all(retry_token)?;
+                Ok(())
+            };
+
+            if let Err(e) = write_ops() {
+                warn!("Failed to construct retry pseudo-packet: {}", e);
                 return Ok(None);
             }
 
-            // A Retry packet does not include a packet number and cannot be explicitly acknowledged by a client.
-            qconn.retry_token = Some(retry_token.to_vec());
-            trace!("Got correct retry token, will send initial packet again");
+            match QuicCrypto::validate_retry_packet_tag(&add, tag) {
+                Ok(false) => {
+                    trace!(
+                        "Retry packet tag is invalid, discarding this packet, add size {} {:x?}",
+                        add.len(),
+                        add,
+                    );
+                    return Ok(None);
+                }
+                Ok(true) => {
+                    qconn.retry_token = Some(retry_token.to_vec());
+                    trace!("Got correct retry token, will send initial packet again");
+                    Self::start_tls_handshake(qconn, true)?;
 
-            Self::start_tls_handshake(qconn, true)?;
-
-            return Ok(None);
+                    return Ok(None);
+                }
+                Err(e) => {
+                    warn!(
+                        "Retry packet tag validation failed: {}, discarding this packet, add size {} {:x?}",
+                        e,
+                        add.len(),
+                        add,
+                    );
+                    return Ok(None);
+                }
+            }
         }
 
         if level == QuicLevel::Initial {
-            let token_len = decode_variable_length(&mut cursor)?;
+            let token_len = decode_or_none!(decode_variable_length(&mut cursor));
             let mut token = vec![0u8; token_len as usize];
-            cursor.read_exact(&mut token)?;
+            read_or_none!(cursor.read_exact(&mut token));
         }
-        let length = decode_variable_length(&mut cursor)?;
+
+        let length = decode_or_none!(decode_variable_length(&mut cursor));
         let packet_header_size = cursor.position();
         let consumed_size = length as u16 + packet_header_size as u16;
+
+        span.record("packet_length", length);
 
         trace!(
             "Now we have new {:?} QUIC packet header_size {}, \
@@ -1461,23 +1675,21 @@ impl QuicPacket<'_> {
         );
 
         if consumed_size as usize > rcvbuf_len {
-            // TODO: QUIC termination
-            return Err(anyhow!(
+            warn!(
                 "Got invalid {:?} QUIC packet, wrong packet length {}, UDP datagram {}",
-                level,
-                length,
-                rcvbuf_len
-            ));
+                level, length, rcvbuf_len
+            );
+            return Ok(None);
         }
 
         if (length as usize) < QUIC_PN_OFFSET as usize + QUIC_SAMPLE_LENGTH {
-            // TODO: QUIC termination
-            return Err(anyhow!(
+            warn!(
                 "Got invalid {:?} QUIC packet, wrong packet length {}, payload smallest size {}",
                 level,
                 length,
                 QUIC_PN_OFFSET as usize + QUIC_SAMPLE_LENGTH
-            ));
+            );
+            return Ok(None);
         }
 
         let (unprotected_flag, truncated_pn, pn_length) = match qconn
@@ -1489,16 +1701,34 @@ impl QuicPacket<'_> {
                 if level == QuicLevel::Initial {
                     return Err(e);
                 }
-                warn!("remove_header_protection failure due to {e}");
+                warn!("remove_header_protection failure due to {e}, just skipped it");
                 return Ok(None);
             }
         };
 
+        let send_ctx = match header_type {
+            LongHeaderType::Initial => &qconn.init_send,
+            LongHeaderType::Retry => &qconn.init_send,
+            LongHeaderType::Handshake => &qconn.hs_send,
+            LongHeaderType::ZeroRtt => {
+                // TODO: Support Zero RTT
+                warn!("Zero RTT header_type is not supported, just ignore it");
+                return Ok(None);
+            }
+        };
+
+        // After successfully decrypting the packet header and validating the connection IDs,
+        // we are now processing the actual packet content from the peer.
+        // Any errors from this point forward indicate a protocol violation or security issue,
+        // so we should terminate the connection rather than just discarding the packet.
         let real_pn = decode_packet_number_field_size(
             send_ctx.largest_pn.as_ref(),
             truncated_pn,
             pn_length << 3,
         )?;
+
+        span.record("pn", real_pn);
+
         trace!(
             "Here we finally got real {:?} packet number {}, largest_pn {:?}",
             level,
@@ -1523,10 +1753,10 @@ impl QuicPacket<'_> {
         let cipher_suite = match level {
             QuicLevel::Initial => TLS_AES_128_GCM_SHA256,
             QuicLevel::Handshake => qconn.tls.get_selected_cipher_suite()?,
-            _ => unimplemented!(),
+            _ => unreachable!(),
         };
 
-        let decrypted_data = qconn.crypto.decrypt_packet(
+        let decrypted_data = match qconn.crypto.decrypt_packet(
             level,
             cipher_suite,
             &cursor.get_ref()[decrypted_start_pos as usize..decrypted_end_pos as usize],
@@ -1536,13 +1766,32 @@ impl QuicPacket<'_> {
             &aad,
             real_pn,
             DecryptKeyMode::Current,
-        )?;
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Failed to decrypt the long header packet, due to {e}");
+                TransportErrorCode::send_crypto_error_cc_frame(
+                    qconn,
+                    TlsError::DecryptError,
+                    vec![level],
+                );
+                qconn.close_helper();
+                return Ok(None);
+            }
+        };
 
         trace!(
             "Got level {:?} decrypted_data size {}",
             level,
             decrypted_data.len()
         );
+
+        if qconn.is_closing() {
+            // Consider defenses against amplification attacks;
+            // however, since our close-state duration is very short, this is not required for now.
+            qconn.send_connection_close_frame(&[level]);
+            return Ok(None);
+        }
 
         let lpkt = QuicLongHeaderPacket {
             packet_type: header_type,

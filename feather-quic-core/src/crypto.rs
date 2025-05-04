@@ -63,7 +63,7 @@ const QUIC_PN_LENGTH_MASK: u8 = 0x03;
 
 pub(crate) const QUIC_PN_OFFSET: u8 = 4;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub(crate) enum DecryptKeyMode {
     Last,
     Current,
@@ -245,8 +245,13 @@ impl QuicCrypto {
             QuicLevel::Application => &mut self.application_server,
         };
 
-        client_keys.key.0 = vec![];
-        server_keys.key.0 = vec![];
+        if !client_keys.key.0.is_empty() {
+            client_keys.key.0 = vec![];
+        }
+
+        if !server_keys.key.0.is_empty() {
+            server_keys.key.0 = vec![];
+        }
 
         Ok(())
     }

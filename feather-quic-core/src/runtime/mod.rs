@@ -29,6 +29,15 @@ where
         self.user_data.connect_done(qconn)
     }
 
+    pub(crate) fn run_close_event(
+        &mut self,
+        qconn: &mut QuicConnection,
+        error_code: Option<u64>,
+        reason: Option<String>,
+    ) -> Result<()> {
+        self.user_data.close(qconn, error_code, reason)
+    }
+
     pub(crate) fn run_read_event(
         &mut self,
         qconn: &mut QuicConnection,
@@ -62,7 +71,13 @@ pub trait QuicCallbacks {
         stream_handle: QuicStreamHandle,
     ) -> Result<()>;
 
-    fn close(&mut self, qconn: &mut QuicConnection) -> Result<()>;
+    // Only when this connection was closed by the peer side
+    fn close(
+        &mut self,
+        qconn: &mut QuicConnection,
+        error_code: Option<u64>,
+        reason: Option<String>,
+    ) -> Result<()>;
 }
 
 pub enum QuicRuntimeCore {

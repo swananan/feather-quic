@@ -19,7 +19,7 @@ struct Opt {
     /// file to log TLS keys to for debugging
     #[clap(long = "keylog")]
     keylog: bool,
-    /// Enable stateless retries
+    /// Enable mandatory retry validation during handshake. When enabled, the server will require all connections to validate their address through a retry process.
     #[clap(long = "stateless-retry")]
     stateless_retry: bool,
     /// Address to listen on
@@ -55,6 +55,12 @@ struct Opt {
     /// File to write logs to (if not specified, logs go to stdout/stderr)
     #[clap(long = "log-file")]
     log_file: Option<PathBuf>,
+    /// Close connection after receiving this many streams (0 means never close)
+    #[clap(long = "close-after-streams", default_value = "0")]
+    close_after_streams: usize,
+    /// If enabled, server will just wait without doing anything
+    #[clap(long = "wait-only")]
+    wait_only: bool,
 }
 
 pub fn make_server_endpoint(
@@ -210,6 +216,7 @@ async fn handle_connection(conn: quinn::Incoming, options: Opt) -> Result<()> {
 
         // Use a Vec to keep track of all active streams
         let mut active_streams: Vec<JoinHandle<()>> = Vec::new();
+        let mut total_streams = 0;
 
         loop {
             tokio::select! {
@@ -218,6 +225,15 @@ async fn handle_connection(conn: quinn::Incoming, options: Opt) -> Result<()> {
                     match stream {
                         Ok(stream) => {
                             info!("New bidirectional stream accepted");
+                            total_streams += 1;
+
+                            // Check if we should close the connection
+                            if options.close_after_streams > 0 && total_streams >= options.close_after_streams {
+                                info!("Closing connection after receiving {} streams", total_streams);
+                                connection.close(VarInt::from_u32(0), b"Connection closed after reaching stream limit");
+                                break;
+                            }
+
                             let stream_options = options.clone(); // Clone options for this specific stream
                             let handle = tokio::spawn(
                                 async move {
@@ -282,6 +298,13 @@ async fn handle_request(
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
     options: Opt,
 ) -> Result<()> {
+    if options.wait_only {
+        info!("Wait-only mode enabled, just waiting...");
+        // Just wait indefinitely
+        tokio::time::sleep(tokio::time::Duration::from_secs(3600 * 24 * 365)).await;
+        return Ok(());
+    }
+
     let mut buffer = Vec::with_capacity(8192); // Increased buffer size
     let mut temp_buf = [0u8; 4096]; // Increased read buffer size
     let mut message_count = 0;
@@ -329,6 +352,7 @@ async fn handle_request(
                         info!("Resetting stream after {} messages", message_count);
                         send.reset(8u32.into())
                             .map_err(|e| anyhow!("failed to reset stream: {}", e))?;
+                        sleep(Duration::from_millis(4000)).await;
                         return Ok(());
                     }
                     if message_count == options.finish_after_messages
@@ -337,7 +361,6 @@ async fn handle_request(
                         info!("Finishing stream after {} messages", message_count);
                         send.finish()?;
                         sleep(Duration::from_millis(4000)).await;
-
                         return Ok(());
                     }
 

@@ -44,7 +44,12 @@ struct FeatherQuicClientContext {
 
 #[allow(unused_variables)]
 impl QuicCallbacks for FeatherQuicClientContext {
-    fn close(&mut self, qconn: &mut QuicConnection) -> Result<()> {
+    fn close(
+        &mut self,
+        qconn: &mut QuicConnection,
+        error_code: Option<u64>,
+        reason: Option<String>,
+    ) -> Result<()> {
         info!("QUIC connection closed");
         Ok(())
     }
@@ -544,6 +549,8 @@ fn main() -> Result<()> {
         let mut uctx = QuicUserContext::new(FeatherQuicClientContext::default());
         runtime.run(&mut qconn, &mut uctx)?;
     };
+
+    info!("QUIC connection was closed, stop running");
 
     Ok(())
 }

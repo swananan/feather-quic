@@ -88,17 +88,6 @@ impl MioEventLoop {
             .with_context(|| format!("Failed to connect target {:?}", self.target_address))?;
 
         // No need to set non-blocking mode since Mio has already handled it
-        let local_addr = client_socket.local_addr().with_context(|| {
-            format!(
-                "Failed to get local address from Mio socket {:?}",
-                client_socket
-            )
-        })?;
-        info!(
-            "UDP socket created successfully - target: {:?}, local: {:?}",
-            self.target_address, local_addr,
-        );
-
         Ok(client_socket)
     }
 
@@ -225,12 +214,25 @@ impl MioEventLoop {
         }
         let mut client_socket = self.create_client_socket()?;
 
+        let local_addr = client_socket.local_addr().with_context(|| {
+            format!(
+                "Failed to get local address from Mio socket {:?}",
+                client_socket
+            )
+        })?;
+        let _span = tracing::span!(
+            tracing::Level::TRACE,
+            "udp",
+            local=?format!("{}:{}", local_addr.ip(), local_addr.port()),
+            peer=?format!("{}:{}", self.target_address.ip(), self.target_address.port())
+        )
+        .entered();
+
         poll.registry()
             .register(&mut client_socket, UDP_SOCKET, Interest::READABLE)?;
         poll.registry()
             .register(&mut quic_timer, QUIC_TIMER_TOKEN, Interest::READABLE)?;
 
-        // TODO: Initialize QUIC handshake and send the initial packet
         qconn.connect()?;
         let udp_sndbuf = qconn
             .consume_data()
@@ -281,7 +283,6 @@ impl MioEventLoop {
                                 }
                                 Err(err) => {
                                     // TODO: Handle QUIC connection migration (when UDP 4-tuple changes)
-                                    uctx.user_data.close(qconn)?;
                                     return Err(anyhow::anyhow!("Socket read failed: {}", err)
                                         .context(format!(
                                             "Error while reading from {:?}",
@@ -297,11 +298,6 @@ impl MioEventLoop {
                         }
 
                         while let Some(send_buf) = qconn.consume_data() {
-                            trace!(
-                                "Sending {} bytes to {}",
-                                send_buf.len(),
-                                self.target_address
-                            );
                             self.socket_send(&mut client_socket, &send_buf)?;
                         }
 
@@ -317,6 +313,11 @@ impl MioEventLoop {
                         }
                         if !self.rx_reorder_queue.is_empty() {
                             self.flush_rx_reorder_queue(qconn)?;
+                        }
+
+                        if qconn.is_closed() {
+                            info!("Now we exit the runtime");
+                            return Ok(());
                         }
                     }
                     QUIC_TIMER_TOKEN => {
@@ -339,6 +340,11 @@ impl MioEventLoop {
                             if let Some(timeout) = qconn.next_time() {
                                 trace!("Update timeout {}ns", timeout);
                                 quic_timer.set_timeout(&Duration::from_micros(timeout))?;
+                            }
+
+                            if qconn.is_closed() {
+                                info!("Now we exit the runtime");
+                                return Ok(());
                             }
                         }
                     }

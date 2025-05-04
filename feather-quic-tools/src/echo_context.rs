@@ -87,6 +87,7 @@ impl FeatherQuicEchoContext {
                             );
                             if self.stream_handles.is_empty() {
                                 info!("All streams finished, exiting");
+                                qconn.close(2077, Some("mission completed".to_string()))?;
                             } else {
                                 trace!("Stream {} was closed", stream_handle);
                             }
@@ -103,6 +104,22 @@ impl FeatherQuicEchoContext {
                             qconn.set_stream_read_active(stream_handle, true)?;
                         } else {
                             warn!("Quic stream error: {:?}", e);
+                            qconn.stream_finish(stream_handle)?;
+                            self.stream_handles.remove(
+                                self.stream_handles
+                                    .iter()
+                                    .position(|h| *h == stream_handle)
+                                    .unwrap(),
+                            );
+                            if self.stream_handles.is_empty() {
+                                info!("All streams finished, due to early termination");
+                                qconn.close(
+                                    2077,
+                                    Some("stream was finished or reset".to_string()),
+                                )?;
+                            } else {
+                                trace!("Stream {} was closed", stream_handle);
+                            }
                         }
                         break;
                     }
@@ -151,17 +168,27 @@ impl FeatherQuicEchoContext {
                         }
                         trace!("QUIC stream {:?} was sent blocked", stream_handle);
                         qconn.set_stream_write_active(stream_handle, true)?;
+
+                        // Just for the intergration test
+                        qconn.close(2077, Some("should not be would blocked".to_string()))?;
                     } else {
                         error!("Quic stream error: {:?}", e);
                     }
                 }
-                QuicConnectionError::StreamConnectionMaxDataLimitations(limit) => {
+                QuicConnectionError::ConnectionMaxDataLimitations(limit) => {
                     trace!(
                         "QUIC stream {:?} was sent blocked, limit: {}",
                         stream_handle,
                         limit
                     );
                     qconn.set_stream_write_active(stream_handle, true)?;
+                    // Just for the intergration test
+                    if limit == 0 {
+                        qconn.close(
+                            2077,
+                            Some("Peer doesn't have any connection data size".to_string()),
+                        )?;
+                    }
                 }
                 _ => panic!("Unknown error: {:?}", e),
             },
@@ -193,8 +220,16 @@ impl FeatherQuicEchoContext {
 }
 
 impl QuicCallbacks for FeatherQuicEchoContext {
-    fn close(&mut self, _qconn: &mut QuicConnection) -> Result<()> {
-        info!("QUIC connection closed");
+    fn close(
+        &mut self,
+        _qconn: &mut QuicConnection,
+        error_code: Option<u64>,
+        reason: Option<String>,
+    ) -> Result<()> {
+        info!(
+            "QUIC connection close callback, error_code {:?}, reason {:?}",
+            error_code, reason
+        );
         Ok(())
     }
 
@@ -209,7 +244,8 @@ impl QuicCallbacks for FeatherQuicEchoContext {
                         "Can not open {} stream, due to streams limitation {:?}",
                         s, l
                     );
-                    break;
+                    qconn.close(2077, Some("can not open stream".to_string()))?;
+                    return Ok(());
                 }
                 Err(e) => panic!("Can not open stream due to {:?}", e),
                 Ok(s) => s,
@@ -288,15 +324,27 @@ impl QuicCallbacks for FeatherQuicEchoContext {
                         context.unsent_data = Some((data, offset));
                     }
                     qconn.set_stream_write_active(stream_handle, true)?;
+
+                    // Just for the intergration test
+                    qconn.close(2077, Some("should not be would blocked".to_string()))?;
                     return Ok(());
                 }
-                QuicConnectionError::StreamConnectionMaxDataLimitations(limit) => {
+                QuicConnectionError::ConnectionMaxDataLimitations(limit) => {
                     trace!(
                         "QUIC stream {:?} was sent blocked, limit: {}",
                         stream_handle,
                         limit
                     );
+
                     qconn.set_stream_write_active(stream_handle, true)?;
+
+                    // Just for the intergration test
+                    if limit == 0 {
+                        qconn.close(
+                            2077,
+                            Some("Peer doesn't have any connection data size".to_string()),
+                        )?;
+                    }
                     return Ok(());
                 }
                 _ => {
