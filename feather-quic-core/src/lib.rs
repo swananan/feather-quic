@@ -12,6 +12,7 @@ mod buffer;
 pub mod config;
 pub mod connection;
 mod crypto;
+mod error_code;
 mod flow_control;
 mod frame;
 mod packet;

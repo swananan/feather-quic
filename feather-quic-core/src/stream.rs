@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use std::cmp::Ordering;
 use std::io::{Cursor, Seek};
 use thiserror::Error;
-use tracing::{error, span, trace, warn, Level};
+use tracing::{error, info, span, trace, warn, Level};
 
 use crate::buffer::QuicBuffer;
 use crate::flow_control::QuicStreamFlowControl;
@@ -188,6 +188,7 @@ pub(crate) struct QuicStream {
     recv_state: QuicReceivingStreamState,
     recv_bufs: QuicBuffer,
     recv_app_err_code: Option<u64>,
+    stop_sending_sent: bool,
 
     // Sender
     send_state: QuicSendingStreamState,
@@ -223,7 +224,7 @@ impl QuicStream {
             "creating new stream",
             stream_id = %stream_id,
             bidirectional = stream_id.is_bidirectional(),
-            client_initiated = stream_id.is_client_initiated()
+            client_initiated = stream_id.is_client_initiated(),
         );
         let _enter = span.enter();
 
@@ -232,6 +233,7 @@ impl QuicStream {
             read_event_active: false,
             recv_app_err_code: None,
             write_event_active: false,
+            stop_sending_sent: false,
             send_state: QuicSendingStreamState::Ready,
             send_queue: None,
             received_stop_sending: false,
@@ -241,13 +243,29 @@ impl QuicStream {
             flow_control: QuicStreamFlowControl::new(max_send_size, max_recv_size),
         };
 
-        trace!("Created new stream {}", stream_id);
+        info!(
+            "Created new stream {} (bidirectional: {}, client_initiated: {}, max_send: {}, max_recv: {})",
+            stream_id,
+            stream_id.is_bidirectional(),
+            stream_id.is_client_initiated(),
+            max_send_size,
+            max_recv_size
+        );
         trace!("Stream details: {:?}", stream);
         stream
     }
 
     // https://www.rfc-editor.org/rfc/rfc9000.html#section-2.4-2
     pub(crate) fn send(&mut self, snd_buf: &[u8]) -> Result<usize, QuicStreamError> {
+        let span = span!(
+            Level::TRACE,
+            "sending data on stream",
+            stream_id = %self.stream_id,
+            data_len = snd_buf.len(),
+            current_state = ?self.send_state
+        );
+        let _enter = span.enter();
+
         if self.stream_id.is_unidirectional() && self.stream_id.is_server_initiated() {
             return Err(QuicStreamError::SendWrongUniStream);
         }
@@ -288,11 +306,12 @@ impl QuicStream {
         self.set_send_state(QuicSendingStreamState::Send);
         self.flow_control.increment_sent_bytes(sent_bytes);
 
-        trace!(
-            "Stream {} sending: requested={}, sent={}, total={}, max={}",
+        info!(
+            "Stream {} sent {} bytes (requested: {}, available: {}, total: {}, max: {})",
             self.stream_id,
-            snd_buf.len(),
             sent_bytes,
+            snd_buf.len(),
+            available_bytes,
             self.flow_control.get_sent_bytes(),
             self.flow_control.get_max_send_size()
         );
@@ -313,7 +332,7 @@ impl QuicStream {
         {
             error!("Invalid stream state for finish: {:?}", self.send_state);
             return Err(QuicStreamError::InvalidSendingStreamState(
-                QuicSendingStreamState::DataSent.to_string(),
+                QuicSendingStreamState::Ready.to_string(),
                 self.send_state.to_string(),
             ));
         }
@@ -350,6 +369,8 @@ impl QuicStream {
             self.stream_id,
             application_error_code
         );
+
+        self.stop_sending_sent = true;
 
         Ok(QuicFrame::create_stop_sending_frame(
             self.stream_id.as_u64(),
@@ -722,7 +743,11 @@ impl QuicStream {
         self.flow_control.set_recv_final_size(final_size)?;
 
         self.set_recv_state(QuicReceivingStreamState::ResetRecvd);
-        self.flow_control.set_readable(true);
+        if !self.stop_sending_sent {
+            // If receiver was shut down by the application layer,
+            // we should not notity the application layer
+            self.flow_control.set_readable(true);
+        }
         self.recv_app_err_code = Some(application_error_code);
         trace!(
             "Stream {} receiving was reset by peer with error code {}",

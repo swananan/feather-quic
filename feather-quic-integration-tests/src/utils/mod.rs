@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::Local;
 use std::env;
 use std::fs;
@@ -146,7 +146,7 @@ impl TestEnvironment {
                     "Server failed to start. Log file saved to: {}",
                     persist_path.display()
                 );
-                return Err(anyhow::anyhow!(
+                return Err(anyhow!(
                     "Server failed to start. See log file: {}",
                     persist_path.display()
                 ));
@@ -197,6 +197,7 @@ impl TestEnvironment {
                 let log_path = self.server_log_file.path();
                 fs::copy(log_path, &persist_path)?;
                 info!("Server logs saved to: {}", persist_path.display());
+                return Err(anyhow!("See server log file: {}", persist_path.display()));
             }
         }
 
@@ -247,8 +248,7 @@ impl TestEnvironment {
                 if let Err(e) = client_process.kill().await {
                     warn!("Failed to kill client process: {}", e);
                 }
-                // TODO: QUIC termination is still not implemented
-                false
+                true
             }
         };
 
@@ -307,7 +307,7 @@ impl TestEnvironment {
                 ));
                 fs::copy(log_path, &persist_path)?;
                 return Err(anyhow::anyhow!(
-                    "Test failed. See log file: {}",
+                    "Test failed\nSee client log file: {}",
                     persist_path.display()
                 ));
             }

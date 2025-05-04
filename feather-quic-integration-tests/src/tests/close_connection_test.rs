@@ -5,24 +5,24 @@ mod tests {
     use tracing::{info, warn};
 
     // Generic test function that accepts a parameter to determine whether to use io_uring
-    async fn run_reset_stream_test(use_io_uring: bool) -> Result<()> {
+    async fn run_close_connection_test(use_io_uring: bool) -> Result<()> {
         init_logging();
         let io_uring_str = if use_io_uring { " with io_uring" } else { "" };
-        info!("Starting reset stream test{}...", io_uring_str);
+        info!("Starting close connection test{}...", io_uring_str);
 
-        // Configure server to reset after 3 messages
-        let server_config = ["--listen", "127.0.0.1:44436", "--reset-after-messages", "3"];
+        // Configure server to close connection after 1 stream
+        let server_config = ["--listen", "127.0.0.1:44437", "--close-after-streams", "1"];
         let mut test_env = TestEnvironment::setup(&server_config).await?;
 
         let mut client_config = vec![
             "--target-address",
-            "127.0.0.1:44436",
+            "127.0.0.1:44437",
             "--sni",
             "localhost",
             "--first-initial-packet-size",
             "1200",
             "--scid",
-            "dddd1baa11",
+            "dddd1baa12",
             "--alpn",
             "echo",
             "-e",
@@ -33,16 +33,16 @@ mod tests {
             client_config.push("--use-io-uring");
         }
 
-        // We expect to see stream reset error after 3 messages
+        // We expect to see connection closed after 3 messages
         let success_patterns = [
             "QUIC connection established successfully",
-            "Echo verification successful for stream",
-            "Quic stream error: ReceiverReset(8)",
-            "All streams finished, due to early termination",
+            "Entering draining",
+            "QUIC connection close callback",
+            "closed after reaching stream limit",
         ];
 
         let failure_patterns = [
-            "All streams finished, exiting", // We don't expect this since stream should be reset
+            "All streams finished, exiting", // We don't expect this since connection should be closed
         ];
 
         let test_result = test_env
@@ -71,12 +71,12 @@ mod tests {
     }
 
     #[tokio::test]
-    pub async fn test_reset_stream() -> Result<()> {
-        run_reset_stream_test(false).await
+    pub async fn test_close_connection() -> Result<()> {
+        run_close_connection_test(false).await
     }
 
     #[tokio::test]
-    pub async fn test_reset_stream_io_uring() -> Result<()> {
-        run_reset_stream_test(true).await
+    pub async fn test_close_connection_io_uring() -> Result<()> {
+        run_close_connection_test(true).await
     }
 }

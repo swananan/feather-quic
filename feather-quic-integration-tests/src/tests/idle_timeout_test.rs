@@ -5,48 +5,45 @@ mod tests {
     use tracing::{info, warn};
 
     // Generic test function that accepts a parameter to determine whether to use io_uring
-    async fn run_reset_stream_test(use_io_uring: bool) -> Result<()> {
+    async fn run_idle_timeout_test(use_io_uring: bool) -> Result<()> {
         init_logging();
         let io_uring_str = if use_io_uring { " with io_uring" } else { "" };
-        info!("Starting reset stream test{}...", io_uring_str);
+        info!("Starting idle timeout test{}...", io_uring_str);
 
-        // Configure server to reset after 3 messages
-        let server_config = ["--listen", "127.0.0.1:44436", "--reset-after-messages", "3"];
+        let server_config = vec!["--listen", "127.0.0.1:44433", "--wait-only"];
+
         let mut test_env = TestEnvironment::setup(&server_config).await?;
 
         let mut client_config = vec![
             "--target-address",
-            "127.0.0.1:44436",
+            "127.0.0.1:44433",
             "--sni",
             "localhost",
             "--first-initial-packet-size",
             "1200",
             "--scid",
-            "dddd1baa11",
+            "aaaa1baa11",
             "--alpn",
             "echo",
             "-e",
             "feather-quic-integration-tests/src/tests/test_files/basic_echo_input",
+            "--idle-timeout",
+            "3000", // 3 seconds
         ];
 
         if use_io_uring {
             client_config.push("--use-io-uring");
         }
 
-        // We expect to see stream reset error after 3 messages
         let success_patterns = [
             "QUIC connection established successfully",
-            "Echo verification successful for stream",
-            "Quic stream error: ReceiverReset(8)",
-            "All streams finished, due to early termination",
+            "Should shut down QUIC connection, due to idle timeout",
         ];
 
-        let failure_patterns = [
-            "All streams finished, exiting", // We don't expect this since stream should be reset
-        ];
+        let failure_patterns = [];
 
         let test_result = test_env
-            .run_client_test(&client_config, &success_patterns, &failure_patterns, 4)
+            .run_client_test(&client_config, &success_patterns, &failure_patterns, 15)
             .await;
 
         if let Err(error) = &test_result {
@@ -71,12 +68,12 @@ mod tests {
     }
 
     #[tokio::test]
-    pub async fn test_reset_stream() -> Result<()> {
-        run_reset_stream_test(false).await
+    pub async fn test_idle_timeout() -> Result<()> {
+        run_idle_timeout_test(false).await
     }
 
     #[tokio::test]
-    pub async fn test_reset_stream_io_uring() -> Result<()> {
-        run_reset_stream_test(true).await
+    pub async fn test_idle_timeout_io_uring() -> Result<()> {
+        run_idle_timeout_test(true).await
     }
 }

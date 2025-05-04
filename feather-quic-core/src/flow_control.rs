@@ -40,7 +40,6 @@ pub(crate) struct QuicConnectionFlowControl {
 
 impl QuicConnectionFlowControl {
     pub(crate) fn new() -> Self {
-        info!("Creating new QuicConnectionFlowControl instance");
         Self::default()
     }
 

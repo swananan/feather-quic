@@ -11,8 +11,9 @@ use std::io::{Cursor, Read, Seek, Write};
 use tracing::{info, trace, warn};
 
 use crate::config::QuicConfig;
-use crate::connection::QuicLevel;
+use crate::connection::{QuicLevel, QUIC_STATELESS_RESET_TOKEN_SIZE};
 use crate::crypto::{hkdf_expand, QUIC_SHA256_SECRET_LENGTH, QUIC_SHA384_SECRET_LENGTH};
+use crate::error_code::TlsError;
 use crate::transport_parameters::{
     create_client_transport_parameters, parse_server_transport_parameters,
     search_transport_parameters, TransportParameter,
@@ -268,6 +269,15 @@ impl FromTransportParam for u8 {
     }
 }
 
+impl FromTransportParam for [u8; QUIC_STATELESS_RESET_TOKEN_SIZE as usize] {
+    fn from_param(param: &TransportParameter) -> Self {
+        match param {
+            TransportParameter::StatelessResetToken(v) => *v,
+            _ => panic!("Unexpected transport parameter type"),
+        }
+    }
+}
+
 impl TlsContext {
     #[allow(unused_variables)]
     pub(crate) fn new(quic_config: &QuicConfig, scid: &[u8]) -> Self {
@@ -415,6 +425,12 @@ impl TlsContext {
         })
     }
 
+    pub(crate) fn get_peer_stateless_reset_token(&self) -> Option<[u8; 16]> {
+        self.get_peer_transport_param(|item| {
+            matches!(item, TransportParameter::StatelessResetToken(_))
+        })
+    }
+
     fn transport_parameters_serialize<W>(&self, cursor: &mut W) -> Result<()>
     where
         W: Write + Seek + Read,
@@ -426,11 +442,15 @@ impl TlsContext {
 
     fn expect_tls_state(&self, expected_state: TlsClientState) -> Result<()> {
         if self.state != expected_state {
-            return Err(anyhow!(
-                "Invalid tls state {:?}, expected {:?}",
-                self.state,
-                expected_state
-            ));
+            return Err(TlsHandshakeError::new(
+                TlsError::UnexpectedMessage,
+                anyhow!(
+                    "Invalid tls state {:?}, expected {:?}",
+                    self.state,
+                    expected_state
+                ),
+            )
+            .into());
         }
 
         Ok(())
@@ -796,6 +816,13 @@ impl TlsContext {
     //      v {Finished}              -------->
     //        [Application Data]      <------->  [Application Data]
     pub(crate) fn handle_tls_handshake(&mut self, crypto_buffer: &[u8]) -> Result<()> {
+        let span = tracing::span!(
+            tracing::Level::TRACE,
+            "tls_handshake",
+            from_state = ?self.state
+        );
+        let _enter = span.enter();
+
         let mut new_crypto_buffer: Vec<u8> = vec![];
 
         let length = crypto_buffer.len() as u64;
@@ -821,10 +848,34 @@ impl TlsContext {
             length,
             new_length,
         );
+
         while cursor.position() - start_pos < new_length {
-            let first_byte = cursor.read_u8()?;
-            let handshake_type = HandshakeType::from_u8(first_byte)
-                .ok_or_else(|| anyhow!("Invalid TLS handshake type: 0x{:x}", first_byte))?;
+            let pos_before_read = cursor.position();
+            let first_byte = cursor.read_u8().map_err(|e| {
+                // Map I/O error to TLS decode error
+                let err = anyhow!(e);
+                warn!("TLS handshake error reading byte: {}", err);
+                TlsHandshakeError::new(TlsError::DecodeError, err)
+            })?;
+
+            let handshake_type = HandshakeType::from_u8(first_byte).ok_or_else(|| {
+                let msg = format!("Invalid TLS handshake type: 0x{:x}", first_byte);
+                warn!("TLS handshake error: {}", msg);
+                TlsHandshakeError::new(TlsError::UnexpectedMessage, anyhow!(msg))
+            })?;
+
+            let remaining = new_length - (cursor.position() - start_pos);
+            let msg_span = tracing::span!(
+                parent: &span,
+                tracing::Level::TRACE,
+                "tls_message",
+                message_type = ?handshake_type,
+                current_state = ?self.state,
+                position = pos_before_read,
+                remaining_bytes = remaining
+            );
+            let _msg_enter = msg_span.enter();
+
             trace!(
                 "Processing TLS handshake message {:?} at position {}",
                 handshake_type,
@@ -844,23 +895,49 @@ impl TlsContext {
                     // Endpoints MUST treat the receipt of a TLS KeyUpdate message
                     // as a connection error of type 0x010a, equivalent to a fatal
                     // TLS alert of unexpected_message;
-                    // TODO: Response conncetion close here
-                    unimplemented!();
+                    let msg = "TLS KeyUpdate message received - not allowed in QUIC";
+                    warn!("TLS handshake error: {}", msg);
+                    return Err(
+                        TlsHandshakeError::new(TlsError::UnexpectedMessage, anyhow!(msg)).into(),
+                    );
                 }
-                _ => unimplemented!(),
+                _ => {
+                    let msg = format!("Unsupported handshake type: {:?}", handshake_type);
+                    warn!("TLS handshake error: {}", msg);
+                    return Err(
+                        TlsHandshakeError::new(TlsError::UnexpectedMessage, anyhow!(msg)).into(),
+                    );
+                }
             }
+
+            let bytes_consumed = cursor.position() - pos_before_read;
+            tracing::trace!(
+                message_complete = true,
+                bytes_consumed = bytes_consumed,
+                new_position = cursor.position(),
+                "Completed processing TLS message"
+            );
         }
 
         if cursor.position() - start_pos != new_length {
             // TODO: support partial tls messages
-            return Err(anyhow!(
-                "Invalid encrypted extensions packet, bad pos {}, begin pos {}, crypto frame new_length {}",
+            let msg = format!(
+                "Invalid TLS packet, bad pos {}, begin pos {}, crypto frame new_length {}",
                 cursor.position(),
                 start_pos,
                 new_length,
-            ));
+            );
+            warn!("TLS handshake error: {}", msg);
+            return Err(TlsHandshakeError::new(TlsError::DecodeError, anyhow!(msg)).into());
         }
 
+        tracing::trace!(
+            handshake_progress = ?self.state,
+            bytes_processed = cursor.position() - start_pos,
+            to_state = ?self.state,
+            cipher_suite = ?self.selected_chipher_suite,
+            "TLS handshake progress"
+        );
         Ok(())
     }
 
@@ -1698,5 +1775,39 @@ impl TlsContext {
         self.handshake_secret = Some(handshake_secret);
 
         Ok(())
+    }
+}
+
+// Define a custom error type for TLS handshake errors
+#[derive(Debug)]
+pub struct TlsHandshakeError {
+    tls_error: TlsError,
+    source: anyhow::Error,
+}
+
+impl TlsHandshakeError {
+    pub fn new(tls_error: TlsError, source: anyhow::Error) -> Self {
+        Self { tls_error, source }
+    }
+
+    pub fn get_tls_error(&self) -> TlsError {
+        self.tls_error
+    }
+}
+
+impl std::fmt::Display for TlsHandshakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "TLS handshake error: {} ({})",
+            self.source,
+            self.tls_error.to_error_message()
+        )
+    }
+}
+
+impl std::error::Error for TlsHandshakeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
     }
 }
