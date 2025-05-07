@@ -1,26 +1,32 @@
-# Feather-QUIC
-A tiny QUIC implementation in Rust
+# feather-quic
+用 Rust 实现的轻量级 QUIC 协议栈
 
-[中文](./README.zh.md)
+[English](./README.en.md)
 
-Feather-QUIC is a personal experimental project aimed at implementing the QUIC protocol in Rust while also developing a client tool that offers flexible configuration options for QUIC’s underlying features. Along the way, I’ll document my thoughts and interesting details from the development process through a series of blog posts:
+feather-quic 是一个个人实验性质项目，使用 Rust 实现 QUIC 协议的同时，并且同时实现一个客户端工具，提供更多 QUIC 协议底层相关的灵活配置。同时，我会写一系列博客来记录我在开发过程中的想法以及一些有意思的细节：
 
-[Implementing QUIC from Scratch with Rust: A Fresh Start](https://jt26wzz.com/en/posts/0001-implement-quic-in-rust-en/)
+[用 Rust 从零开始写 QUIC：写在刚开始](https://jt26wzz.com/posts/0001-implement-quic-in-rust/)
 
-[Implementing QUIC from Scratch with Rust: Runtime](https://jt26wzz.com/en/posts/0002-implement-quic-in-rust-en/)
+[用 Rust 从零开始写 QUIC：Runtime](https://jt26wzz.com/posts/0002-implement-quic-in-rust-runtime/)
 
-[Implementing QUIC from Scratch with Rust: Trying to analyse and implement QUIC Handshake 😂](https://jt26wzz.com/en/posts/0003-implement-quic-in-rust-en/)
+[用 Rust 从零开始写 QUIC：尝试深入分析 QUIC 握手😂](https://jt26wzz.com/posts/0003-implement-quic-in-rust/)
 
-[Implementing QUIC from Scratch with Rust: Implement TLS 1.3 Handshake and QUIC-TLS Key Update](https://jt26wzz.com/en/posts/0004-implement-quic-in-rust-en/)
+[用 Rust 从零开始写 QUIC：实现 TLS 1.3 握手和 QUIC-TLS Key Update](https://jt26wzz.com/posts/0004-implement-quic-in-rust/)
 
-To be continued
+[用 Rust 从零开始写 QUIC：Reliability](https://jt26wzz.com/posts/0005-implement-quic-in-rust/)
+
+[用 Rust 从零开始写 QUIC：实现 QUIC 多路复用流传输和流量控制](https://jt26wzz.com/posts/0006-implement-quic-in-rust/)
+
+[用 Rust 从零开始写 QUIC：QUIC 连接关闭和错误处理](https://jt26wzz.com/posts/0008-implement-quic-in-rust/)
+
+未完待续
 
 ---
 
-Contribution
-Contributions are welcome! Feel free to open issues or submit pull requests to improve Feather-QUIC.
+欢迎贡献
+欢迎任何形式的贡献！如果有建议或改进，可以通过 Issue 或 Pull Request 提交。
 
 ---
 
-License
-This project is licensed under the MIT License. See the [LICENSE](./LICENSE.md) file for more details.
+许可证
+本项目使用 MIT 许可证，详细信息请查看 [LICENSE](./LICENSE.md) 文件。
