@@ -442,7 +442,7 @@ impl QuicConnection {
         }
     }
 
-    fn update_idle_timeout_threshold(&mut self) {
+    pub(crate) fn update_idle_timeout_threshold(&mut self) {
         let idle_timeout = self.get_idle_timeout();
         self.idle_timeout_threshold = if idle_timeout != 0 {
             trace!(
@@ -477,8 +477,6 @@ impl QuicConnection {
                 self.scid, self.dcid, self.org_dcid
             )
         })?;
-
-        self.update_idle_timeout_threshold();
 
         Ok(())
     }
@@ -589,7 +587,7 @@ impl QuicConnection {
     }
 
     pub(crate) fn close_helper(&mut self) {
-        if self.is_closing() || self.is_draining() || self.is_draining() {
+        if self.is_closing() || self.is_draining() || self.is_closed() {
             return;
         }
         // Intention of calling close doesn't trigger the close callback
@@ -1083,12 +1081,15 @@ impl QuicConnection {
         self.peer_conn_ids.contains(scid)
     }
 
-    fn draining(&mut self, level: QuicLevel) {
+    fn draining(&mut self, level: QuicLevel, reply_cc: bool) {
         if self.is_draining() {
             return;
         }
 
-        info!("Entering draining state, level {:?}", level);
+        info!(
+            "Entering draining state, level {:?}, reply_cc {}",
+            level, reply_cc
+        );
 
         // Stop sending any packet and notify the application layer
         self.app_send.clear();
@@ -1096,8 +1097,13 @@ impl QuicConnection {
         self.init_send.clear();
         self.send_queue.clear();
 
-        // https://www.rfc-editor.org/rfc/rfc9000.html#section-10.2.2-2
-        TransportErrorCode::send_no_error_cc_frame(self, level);
+        if reply_cc {
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-10.2.2-2
+            TransportErrorCode::send_no_error_cc_frame(self, level);
+        } else {
+            // Trigger close event immediately
+            self.close_threshold = Some(self.current_ts);
+        }
 
         self.state = QuicConnectionState::ConnectionDraining;
     }
@@ -1116,7 +1122,9 @@ impl QuicConnection {
         if self.peer_reset_tokens.contains(reset_token) {
             self.peer_error_code = None;
             self.peer_reason_phrase = Some("quic stateless reset packet detected".to_string());
-            self.draining(QuicLevel::Application);
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-10.3.1-5
+            // the endpoint MUST enter the draining period and not send any further packets on this connection
+            self.draining(QuicLevel::Application, false);
         }
     }
 
@@ -1288,6 +1296,7 @@ impl QuicConnection {
                 error_code,
                 reason
             );
+            self.draining(level, false);
             return Ok(());
         }
 
@@ -1309,7 +1318,7 @@ impl QuicConnection {
         self.peer_error_code = Some(error_code);
         self.peer_reason_phrase = Some(reason);
 
-        self.draining(level);
+        self.draining(level, true);
 
         Ok(())
     }
