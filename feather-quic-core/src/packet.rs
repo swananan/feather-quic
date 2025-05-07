@@ -1112,6 +1112,8 @@ impl QuicPacket<'_> {
             // and all frames contained in the packet have been processed.
             Self::update_packet_space(qconn, &pkt, need_ack)?;
 
+            qconn.update_idle_timeout_threshold();
+
             Ok(consumed_size)
         } else {
             // Discarding packet
@@ -1192,6 +1194,7 @@ impl QuicPacket<'_> {
         if let Some(consumed_size) =
             Self::handle_short_header_packet_helper(rcvbuf, qconn, source_addr)?
         {
+            qconn.update_idle_timeout_threshold();
             Ok(consumed_size)
         } else {
             if first_packet && !qconn.is_closed() && !qconn.is_closing() && !qconn.is_draining() {
@@ -1770,12 +1773,14 @@ impl QuicPacket<'_> {
             Ok(v) => v,
             Err(e) => {
                 error!("Failed to decrypt the long header packet, due to {e}");
-                TransportErrorCode::send_crypto_error_cc_frame(
-                    qconn,
-                    TlsError::DecryptError,
-                    vec![level],
-                );
-                qconn.close_helper();
+                if matches!(level, QuicLevel::Handshake) {
+                    TransportErrorCode::send_crypto_error_cc_frame(
+                        qconn,
+                        TlsError::DecryptError,
+                        vec![level],
+                    );
+                    qconn.close_helper();
+                }
                 return Ok(None);
             }
         };
