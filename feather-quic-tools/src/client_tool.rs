@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Arg, Command};
 use clap_num::number_range;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -187,7 +187,7 @@ fn main() -> Result<()> {
         .arg(
             Arg::new("use_io_uring")
                 .long("use-io-uring")
-                .help("Use io-uring-based QUIC runtime instead of default Mio Epoll")
+                .help("Use io-uring-based QUIC runtime instead of default Mio Epoll (Linux only)")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
@@ -415,6 +415,10 @@ fn main() -> Result<()> {
     }
 
     let use_io_uring = matches.get_flag("use_io_uring");
+    #[cfg(not(target_os = "linux"))]
+    if use_io_uring {
+        return Err(anyhow!("io_uring is only supported on Linux platforms"));
+    }
     let target_address = matches.get_one::<String>("target_address").unwrap().clone();
 
     let target_addr: SocketAddr = target_address

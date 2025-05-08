@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::utils::{init_logging, TestEnvironment};
+    use crate::utils::{init_logging, TestEnvironment, platform::is_io_uring_supported};
     use anyhow::{anyhow, Result};
     use test_log::test;
     use tracing::{info, warn};
@@ -955,12 +955,18 @@ mod tests {
     // Test function that uses io_uring
     #[test(tokio::test)]
     pub async fn test_single_stream_echo_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_single_stream_echo_test(true, false).await
     }
 
     // Test function that uses io_uring with key update
     #[test(tokio::test)]
     pub async fn test_single_stream_echo_io_uring_with_key_update() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_single_stream_echo_test(true, true).await
     }
 
@@ -979,12 +985,18 @@ mod tests {
     // Test function that uses io_uring
     #[test(tokio::test)]
     pub async fn test_parallel_stream_echo_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_parallel_stream_echo_test(true, false).await
     }
 
     // Test function that uses io_uring with key update
     #[test(tokio::test)]
     pub async fn test_parallel_stream_echo_io_uring_with_key_update() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_parallel_stream_echo_test(true, true).await
     }
 
@@ -1057,71 +1069,107 @@ mod tests {
     // Test function that uses io_uring
     #[test(tokio::test)]
     pub async fn test_large_payload_echo_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_large_payload_echo_test(true).await
     }
 
     // Test function that uses io_uring
     #[test(tokio::test)]
     pub async fn test_parallel_large_payload_echo_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_parallel_large_payload_echo_test(true).await
     }
 
     // Test function that uses io_uring
     #[test(tokio::test)]
     pub async fn test_long_message_echo_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_long_message_echo_test(true).await
     }
 
     // Test function that uses io_uring
     #[test(tokio::test)]
     pub async fn test_parallel_long_message_echo_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_parallel_long_message_echo_test(true).await
     }
 
     // Test function that uses io_uring
     #[test(tokio::test)]
     pub async fn test_parallel_long_message_echo_with_packet_loss_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_parallel_long_message_echo_with_packet_loss_test(true).await
     }
 
     // Test function that uses io_uring
     #[test(tokio::test)]
     pub async fn test_connection_data_limit_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_connection_data_limit_test(true).await
     }
 
     // Test function that uses io_uring
     #[test(tokio::test)]
     pub async fn test_stream_data_limit_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_stream_data_limit_test(true).await
     }
 
     // Test function that uses io_uring
     #[test(tokio::test)]
     pub async fn test_connection_data_blocking_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_connection_data_blocking_test(true).await
     }
 
     // Test function that uses io_uring
     #[test(tokio::test)]
     pub async fn test_stream_data_blocking_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_stream_data_blocking_test(true).await
     }
 
     // Test function that uses io_uring
     #[test(tokio::test)]
     pub async fn test_bidirectional_stream_blocking_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_bidirectional_stream_blocking_test(true).await
     }
 
     // Test function that uses io_uring
     #[test(tokio::test)]
     pub async fn test_large_payload_with_packet_loss_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_large_payload_with_packet_loss_test(true).await
     }
 
     #[tokio::test]
     async fn test_retry_validation_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_retry_validation(true).await
     }
 

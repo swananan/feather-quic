@@ -14,12 +14,10 @@ categories = ["network-programming", "protocols"]
 
 [workspace.dependencies]
 mio = { version = "1.0.2", features = ["net", "os-poll"] }
-mio-timerfd = { version = "0.3.0", git = "https://github.com/swananan/mio-timerfd.git"}
 log = "0.4.22"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 rand = "0.8.5"
 anyhow = "1.0.93"
-io-uring = "0.7.2"
 slab = "0.4.9"
 libc = "0.2.169"
 aes = "0.8.4"

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::utils::{init_logging, TestEnvironment};
+    use crate::utils::{init_logging, TestEnvironment, platform::is_io_uring_supported};
     use anyhow::{anyhow, Result};
     use tracing::{info, warn};
 
@@ -286,6 +286,9 @@ mod tests {
 
     #[tokio::test]
     pub async fn test_normal_finish_stream_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_normal_finish_stream_test(true).await
     }
 
@@ -296,6 +299,9 @@ mod tests {
 
     #[tokio::test]
     pub async fn test_finish_stream_with_loss_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_finish_stream_with_loss_test(true).await
     }
 
@@ -317,6 +323,9 @@ mod tests {
 
     #[tokio::test]
     pub async fn test_finish_stream_with_selective_loss_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_finish_stream_with_selective_loss_test(true).await
     }
 }
