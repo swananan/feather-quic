@@ -19,7 +19,7 @@ To be continued
 
 **Building and Debugging**
 
-Currently, compilation is only supported on Linux platforms due to the use of Linux timerfd for high-precision timers. Support for Mac and Windows platforms will be added soon.
+Currently, compilation is tested on Linux and MacOS platforms. Windows platform has not been tested yet, but it should be ok.
 
 Build command:
 

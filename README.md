@@ -24,7 +24,7 @@ feather-quic 是一个个人实验性质项目，使用 Rust 实现 QUIC 协议�
 ---
 **构建和调试**
 
-目前仅支持在 Linux 平台上编译，因为使用了 Linux timerfd 实现高精度定时器。后续将快速支持 Mac 和 Windows 平台。
+目前在 Linux 和 Mac 平台都进行过测试，Windows 平台理论上支持。
 
 构建命令:
 

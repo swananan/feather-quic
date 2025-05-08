@@ -13,6 +13,8 @@ use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::FmtSubscriber;
 
+pub mod platform;
+
 static INIT: Once = Once::new();
 static INIT_SUCCESS: AtomicBool = AtomicBool::new(false);
 static BUILD_ONCE: Once = Once::new();
