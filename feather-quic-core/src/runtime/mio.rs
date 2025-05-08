@@ -4,6 +4,7 @@ use crate::QuicConnection;
 use anyhow::{Context, Result};
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token};
+#[cfg(target_os = "linux")]
 use mio_timerfd::{ClockId, TimerFd};
 use rand::Rng;
 use std::collections::VecDeque;
@@ -22,6 +23,10 @@ pub struct MioEventLoop {
     tx_reorder_queue: VecDeque<Vec<u8>>,
     rx_reorder_queue: VecDeque<(Vec<u8>, SocketAddr)>,
     rng: rand::rngs::ThreadRng,
+    #[cfg(target_os = "linux")]
+    quic_timer: Option<TimerFd>,
+    #[cfg(not(target_os = "linux"))]
+    next_timeout: Option<Duration>,
 }
 
 impl MioEventLoop {
@@ -44,6 +49,10 @@ impl MioEventLoop {
             tx_reorder_queue: VecDeque::new(),
             rx_reorder_queue: VecDeque::new(),
             rng: rand::thread_rng(),
+            #[cfg(target_os = "linux")]
+            quic_timer: None,
+            #[cfg(not(target_os = "linux"))]
+            next_timeout: None,
         }
     }
 
@@ -202,16 +211,22 @@ impl MioEventLoop {
         T: QuicCallbacks,
     {
         const UDP_SOCKET: Token = Token(0);
+        #[cfg(target_os = "linux")]
         const QUIC_TIMER_TOKEN: Token = Token(1);
 
-        let mut quic_timer = TimerFd::new(ClockId::Monotonic)?;
         let mut poll = Poll::new()?;
         let mut events = Events::with_capacity(5);
 
-        if let Some(timeout) = qconn.next_time() {
-            trace!("Update timeout {}ns firstly", timeout);
-            quic_timer.set_timeout(&Duration::from_micros(timeout))?;
+        #[cfg(target_os = "linux")]
+        {
+            let mut quic_timer = TimerFd::new(ClockId::Monotonic)?;
+            if let Some(timeout) = qconn.next_time() {
+                trace!("Update timeout {}ns firstly", timeout);
+                quic_timer.set_timeout(&Duration::from_micros(timeout))?;
+            }
+            self.quic_timer = Some(quic_timer);
         }
+
         let mut client_socket = self.create_client_socket()?;
 
         let local_addr = client_socket.local_addr().with_context(|| {
@@ -230,8 +245,14 @@ impl MioEventLoop {
 
         poll.registry()
             .register(&mut client_socket, UDP_SOCKET, Interest::READABLE)?;
-        poll.registry()
-            .register(&mut quic_timer, QUIC_TIMER_TOKEN, Interest::READABLE)?;
+
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(ref mut timer) = self.quic_timer {
+                poll.registry()
+                    .register(timer, QUIC_TIMER_TOKEN, Interest::READABLE)?;
+            }
+        }
 
         qconn.connect()?;
         let udp_sndbuf = qconn
@@ -242,18 +263,37 @@ impl MioEventLoop {
             "Initiating QUIC handshake, first UDP Datagram size {}",
             udp_sndbuf.len()
         );
-        if let Some(timeout) = qconn.next_time() {
-            trace!("Update timeout to {}ns", timeout);
-            quic_timer.set_timeout(&Duration::from_micros(timeout))?;
-        } else {
-            warn!("Should not trigger the timer process immediately!");
+
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(timeout) = qconn.next_time() {
+                trace!("Update timeout to {}ns", timeout);
+                if let Some(ref mut timer) = self.quic_timer {
+                    timer.set_timeout(&Duration::from_micros(timeout))?;
+                }
+            } else {
+                warn!("Should not trigger the timer process immediately!");
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            if let Some(timeout) = qconn.next_time() {
+                self.next_timeout = Some(Duration::from_micros(timeout));
+            }
         }
 
         // Buffer size set to 65536 (maximum UDP datagram size)
         let mut udp_rcvbuf = [0; 1 << 16];
 
         loop {
-            if let Err(err) = poll.poll(&mut events, None) {
+            #[cfg(target_os = "linux")]
+            let poll_timeout = None;
+
+            #[cfg(not(target_os = "linux"))]
+            let poll_timeout = self.next_timeout;
+
+            if let Err(err) = poll.poll(&mut events, poll_timeout) {
                 if err.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
@@ -262,6 +302,35 @@ impl MioEventLoop {
             }
 
             qconn.update_current_time();
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Check if we hit the timeout
+                if events.is_empty() {
+                    trace!("Timer event triggered via poll timeout");
+                    qconn.run_timer()?;
+                    qconn.run_events(uctx)?;
+                    if qconn.next_time().is_none() {
+                        qconn.run_timer()?;
+                    }
+
+                    while let Some(send_buf) = qconn.consume_data() {
+                        self.socket_send(&mut client_socket, &send_buf)?;
+                    }
+
+                    if let Some(timeout) = qconn.next_time() {
+                        self.next_timeout = Some(Duration::from_micros(timeout));
+                    } else {
+                        self.next_timeout = None;
+                    }
+
+                    if qconn.is_closed() {
+                        info!("Now we exit the runtime");
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
+
             for event in events.iter() {
                 match event.token() {
                     UDP_SOCKET => {
@@ -301,11 +370,25 @@ impl MioEventLoop {
                             self.socket_send(&mut client_socket, &send_buf)?;
                         }
 
-                        if let Some(timeout) = qconn.next_time() {
-                            trace!("Update timeout to {}ns", timeout);
-                            quic_timer.set_timeout(&Duration::from_micros(timeout))?;
-                        } else {
-                            warn!("Should not trigger the timer process immediately!");
+                        #[cfg(target_os = "linux")]
+                        {
+                            if let Some(timeout) = qconn.next_time() {
+                                trace!("Update timeout to {}ns", timeout);
+                                if let Some(ref mut timer) = self.quic_timer {
+                                    timer.set_timeout(&Duration::from_micros(timeout))?;
+                                }
+                            } else {
+                                warn!("Should not trigger the timer process immediately!");
+                            }
+                        }
+
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            if let Some(timeout) = qconn.next_time() {
+                                self.next_timeout = Some(Duration::from_micros(timeout));
+                            } else {
+                                self.next_timeout = None;
+                            }
                         }
 
                         if !self.tx_reorder_queue.is_empty() {
@@ -320,31 +403,35 @@ impl MioEventLoop {
                             return Ok(());
                         }
                     }
+                    #[cfg(target_os = "linux")]
                     QUIC_TIMER_TOKEN => {
-                        if let Ok(real_timeout) = quic_timer.read() {
-                            trace!("Timer event triggered {} times!", real_timeout);
-                            qconn.run_timer()?;
-                            // Handling the connection close callback (e.g. idle timeout)
-                            qconn.run_events(uctx)?;
-                            if qconn.next_time().is_none() {
+                        if let Some(ref mut timer) = self.quic_timer {
+                            if let Ok(real_timeout) = timer.read() {
+                                trace!("Timer event triggered {} times!", real_timeout);
                                 qconn.run_timer()?;
-                            }
+                                qconn.run_events(uctx)?;
+                                if qconn.next_time().is_none() {
+                                    qconn.run_timer()?;
+                                }
 
-                            while let Some(send_buf) = qconn.consume_data() {
-                                self.socket_send(&mut client_socket, &send_buf)?;
-                            }
-                            if !self.tx_reorder_queue.is_empty() {
-                                self.flush_tx_reorder_queue(&mut client_socket)?;
-                            }
+                                while let Some(send_buf) = qconn.consume_data() {
+                                    self.socket_send(&mut client_socket, &send_buf)?;
+                                }
+                                if !self.tx_reorder_queue.is_empty() {
+                                    self.flush_tx_reorder_queue(&mut client_socket)?;
+                                }
 
-                            if let Some(timeout) = qconn.next_time() {
-                                trace!("Update timeout {}ns", timeout);
-                                quic_timer.set_timeout(&Duration::from_micros(timeout))?;
-                            }
+                                if let Some(timeout) = qconn.next_time() {
+                                    trace!("Update timeout {}ns", timeout);
+                                    if let Some(ref mut timer) = self.quic_timer {
+                                        timer.set_timeout(&Duration::from_micros(timeout))?;
+                                    }
+                                }
 
-                            if qconn.is_closed() {
-                                info!("Now we exit the runtime");
-                                return Ok(());
+                                if qconn.is_closed() {
+                                    info!("Now we exit the runtime");
+                                    return Ok(());
+                                }
                             }
                         }
                     }

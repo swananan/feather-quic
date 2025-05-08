@@ -5,25 +5,21 @@ use crate::stream::QuicStreamHandle;
 use anyhow::Result;
 use std::net::SocketAddr;
 
+#[cfg(target_os = "linux")]
 mod io_uring;
 mod mio;
 
+#[cfg(target_os = "linux")]
 pub(crate) use io_uring::IoUringEventLoop;
 pub(crate) use mio::MioEventLoop;
 
-pub struct QuicUserContext<T>
-where
-    T: QuicCallbacks,
-{
-    user_data: T,
+pub struct QuicUserContext<T: QuicCallbacks> {
+    pub callbacks: T,
 }
 
-impl<T> QuicUserContext<T>
-where
-    T: QuicCallbacks,
-{
-    pub fn new(user_data: T) -> Self {
-        Self { user_data }
+impl<T: QuicCallbacks> QuicUserContext<T> {
+    pub fn new(callbacks: T) -> Self {
+        Self { callbacks }
     }
 
     pub(crate) fn run_connect_done_event(
@@ -31,7 +27,7 @@ where
         qconn: &mut QuicConnection,
         result: QuicConnectResult,
     ) -> Result<()> {
-        self.user_data.connect_done(qconn, result)
+        self.callbacks.connect_done(qconn, result)
     }
 
     pub(crate) fn run_close_event(
@@ -40,7 +36,7 @@ where
         error_code: Option<u64>,
         reason: Option<String>,
     ) -> Result<()> {
-        self.user_data.close(qconn, error_code, reason)
+        self.callbacks.close(qconn, error_code, reason)
     }
 
     pub(crate) fn run_read_event(
@@ -48,7 +44,7 @@ where
         qconn: &mut QuicConnection,
         stream_handle: QuicStreamHandle,
     ) -> Result<()> {
-        self.user_data.read_event(qconn, stream_handle)
+        self.callbacks.read_event(qconn, stream_handle)
     }
 
     pub(crate) fn run_write_event(
@@ -56,7 +52,7 @@ where
         qconn: &mut QuicConnection,
         stream_handle: QuicStreamHandle,
     ) -> Result<()> {
-        self.user_data.write_event(qconn, stream_handle)
+        self.callbacks.write_event(qconn, stream_handle)
     }
 }
 
@@ -118,6 +114,7 @@ pub trait QuicCallbacks {
 
 pub enum QuicRuntimeCore {
     Mio(MioEventLoop),
+    #[cfg(target_os = "linux")]
     IoUring(IoUringEventLoop),
 }
 
@@ -125,16 +122,17 @@ pub struct QuicRuntime {
     core: QuicRuntimeCore,
 }
 
+#[derive(Debug)]
 pub struct RuntimeConfig {
-    pub use_io_uring: bool,
     pub target_address: SocketAddr,
+    pub use_io_uring: bool,
+    pub io_uring_capacity: usize,
+    pub buffer_size: usize,
     pub max_quic_packet_send_count: Option<u64>,
     pub tx_packet_loss_rate: Option<f32>,
     pub rx_packet_loss_rate: Option<f32>,
     pub tx_packet_reorder_rate: Option<f32>,
     pub rx_packet_reorder_rate: Option<f32>,
-    pub io_uring_capacity: usize,
-    pub buffer_size: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -165,14 +163,21 @@ impl QuicRuntime {
                 config.rx_packet_reorder_rate,
             ))
         } else {
-            QuicRuntimeCore::IoUring(IoUringEventLoop::with_capacity(
-                config.io_uring_capacity,
-                config.buffer_size,
-                config.target_address,
-                config.max_quic_packet_send_count,
-                config.tx_packet_loss_rate,
-                config.rx_packet_loss_rate,
-            ))
+            #[cfg(target_os = "linux")]
+            {
+                QuicRuntimeCore::IoUring(IoUringEventLoop::with_capacity(
+                    config.io_uring_capacity,
+                    config.buffer_size,
+                    config.target_address,
+                    config.max_quic_packet_send_count,
+                    config.tx_packet_loss_rate,
+                    config.rx_packet_loss_rate,
+                ))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                panic!("io_uring is only supported on Linux platforms");
+            }
         };
 
         Self { core }
@@ -188,6 +193,7 @@ impl QuicRuntime {
     {
         match self.core {
             QuicRuntimeCore::Mio(ref mut event_loop) => event_loop.run(qconn, uctx)?,
+            #[cfg(target_os = "linux")]
             QuicRuntimeCore::IoUring(ref mut event_loop) => event_loop.run(qconn, uctx)?,
         }
 

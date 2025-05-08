@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::utils::{init_logging, TestEnvironment};
+    use crate::utils::{init_logging, platform::is_io_uring_supported, TestEnvironment};
     use anyhow::{anyhow, Result};
     use tracing::{info, warn};
 
@@ -134,6 +134,9 @@ mod tests {
 
     #[tokio::test]
     pub async fn test_connect_failure_idle_timeout_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_connect_failure_idle_timeout_test(true).await
     }
 
@@ -144,6 +147,9 @@ mod tests {
 
     #[tokio::test]
     pub async fn test_connect_failure_wrong_alpn_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_connect_failure_wrong_alpn_test(true).await
     }
 }

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::utils::{init_logging, TestEnvironment};
+    use crate::utils::{init_logging, platform::is_io_uring_supported, TestEnvironment};
     use anyhow::{anyhow, Result};
     use tracing::{info, warn};
 
@@ -77,6 +77,9 @@ mod tests {
 
     #[tokio::test]
     pub async fn test_reset_stream_io_uring() -> Result<()> {
+        if !is_io_uring_supported() {
+            return Ok(());
+        }
         run_reset_stream_test(true).await
     }
 }
