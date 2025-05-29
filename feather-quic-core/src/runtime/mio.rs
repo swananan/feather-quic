@@ -23,10 +23,13 @@ pub struct MioEventLoop {
     tx_reorder_queue: VecDeque<Vec<u8>>,
     rx_reorder_queue: VecDeque<(Vec<u8>, SocketAddr)>,
     rng: rand::rngs::ThreadRng,
+
     #[cfg(target_os = "linux")]
     quic_timer: Option<TimerFd>,
     #[cfg(not(target_os = "linux"))]
     next_timeout: Option<Duration>,
+
+    drop_packets_above_size: Option<u16>,
 }
 
 impl MioEventLoop {
@@ -37,6 +40,7 @@ impl MioEventLoop {
         rx_packet_loss_rate: Option<f32>,
         tx_packet_reorder_rate: Option<f32>,
         rx_packet_reorder_rate: Option<f32>,
+        drop_packets_above_size: Option<u16>,
     ) -> Self {
         Self {
             sent_cnt: 0,
@@ -53,10 +57,22 @@ impl MioEventLoop {
             quic_timer: None,
             #[cfg(not(target_os = "linux"))]
             next_timeout: None,
+
+            drop_packets_above_size,
         }
     }
 
-    fn should_drop_tx_packet(&mut self) -> bool {
+    fn should_drop_tx_packet(&mut self, packet_size: usize) -> bool {
+        if let Some(max_size) = self.drop_packets_above_size {
+            if packet_size > max_size as usize {
+                trace!(
+                    "Dropping TX packet of size {} (above limit of {})",
+                    packet_size,
+                    max_size
+                );
+                return true;
+            }
+        }
         if let Some(packet_loss_rate) = self.tx_packet_loss_rate {
             self.rng.gen::<f32>() < packet_loss_rate
         } else {
@@ -64,7 +80,17 @@ impl MioEventLoop {
         }
     }
 
-    fn should_drop_rx_packet(&mut self) -> bool {
+    fn should_drop_rx_packet(&mut self, packet_size: usize) -> bool {
+        if let Some(max_size) = self.drop_packets_above_size {
+            if packet_size > max_size as usize {
+                trace!(
+                    "Dropping RX packet of size {} (above limit of {})",
+                    packet_size,
+                    max_size
+                );
+                return true;
+            }
+        }
         if let Some(packet_loss_rate) = self.rx_packet_loss_rate {
             self.rng.gen::<f32>() < packet_loss_rate
         } else {
@@ -89,14 +115,22 @@ impl MioEventLoop {
     }
 
     fn create_client_socket(&self) -> Result<UdpSocket> {
-        let client_socket = UdpSocket::bind("0.0.0.0:0".parse::<SocketAddr>()?)
+        let std_socket = std::net::UdpSocket::bind("0.0.0.0:0".parse::<SocketAddr>()?)
             .with_context(|| "Failed to bind random address".to_string())?;
 
-        client_socket
+        std_socket
             .connect(self.target_address)
             .with_context(|| format!("Failed to connect target {:?}", self.target_address))?;
 
-        // No need to set non-blocking mode since Mio has already handled it
+        // Set socket to non-blocking mode
+        std_socket.set_nonblocking(true)?;
+
+        // Set DF (Don't Fragment) flag on the socket
+        super::socket_utils::set_dont_fragment(&std_socket);
+
+        // Convert to Mio socket after setting socket options
+        let client_socket = UdpSocket::from_std(std_socket);
+
         Ok(client_socket)
     }
 
@@ -112,7 +146,7 @@ impl MioEventLoop {
             }
         }
 
-        if self.should_drop_tx_packet() {
+        if self.should_drop_tx_packet(snd_buf.len()) {
             trace!(
                 "Simulating TX packet loss - dropping {} bytes",
                 snd_buf.len()
@@ -149,7 +183,7 @@ impl MioEventLoop {
         packet_data: &[u8],
         source_addr: SocketAddr,
     ) -> Result<()> {
-        if self.should_drop_rx_packet() {
+        if self.should_drop_rx_packet(packet_data.len()) {
             trace!(
                 "Simulating RX packet loss - dropping {} bytes",
                 packet_data.len()

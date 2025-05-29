@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
 mod io_uring;
 mod mio;
+mod socket_utils;
 
 #[cfg(target_os = "linux")]
 pub(crate) use io_uring::IoUringEventLoop;
@@ -133,6 +134,7 @@ pub struct RuntimeConfig {
     pub rx_packet_loss_rate: Option<f32>,
     pub tx_packet_reorder_rate: Option<f32>,
     pub rx_packet_reorder_rate: Option<f32>,
+    pub drop_packets_above_size: Option<u16>,
 }
 
 impl Default for RuntimeConfig {
@@ -147,6 +149,7 @@ impl Default for RuntimeConfig {
             rx_packet_reorder_rate: None,
             io_uring_capacity: 256,
             buffer_size: 1 << 16,
+            drop_packets_above_size: None,
         }
     }
 }
@@ -161,6 +164,7 @@ impl QuicRuntime {
                 config.rx_packet_loss_rate,
                 config.tx_packet_reorder_rate,
                 config.rx_packet_reorder_rate,
+                config.drop_packets_above_size,
             ))
         } else {
             #[cfg(target_os = "linux")]
@@ -172,6 +176,7 @@ impl QuicRuntime {
                     config.max_quic_packet_send_count,
                     config.tx_packet_loss_rate,
                     config.rx_packet_loss_rate,
+                    config.drop_packets_above_size,
                 ))
             }
             #[cfg(not(target_os = "linux"))]

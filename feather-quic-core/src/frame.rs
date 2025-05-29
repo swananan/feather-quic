@@ -1801,6 +1801,7 @@ impl QuicFrame {
         let ack_range_count = decode_variable_length(cursor)?;
         let first_ack_range = decode_variable_length(cursor)?;
 
+        let mut mtu_probe_pns = qconn.get_mtu_probe_pns();
         let send_ctx = match level {
             QuicLevel::Initial => &mut qconn.init_send,
             QuicLevel::Handshake => &mut qconn.hs_send,
@@ -1841,12 +1842,14 @@ impl QuicFrame {
             &mut qconn.rtt,
             &qconn.current_ts,
             ack_delay,
+            mtu_probe_pns.as_mut(),
         )?;
 
         qconn.handle_acked_stream_frame(stream_frames)?;
         qconn.reset_pto_backoff_factor();
         qconn.detect_lost()?;
         qconn.set_loss_or_pto_timer()?;
+        qconn.handle_acked_mtu_probe(mtu_probe_pns.as_ref())?;
 
         if !ack_ranges.is_empty() {
             trace!(

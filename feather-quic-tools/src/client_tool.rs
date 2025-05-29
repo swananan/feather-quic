@@ -319,6 +319,14 @@ fn main() -> Result<()> {
                 .value_parser(clap::value_parser!(u64)),
         )
         .arg(
+            Arg::new("drop_packets_above_size")
+                .long("drop-packets-above-size")
+                .help("Drop all packets with size greater than this value (in bytes). \
+                    This is useful for MTU discovery testing. \
+                    By default, no packets are dropped based on size.")
+                .value_parser(clap::value_parser!(u16)),
+        )
+        .arg(
             Arg::new("packet_loss_rate")
                 .long("loss-rate")
                 .help("Packet loss rate (0.0 - 1.0) for both sending and receiving. \
@@ -380,6 +388,18 @@ fn main() -> Result<()> {
                 .value_parser(more_then_zero),
         )
         .arg(
+            Arg::new("mtu_discovery_timeout")
+                .long("mtu-discovery-timeout")
+                .help("MTU discovery probe timeout in milliseconds (default: 5000)")
+                .value_parser(clap::value_parser!(u64)),
+        )
+        .arg(
+            Arg::new("mtu_discovery_retry_count")
+                .long("mtu-discovery-retry-count")
+                .help("Maximum number of MTU discovery probe retries per size (default: 3)")
+                .value_parser(clap::value_parser!(u8)),
+        )
+        .arg(
             Arg::new("log_file")
                 .long("log-file")
                 .help("Path to write all logs to (default: stdout/stderr)")
@@ -427,6 +447,12 @@ fn main() -> Result<()> {
         .to_socket_addrs()?
         .next()
         .with_context(|| format!("Invalid target address: {}", target_address))?;
+
+    // Set MTU discovery network type based on target address
+    match target_addr {
+        SocketAddr::V4(_) => config.set_mtu_discovery_network_type(true),
+        SocketAddr::V6(_) => config.set_mtu_discovery_network_type(false),
+    }
 
     if let Some(idle_timeout) = matches.get_one::<u64>("idle_timeout") {
         config.set_idle_timeout(*idle_timeout);
@@ -508,9 +534,19 @@ fn main() -> Result<()> {
         config.set_trigger_key_update(*value);
     }
 
+    if let Some(value) = matches.get_one::<u64>("mtu_discovery_timeout") {
+        config.set_mtu_discovery_timeout(*value);
+    }
+
+    if let Some(value) = matches.get_one::<u8>("mtu_discovery_retry_count") {
+        config.set_mtu_discovery_retry_count(*value);
+    }
+
     let max_quic_packet_send_count = matches
         .get_one::<u64>("max_quic_packet_send_count")
         .copied();
+
+    let drop_packets_above_size = matches.get_one::<u16>("drop_packets_above_size").copied();
 
     let loss_rate = matches.get_one::<f32>("packet_loss_rate").copied();
 
@@ -556,10 +592,10 @@ fn main() -> Result<()> {
         io_uring_capacity: 256,
         buffer_size: 1 << 16,
         target_address: target_addr,
+        drop_packets_above_size,
     };
 
     let mut qconn = QuicConnection::new(config);
-
     let mut runtime = QuicRuntime::new(runtime_config);
 
     // Create appropriate context based on echo option
