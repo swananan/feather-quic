@@ -1,3 +1,4 @@
+use crate::mtu_discovery::NetworkType;
 use std::borrow::Cow;
 
 pub const DEFAULT_INITIAL_PACKET_SIZE: u16 = 1200;
@@ -12,6 +13,8 @@ const DEFAULT_ACK_DELAY_EXPONENT: u8 = 3;
 const DEFAULT_MAX_ACK_DELAY: u16 = 25;
 const DEFAULT_DISABLE_ACTIVE_MIGRATION: bool = false;
 const DEFAULT_ACTIVE_CONNECTION_ID_LIMIT: u8 = 7;
+const DEFAULT_MTU_DISCOVERY_TIMEOUT: u64 = 789;
+const DEFAULT_MTU_DISCOVERY_RETRY_COUNT: u8 = 3;
 
 #[derive(Clone, Default)]
 pub struct QuicConfig {
@@ -36,6 +39,9 @@ pub struct QuicConfig {
     disable_active_migration: Option<bool>,
     active_connection_id_limit: Option<u8>,
     max_udp_payload_size: Option<u32>,
+    mtu_discovery_timeout: Option<u64>,
+    mtu_discovery_retry_count: Option<u8>,
+    mtu_discovery_network_type: Option<NetworkType>,
 }
 
 impl QuicConfig {
@@ -206,5 +212,35 @@ impl QuicConfig {
 
     pub(crate) fn clear_trigger_key_update(&mut self) {
         self.trigger_key_update = None
+    }
+
+    pub fn set_mtu_discovery_timeout(&mut self, timeout: u64) {
+        self.mtu_discovery_timeout = Some(timeout);
+    }
+
+    pub(crate) fn get_mtu_discovery_timeout(&self) -> u64 {
+        self.mtu_discovery_timeout
+            .unwrap_or(DEFAULT_MTU_DISCOVERY_TIMEOUT)
+    }
+
+    pub fn set_mtu_discovery_retry_count(&mut self, retry_count: u8) {
+        self.mtu_discovery_retry_count = Some(retry_count);
+    }
+
+    pub(crate) fn get_mtu_discovery_retry_count(&self) -> u8 {
+        self.mtu_discovery_retry_count
+            .unwrap_or(DEFAULT_MTU_DISCOVERY_RETRY_COUNT)
+    }
+
+    pub fn set_mtu_discovery_network_type(&mut self, is_ipv4: bool) {
+        self.mtu_discovery_network_type = Some(if is_ipv4 {
+            NetworkType::IPv4
+        } else {
+            NetworkType::IPv6
+        });
+    }
+
+    pub(crate) fn get_mtu_discovery_network_type(&self) -> NetworkType {
+        self.mtu_discovery_network_type.unwrap_or(NetworkType::IPv4)
     }
 }

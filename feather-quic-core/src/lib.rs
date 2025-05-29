@@ -15,6 +15,7 @@ mod crypto;
 mod error_code;
 mod flow_control;
 mod frame;
+mod mtu_discovery;
 mod packet;
 mod rtt;
 pub mod runtime;

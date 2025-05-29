@@ -12,6 +12,7 @@ use crate::crypto::QuicCrypto;
 use crate::error_code::{QuicConnectionErrorCode, TransportErrorCode};
 use crate::flow_control::QuicConnectionFlowControl;
 use crate::frame::{QuicFrame, QuicPing};
+use crate::mtu_discovery::{MtuDiscovery, MtuDiscoveryConfig};
 use crate::packet::QuicPacket;
 use crate::rtt::QuicRttGenerator;
 use crate::runtime::QuicUserContext;
@@ -88,7 +89,6 @@ pub struct QuicConnection {
     idle_timeout_threshold: Option<Instant>,
     idle_close_trigger: bool,
 
-    pub(crate) datagram_size: u16,
     pub(crate) scid: Vec<u8>,
     pub(crate) org_dcid: Vec<u8>,
     pub(crate) dcid: Option<Vec<u8>>,
@@ -135,6 +135,10 @@ pub struct QuicConnection {
     next_uni_local_stream_id: u64,
     max_remote_stream_id: Option<u64>,
     flow_control: QuicConnectionFlowControl,
+
+    mtu: MtuDiscovery,
+    mtu_probe_size: Option<u16>,
+    mtu_probe_timeout_threshold: Option<Instant>,
 }
 
 #[allow(dead_code)]
@@ -157,6 +161,13 @@ impl QuicConnection {
         } else {
             quic_config.org_dcid.take().unwrap()
         };
+
+        let mtu_config = MtuDiscoveryConfig::from_quic_config(&quic_config);
+
+        info!(
+            "[MTU] Initializing MTU discovery with timeout: {}ms, max retries: {}, network type: {:?}",
+            mtu_config.probe_timeout_ms, mtu_config.max_probe_retries, mtu_config.network_type
+        );
 
         let now = Instant::now();
 
@@ -182,7 +193,6 @@ impl QuicConnection {
             peer_conn_ids: HashSet::new(),
             peer_reset_tokens: HashSet::new(),
 
-            datagram_size: 1200,
             key_phase: 0,
             discard_oldkey_threshold: None,
             detect_lost_threshold: None,
@@ -214,6 +224,10 @@ impl QuicConnection {
 
             peer_transport_params: PeerTransportParameters::new(),
             flow_control: QuicConnectionFlowControl::new(),
+
+            mtu: MtuDiscovery::new(mtu_config),
+            mtu_probe_size: None,
+            mtu_probe_timeout_threshold: None,
         }
     }
 
@@ -239,6 +253,9 @@ impl QuicConnection {
         }
         self.expected_state(QuicConnectionState::Connecting)?;
         self.state = QuicConnectionState::Established;
+
+        self.start_mtu_discovery()?;
+
         Ok(())
     }
 
@@ -293,6 +310,12 @@ impl QuicConnection {
                 );
                 self.discard_oldkey_threshold = None;
                 self.crypto.discard_last_key();
+            }
+        }
+
+        if let Some(mtu_threshold) = self.mtu_probe_timeout_threshold.as_ref() {
+            if compare_ts(&self.current_ts, mtu_threshold) {
+                self.mtu_handler()?;
             }
         }
 
@@ -404,6 +427,7 @@ impl QuicConnection {
         let idle_timeout = time_until("Idle timeout", self.idle_timeout_threshold);
         let key_update = time_until("Key update", self.discard_oldkey_threshold);
         let detect_lost = time_until("Loss detection", self.detect_lost_threshold);
+        let mtu_discovery = time_until("MTU discovery", self.mtu_probe_timeout_threshold);
         let pto = time_until("PTO", self.pto_threshold);
         let ack_delay = time_until("ACK delay", self.ack_delay_threshold);
         let close = time_until("Close event", self.close_threshold);
@@ -423,7 +447,8 @@ impl QuicConnection {
             .min(detect_lost)
             .min(pto)
             .min(ack_delay)
-            .min(close);
+            .min(close)
+            .min(mtu_discovery);
 
         // Log the result
         match timeout {
@@ -1607,6 +1632,7 @@ impl QuicConnection {
         );
         let _enter = span.enter();
 
+        trace!("Processing events at {:?}", self.current_ts);
         if !self.connect_done_called {
             if self.is_established() {
                 trace!("Connection established, calling connect done event");
@@ -1708,7 +1734,7 @@ impl QuicConnection {
         // - Optimize packetization to minimize stream multiplexing within a single datagram
         // - Implement congestion control window
         // - Add stream priority support
-        let max_buf_size = self.datagram_size as u64;
+        let max_buf_size = self.get_mtu() as u64;
         loop {
             let mut has_data = false;
 
@@ -2086,7 +2112,7 @@ impl QuicConnection {
     }
 
     fn expected_states(&self, s: Vec<QuicConnectionState>) -> Result<()> {
-        if s.iter().any(|s| *s == self.state) {
+        if s.contains(&self.state) {
             Ok(())
         } else {
             Err(anyhow!(
@@ -2168,5 +2194,107 @@ impl QuicConnection {
         if let Err(e) = self.discard_keys(level) {
             error!("Failed to discard {:?} keys: {}", level, e);
         }
+    }
+
+    pub(crate) fn get_mtu(&self) -> u16 {
+        self.mtu.get_mtu()
+    }
+
+    fn start_mtu_discovery(&mut self) -> Result<()> {
+        if let Some(target_mtu) = self.mtu.start_probe(&[self.app_send.next_pn]) {
+            self.create_mtu_probe_packet(target_mtu)?;
+            self.mtu_probe_timeout_threshold = self
+                .current_ts
+                .checked_add(Duration::from_millis(self.mtu.get_probe_timeout()));
+            info!(
+                "MTU probe timeout threshold: {:?}, next probe: {}",
+                format_instant(self.mtu_probe_timeout_threshold.unwrap(), self.current_ts),
+                target_mtu
+            );
+        }
+
+        Ok(())
+    }
+
+    fn mtu_handler(&mut self) -> Result<()> {
+        // Check if hit probe loss
+        self.mtu_probe_timeout_threshold = None;
+        info!("MTU handler called");
+
+        if let Some(next_probe) = self.mtu.probe_failed() {
+            // Send two probe packets to improve detection reliability
+            self.create_mtu_probe_packet(next_probe)?;
+            self.create_mtu_probe_packet(next_probe)?;
+            self.mtu_probe_timeout_threshold = self
+                .current_ts
+                .checked_add(Duration::from_millis(self.mtu.get_probe_timeout()));
+            info!(
+                "MTU probe failed, threshold: {:?}, next probe: {}",
+                format_instant(self.mtu_probe_timeout_threshold.unwrap(), self.current_ts),
+                next_probe
+            );
+        } else {
+            info!(
+                "MTU discovery completed successfully, final MTU: {}",
+                self.get_mtu()
+            );
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn get_mtu_probe_pns(&self) -> Option<HashSet<u64>> {
+        self.mtu.get_mtu_probe_pns()
+    }
+
+    pub(crate) fn handle_acked_mtu_probe(
+        &mut self,
+        acked_pns: Option<&HashSet<u64>>,
+    ) -> Result<()> {
+        if let Some(pns) = acked_pns {
+            trace!("Handle mtu not acked probe pns {:?}", pns);
+
+            if !pns.is_empty() {
+                return Ok(());
+            }
+
+            if let Some(next_probe) = self.mtu.probe_success(self.app_send.next_pn) {
+                info!(
+                    "MTU success, threshold: {:?}, next probe: {}, pn {}",
+                    format_instant(self.mtu_probe_timeout_threshold.unwrap(), self.current_ts),
+                    next_probe,
+                    self.app_send.next_pn
+                );
+                self.create_mtu_probe_packet(next_probe)?;
+                self.mtu_probe_timeout_threshold = self
+                    .current_ts
+                    .checked_add(Duration::from_millis(self.mtu.get_probe_timeout()));
+            } else {
+                info!(
+                    "MTU discovery completed successfully, final MTU: {}",
+                    self.get_mtu()
+                );
+                self.mtu_probe_timeout_threshold = None;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn get_mtu_probe_size(&self) -> Option<u16> {
+        self.mtu_probe_size
+    }
+
+    fn create_mtu_probe_packet(&mut self, mtu: u16) -> Result<()> {
+        let ping_frame = QuicFrame::Ping(QuicPing::default());
+        self.app_send.insert_send_queue_front(ping_frame);
+        self.mtu_probe_size = Some(mtu);
+        let datagram_buf = QuicPacket::create_quic_packet(self, QuicLevel::Application, 1)?
+            .ok_or_else(|| anyhow!("Must create the mtu probe QUIC packet successfully here"))?;
+        self.mtu_probe_size = None;
+        self.update_packet_send_queue(vec![datagram_buf]);
+        self.set_next_send_event_time(0);
+
+        Ok(())
     }
 }
