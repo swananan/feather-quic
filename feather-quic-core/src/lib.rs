@@ -4,6 +4,7 @@ pub mod prelude {
     pub use crate::connection::{QuicConnectResult, QuicConnection, QuicConnectionError};
     pub use crate::runtime::{QuicCallbacks, QuicRuntime, QuicUserContext, RuntimeConfig};
     pub use crate::stream::{QuicStreamError, QuicStreamHandle};
+    pub use crate::transport_parameters::{MAX_UDP_PAYLOAD_SIZE, MIN_UDP_PAYLOAD_SIZE};
 }
 
 // Internal modules
@@ -15,6 +16,7 @@ mod crypto;
 mod error_code;
 mod flow_control;
 mod frame;
+mod mtu_discovery;
 mod packet;
 mod rtt;
 pub mod runtime;

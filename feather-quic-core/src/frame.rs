@@ -1385,6 +1385,23 @@ impl QuicFrame {
                     qconn.rtt.ack_delay_exponent = Some(ade);
                 }
             }
+
+            if !qconn.mtu.has_max_mtu() {
+                let peer_mtu = qconn.get_peer_max_udp_payload_size().unwrap_or(0);
+                let local_mtu = qconn.quic_config.get_max_udp_payload_size().unwrap_or(0);
+
+                let final_mtu = if local_mtu > 0 && peer_mtu > 0 {
+                    local_mtu.min(peer_mtu)
+                } else {
+                    local_mtu.max(peer_mtu)
+                };
+
+                info!(
+                    "Update max_mtu to {} from peer {}, local {}",
+                    final_mtu, peer_mtu, local_mtu
+                );
+                qconn.mtu.set_max_mtu(final_mtu);
+            }
         }
 
         qconn.consume_tls_send_queue()?;
@@ -1801,6 +1818,7 @@ impl QuicFrame {
         let ack_range_count = decode_variable_length(cursor)?;
         let first_ack_range = decode_variable_length(cursor)?;
 
+        let mut mtu_probe_pns = qconn.get_mtu_probe_pns();
         let send_ctx = match level {
             QuicLevel::Initial => &mut qconn.init_send,
             QuicLevel::Handshake => &mut qconn.hs_send,
@@ -1841,12 +1859,14 @@ impl QuicFrame {
             &mut qconn.rtt,
             &qconn.current_ts,
             ack_delay,
+            mtu_probe_pns.as_mut(),
         )?;
 
         qconn.handle_acked_stream_frame(stream_frames)?;
         qconn.reset_pto_backoff_factor();
         qconn.detect_lost()?;
         qconn.set_loss_or_pto_timer()?;
+        qconn.handle_acked_mtu_probe(mtu_probe_pns.as_ref())?;
 
         if !ack_ranges.is_empty() {
             trace!(

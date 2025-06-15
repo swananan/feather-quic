@@ -16,8 +16,6 @@ use crate::utils::{
     write_cursor_bytes_with_pos,
 };
 
-const DEFAULT_MTU: u16 = 1472; // 1500 - udp header 8 - ip header 20
-
 const QUIC_PACKET_LENGTH_FIELD_SIZE: u16 = 2;
 
 // Fixed Bit:
@@ -165,7 +163,6 @@ impl QuicPacket<'_> {
 
         qconn.consume_tls_send_queue()?;
 
-        qconn.datagram_size = qconn.quic_config.get_first_initial_packet_size();
         Self::update_quic_send_queue(qconn)?;
 
         Ok(())
@@ -180,7 +177,7 @@ impl QuicPacket<'_> {
             return Ok(None);
         }
 
-        let remain = qconn.datagram_size;
+        let remain = qconn.get_mtu();
         let datagram_buf = match level {
             QuicLevel::Initial => Self::create_initial_packet(qconn, remain, frame_count)?,
             QuicLevel::Handshake => Self::create_handshake_packet(qconn, remain, frame_count)?,
@@ -257,8 +254,7 @@ impl QuicPacket<'_> {
 
     pub(crate) fn update_quic_send_queue(qconn: &mut QuicConnection) -> Result<()> {
         loop {
-            // TODO, MTU discovery
-            let udp_datagram_size = qconn.datagram_size;
+            let udp_datagram_size = qconn.get_mtu();
 
             let mut datagram_bufs = vec![];
             let remain = Self::update_quic_send_queue_helper(
@@ -551,8 +547,8 @@ impl QuicPacket<'_> {
             < QUIC_PN_OFFSET as u16 + QUIC_SAMPLE_LENGTH as u16
         {
             // An endpoint MUST discard packets that are not long enough to contain a complete sample.
-            QUIC_PN_OFFSET as u16 + QUIC_SAMPLE_LENGTH as u16
-                - (pn.packet_size as u16 + payload_len as u16 + QUIC_TAG_LENGTH as u16)
+            (QUIC_PN_OFFSET as u16 + QUIC_SAMPLE_LENGTH as u16)
+                .saturating_sub(pn.packet_size as u16 + payload_len as u16 + QUIC_TAG_LENGTH as u16)
         } else {
             0
         };
@@ -674,7 +670,7 @@ impl QuicPacket<'_> {
         }
 
         let quic_header_size = cursor.position() as u16;
-        if udp_datagram_remaining < quic_header_size {
+        if udp_datagram_remaining < quic_header_size && qconn.get_mtu_probe_size().is_none() {
             return Ok(None);
         }
         let max_payload_size = udp_datagram_remaining - quic_header_size - QUIC_TAG_LENGTH as u16;
@@ -724,20 +720,25 @@ impl QuicPacket<'_> {
             return Ok(None);
         }
 
-        let padding_frame_size =
-            if pn.packet_size as u16 + payload_len as u16 + (QUIC_TAG_LENGTH as u16)
-                < QUIC_PN_OFFSET as u16 + QUIC_SAMPLE_LENGTH as u16
-            {
-                // An endpoint MUST discard packets that are not long enough to contain a complete sample.
-                QUIC_PN_OFFSET as u16 + QUIC_SAMPLE_LENGTH as u16
-                    - (pn.packet_size as u16 + payload_len as u16 + QUIC_TAG_LENGTH as u16)
-            } else {
-                0
-            };
+        let padding_frame_size = if let Some(probe) = qconn.get_mtu_probe_size() {
+            probe.saturating_sub(quic_header_size + payload_len as u16 + QUIC_TAG_LENGTH as u16)
+        } else if pn.packet_size as u16 + payload_len as u16 + (QUIC_TAG_LENGTH as u16)
+            < QUIC_PN_OFFSET as u16 + QUIC_SAMPLE_LENGTH as u16
+        {
+            // An endpoint MUST discard packets that are not long enough to contain a complete sample.
+            (QUIC_PN_OFFSET as u16 + QUIC_SAMPLE_LENGTH as u16)
+                .saturating_sub(pn.packet_size as u16 + payload_len as u16 + QUIC_TAG_LENGTH as u16)
+        } else {
+            0
+        };
 
         if padding_frame_size > 0 {
             QuicFrame::create_padding_frame(&mut payload_cursor, padding_frame_size)?;
-            trace!("Added padding frame at pos {}", payload_cursor.position());
+            trace!(
+                "Added padding frame at pos {}, mtu probe {:?}",
+                payload_cursor.position(),
+                qconn.get_mtu_probe_size()
+            );
         }
 
         // Trigger the key update voluntarily
@@ -1088,11 +1089,6 @@ impl QuicPacket<'_> {
                 rcvbuf.len()
             );
         }
-
-        // TODO: MTU Discovery
-        qconn.datagram_size = DEFAULT_MTU;
-        // ?
-        // qconn.set_next_send_event_time(0);
 
         Ok(())
     }

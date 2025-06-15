@@ -61,6 +61,9 @@ struct Opt {
     /// If enabled, server will just wait without doing anything
     #[clap(long = "wait-only")]
     wait_only: bool,
+    /// Delay before sending each response (in milliseconds)
+    #[clap(long = "response-delay", default_value = "0")]
+    response_delay: u64,
 }
 
 pub fn make_server_endpoint(
@@ -339,6 +342,12 @@ async fn handle_request(
                         line.len(),
                         send,
                     );
+
+                    // Add delay before sending response if configured
+                    if options.response_delay > 0 {
+                        info!("Delaying response for {} ms", options.response_delay);
+                        sleep(Duration::from_millis(options.response_delay)).await;
+                    }
 
                     // Send the line including newline
                     send.write_all(line)

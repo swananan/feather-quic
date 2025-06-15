@@ -17,7 +17,9 @@ feather-quic 是一个个人实验性质项目，使用 Rust 实现 QUIC 协议�
 
 [用 Rust 从零开始写 QUIC：实现 QUIC 多路复用流传输和流量控制](https://jt26wzz.com/posts/0006-implement-quic-in-rust/)
 
-[用 Rust 从零开始写 QUIC：QUIC 连接关闭和错误处理](https://jt26wzz.com/posts/0008-implement-quic-in-rust/)
+[用 Rust 从零开始写 QUIC：实现 QUIC 连接关闭和错误处理](https://jt26wzz.com/posts/0008-implement-quic-in-rust/)
+
+[用 Rust 从零开始写 QUIC： MTU 探测](https://jt26wzz.com/posts/0009-implement-quic-in-rust/)
 
 未完待续
 

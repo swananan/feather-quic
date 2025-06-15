@@ -87,6 +87,7 @@ pub struct IoUringEventLoop {
     tx_packet_loss_rate: Option<f32>,
     rx_packet_loss_rate: Option<f32>,
     rng: rand::rngs::ThreadRng,
+    drop_packets_above_size: Option<u16>,
 }
 
 impl IoUringEventLoop {
@@ -97,6 +98,7 @@ impl IoUringEventLoop {
         max_quic_packet_send_count: Option<u64>,
         tx_packet_loss_rate: Option<f32>,
         rx_packet_loss_rate: Option<f32>,
+        drop_packets_above_size: Option<u16>,
     ) -> Self {
         const MULTI_BUFFER_CNT: u16 = 20;
         Self {
@@ -114,6 +116,7 @@ impl IoUringEventLoop {
             tx_packet_loss_rate,
             rx_packet_loss_rate,
             rng: rand::thread_rng(),
+            drop_packets_above_size,
         }
     }
 
@@ -240,7 +243,17 @@ impl IoUringEventLoop {
         Ok(())
     }
 
-    fn should_drop_tx_packet(&mut self) -> bool {
+    fn should_drop_tx_packet(&mut self, packet_size: usize) -> bool {
+        if let Some(max_size) = self.drop_packets_above_size {
+            if packet_size > max_size as usize {
+                trace!(
+                    "Dropping TX packet of size {} (above limit of {})",
+                    packet_size,
+                    max_size
+                );
+                return true;
+            }
+        }
         if let Some(packet_loss_rate) = self.tx_packet_loss_rate {
             self.rng.gen::<f32>() < packet_loss_rate
         } else {
@@ -248,7 +261,17 @@ impl IoUringEventLoop {
         }
     }
 
-    fn should_drop_rx_packet(&mut self) -> bool {
+    fn should_drop_rx_packet(&mut self, packet_size: usize) -> bool {
+        if let Some(max_size) = self.drop_packets_above_size {
+            if packet_size > max_size as usize {
+                trace!(
+                    "Dropping RX packet of size {} (above limit of {})",
+                    packet_size,
+                    max_size
+                );
+                return true;
+            }
+        }
         if let Some(packet_loss_rate) = self.rx_packet_loss_rate {
             self.rng.gen::<f32>() < packet_loss_rate
         } else {
@@ -260,59 +283,68 @@ impl IoUringEventLoop {
         &mut self,
         sq: &mut SubmissionQueue<'_>,
         fd: i32,
-        prepare_data: F,
+        mut fill_buf: F,
     ) -> Result<()>
     where
-        F: FnOnce(&mut Vec<u8>) -> Result<u16>,
+        F: FnMut(&mut [u8]) -> Result<u16>,
     {
-        if let Some(limit) = self.max_quic_packet_send_count {
-            if limit <= self.sent_cnt {
-                return Ok(());
-            }
+        if self
+            .max_quic_packet_send_count
+            .is_some_and(|max| self.sent_cnt >= max)
+        {
+            info!(
+                "Maximum packet send count {} reached, dropping packet",
+                self.sent_cnt
+            );
+            return Ok(());
         }
 
-        let should_drop = self.should_drop_tx_packet();
-        let (buf_index, buf) = match self.bufpool.pop() {
-            Some(buf_index) => (buf_index, &mut self.buf_alloc[buf_index]),
+        let buf_index = match self.bufpool.pop() {
+            Some(index) => index,
             None => {
                 let buf = vec![0u8; self.buffer_size];
                 let buf_entry = self.buf_alloc.vacant_entry();
-                let buf_index = buf_entry.key();
+                let index = buf_entry.key();
                 buf_entry.insert(buf);
-
-                (buf_index, &mut self.buf_alloc[buf_index])
+                index
             }
         };
 
-        let write_len = prepare_data(buf)?;
+        let datagram_len = {
+            let buf = &mut self.buf_alloc[buf_index];
+            fill_buf(buf)?
+        };
 
-        if should_drop {
-            trace!("Simulating TX packet loss - dropping QUIC packet");
-            self.sent_cnt += 1;
+        if self.should_drop_tx_packet(datagram_len as usize) {
+            trace!(
+                "Simulating TX packet loss - dropping {} bytes",
+                datagram_len
+            );
             self.bufpool.push(buf_index);
             return Ok(());
         }
 
         let token_index = self.token_alloc.insert(Token::Write {
             buf_index,
-            datagram_len: write_len,
+            datagram_len,
         });
 
-        let send_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), write_len as u32)
-            .build()
-            .user_data(token_index as u64);
-        self.sent_cnt += 1;
+        let write_e = {
+            let buf = &self.buf_alloc[buf_index];
+            opcode::Send::new(types::Fd(fd), buf.as_ptr(), datagram_len as u32)
+                .build()
+                .user_data(token_index as u64)
+        };
 
+        unsafe { sq.push(&write_e)? }
         trace!(
-            "Attempting to submit write operation, length: {}, token index: {}",
-            write_len,
+            "Trying to submit write event, token index {}, datagram len {}",
             token_index,
+            datagram_len
         );
 
-        // I guess sq push will not hold ref send_e, so it's totally fine
-        unsafe { sq.push(&send_e)? }
-
         sq.sync();
+        self.sent_cnt += 1;
         Ok(())
     }
 
@@ -370,6 +402,15 @@ impl IoUringEventLoop {
 
         let udp_socket = UdpSocket::bind("0.0.0.0:0")?;
         udp_socket.connect(self.target_address)?;
+        let max_udp_payload_size =
+            super::socket_utils::get_max_udp_payload_size_from_device_mtu(&udp_socket);
+
+        // Set socket to non-blocking mode
+        udp_socket.set_nonblocking(true)?;
+
+        // Set DF (Don't Fragment) flag on the socket
+        super::socket_utils::set_dont_fragment(&udp_socket);
+
         let udp_fd = udp_socket.as_raw_fd();
         let local_addr = udp_socket.local_addr().with_context(|| {
             format!(
@@ -392,7 +433,7 @@ impl IoUringEventLoop {
         );
 
         self.create_and_sumbit_write_event(&mut sq, udp_fd, |buf| {
-            qconn.connect()?;
+            qconn.connect(max_udp_payload_size)?;
             let udp_sndbuf = qconn
                 .consume_data()
                 .expect("Should have first initial QUIC packet");
@@ -563,7 +604,7 @@ impl IoUringEventLoop {
                             more
                         );
 
-                        if self.should_drop_rx_packet() {
+                        if self.should_drop_rx_packet(read_len) {
                             trace!("Simulating RX packet loss - dropping {} bytes", read_len);
                             continue;
                         }
