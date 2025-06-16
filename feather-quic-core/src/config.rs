@@ -1,8 +1,10 @@
+use crate::mtu_discovery::NetworkType;
+use crate::transport_parameters::{MAX_UDP_PAYLOAD_SIZE, MIN_UDP_PAYLOAD_SIZE};
+use anyhow::{anyhow, Result};
 use std::borrow::Cow;
 
-pub const DEFAULT_INITIAL_PACKET_SIZE: u16 = 1200;
+pub const DEFAULT_INITIAL_PACKET_SIZE: u16 = MIN_UDP_PAYLOAD_SIZE;
 const DEFAULT_MAX_IDLE_TIMEOUT: u64 = 0;
-const DEFAULT_MAX_UDP_PAYLOAD_SIZE: u32 = 65527;
 const DEFAULT_MAX_STREAM_DATA_BIDI_LOCAL: u64 = 1 << 17;
 const DEFAULT_MAX_STREAM_DATA_BIDI_REMOTE: u64 = 1 << 16;
 const DEFAULT_MAX_STREAM_DATA_UNI: u64 = 1 << 16;
@@ -12,6 +14,8 @@ const DEFAULT_ACK_DELAY_EXPONENT: u8 = 3;
 const DEFAULT_MAX_ACK_DELAY: u16 = 25;
 const DEFAULT_DISABLE_ACTIVE_MIGRATION: bool = false;
 const DEFAULT_ACTIVE_CONNECTION_ID_LIMIT: u8 = 7;
+const DEFAULT_MTU_DISCOVERY_TIMEOUT: u64 = 789;
+const DEFAULT_MTU_DISCOVERY_RETRY_COUNT: u8 = 3;
 
 #[derive(Clone, Default)]
 pub struct QuicConfig {
@@ -35,7 +39,10 @@ pub struct QuicConfig {
     max_ack_delay: Option<u16>,
     disable_active_migration: Option<bool>,
     active_connection_id_limit: Option<u8>,
-    max_udp_payload_size: Option<u32>,
+    max_udp_payload_size: Option<u16>,
+    mtu_discovery_timeout: Option<u64>,
+    mtu_discovery_retry_count: Option<u8>,
+    mtu_discovery_network_type: Option<NetworkType>,
 }
 
 impl QuicConfig {
@@ -121,9 +128,8 @@ impl QuicConfig {
             .unwrap_or(DEFAULT_ACTIVE_CONNECTION_ID_LIMIT)
     }
 
-    pub(crate) fn get_max_udp_payload_size(&self) -> u32 {
+    pub(crate) fn get_max_udp_payload_size(&self) -> Option<u16> {
         self.max_udp_payload_size
-            .unwrap_or(DEFAULT_MAX_UDP_PAYLOAD_SIZE)
     }
 
     pub fn set_server_name<'a, S>(&mut self, server_name: S)
@@ -192,8 +198,17 @@ impl QuicConfig {
         self.active_connection_id_limit = Some(value);
     }
 
-    pub fn set_max_udp_payload_size(&mut self, value: u32) {
+    pub fn set_max_udp_payload_size(&mut self, value: u16) -> Result<()> {
+        if !(MIN_UDP_PAYLOAD_SIZE..=MAX_UDP_PAYLOAD_SIZE).contains(&value) {
+            return Err(anyhow!(
+                "Invalid UDP payload size: {}, must be between {} and {}",
+                value,
+                MIN_UDP_PAYLOAD_SIZE,
+                MAX_UDP_PAYLOAD_SIZE
+            ));
+        }
         self.max_udp_payload_size = Some(value);
+        Ok(())
     }
 
     pub fn set_trigger_key_update(&mut self, trigger_key_update: u64) {
@@ -206,5 +221,35 @@ impl QuicConfig {
 
     pub(crate) fn clear_trigger_key_update(&mut self) {
         self.trigger_key_update = None
+    }
+
+    pub fn set_mtu_discovery_timeout(&mut self, timeout: u64) {
+        self.mtu_discovery_timeout = Some(timeout);
+    }
+
+    pub(crate) fn get_mtu_discovery_timeout(&self) -> u64 {
+        self.mtu_discovery_timeout
+            .unwrap_or(DEFAULT_MTU_DISCOVERY_TIMEOUT)
+    }
+
+    pub fn set_mtu_discovery_retry_count(&mut self, retry_count: u8) {
+        self.mtu_discovery_retry_count = Some(retry_count);
+    }
+
+    pub(crate) fn get_mtu_discovery_retry_count(&self) -> u8 {
+        self.mtu_discovery_retry_count
+            .unwrap_or(DEFAULT_MTU_DISCOVERY_RETRY_COUNT)
+    }
+
+    pub fn set_mtu_discovery_network_type(&mut self, is_ipv4: bool) {
+        self.mtu_discovery_network_type = Some(if is_ipv4 {
+            NetworkType::IPv4
+        } else {
+            NetworkType::IPv6
+        });
+    }
+
+    pub(crate) fn get_mtu_discovery_network_type(&self) -> NetworkType {
+        self.mtu_discovery_network_type.unwrap_or(NetworkType::IPv4)
     }
 }

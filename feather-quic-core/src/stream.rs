@@ -338,6 +338,7 @@ impl QuicStream {
         }
 
         self.set_send_state(QuicSendingStreamState::DataSent);
+        self.write_event_active = false;
         self.fin = true;
 
         trace!(
@@ -370,6 +371,7 @@ impl QuicStream {
             application_error_code
         );
 
+        self.read_event_active = false;
         self.stop_sending_sent = true;
 
         Ok(QuicFrame::create_stop_sending_frame(
@@ -405,6 +407,7 @@ impl QuicStream {
             ));
         }
 
+        self.write_event_active = false;
         self.set_send_state(QuicSendingStreamState::ResetSent);
 
         trace!(

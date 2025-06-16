@@ -13,6 +13,10 @@ fn limitation_initial_packet_size(s: &str) -> Result<u16, String> {
     number_range(s, DEFAULT_INITIAL_PACKET_SIZE, u16::MAX)
 }
 
+fn limitation_udp_payload_size(s: &str) -> Result<u16, String> {
+    number_range(s, MIN_UDP_PAYLOAD_SIZE, MAX_UDP_PAYLOAD_SIZE)
+}
+
 fn more_then_zero(s: &str) -> Result<u64, String> {
     number_range(s, 1, u64::MAX)
 }
@@ -200,7 +204,10 @@ fn main() -> Result<()> {
         .arg(
             Arg::new("first_initial_packet_size")
                 .long("first-initial-packet-size")
-                .help("First QUIC initial packet size in bytes (default: 1200, range [0, 65536])")
+                .help("First QUIC initial packet size in bytes (default: 1200, range [0, 65536]). \
+                    Note: This is an experimental feature for testing purposes only. \
+                    Setting this value might interfere with the normal MTU discovery process \
+                    and is not recommended for production use. We keep it just for fun!")
                 .value_parser(clap::value_parser!(u16)),
         )
         .arg(
@@ -296,8 +303,8 @@ fn main() -> Result<()> {
         .arg(
             Arg::new("max_udp_payload_size")
                 .long("max-udp-payload-size")
-                .help("Transport Parameter: Maximum size of UDP payloads in bytes (default: 65527)")
-                .value_parser(clap::value_parser!(u32)),
+                .help("Transport Parameter: Maximum size of UDP payloads in bytes (default: 65527, range [1200, 65527])")
+                .value_parser(limitation_udp_payload_size),
         )
         .arg(
             Arg::new("trigger_key_update")
@@ -317,6 +324,14 @@ fn main() -> Result<()> {
                     When the limit is reached, the connection will be closed. \
                     By default, there is no limit.")
                 .value_parser(clap::value_parser!(u64)),
+        )
+        .arg(
+            Arg::new("drop_packets_above_size")
+                .long("drop-packets-above-size")
+                .help("Drop all packets with size greater than this value (in bytes). \
+                    This is useful for MTU discovery testing. \
+                    By default, no packets are dropped based on size.")
+                .value_parser(clap::value_parser!(u16)),
         )
         .arg(
             Arg::new("packet_loss_rate")
@@ -380,6 +395,18 @@ fn main() -> Result<()> {
                 .value_parser(more_then_zero),
         )
         .arg(
+            Arg::new("mtu_discovery_timeout")
+                .long("mtu-discovery-timeout")
+                .help("MTU discovery probe timeout in milliseconds (default: 5000)")
+                .value_parser(clap::value_parser!(u64)),
+        )
+        .arg(
+            Arg::new("mtu_discovery_retry_count")
+                .long("mtu-discovery-retry-count")
+                .help("Maximum number of MTU discovery probe retries per size (default: 3)")
+                .value_parser(clap::value_parser!(u8)),
+        )
+        .arg(
             Arg::new("log_file")
                 .long("log-file")
                 .help("Path to write all logs to (default: stdout/stderr)")
@@ -427,6 +454,12 @@ fn main() -> Result<()> {
         .to_socket_addrs()?
         .next()
         .with_context(|| format!("Invalid target address: {}", target_address))?;
+
+    // Set MTU discovery network type based on target address
+    match target_addr {
+        SocketAddr::V4(_) => config.set_mtu_discovery_network_type(true),
+        SocketAddr::V6(_) => config.set_mtu_discovery_network_type(false),
+    }
 
     if let Some(idle_timeout) = matches.get_one::<u64>("idle_timeout") {
         config.set_idle_timeout(*idle_timeout);
@@ -500,17 +533,27 @@ fn main() -> Result<()> {
         config.set_active_connection_id_limit(*value);
     }
 
-    if let Some(value) = matches.get_one::<u32>("max_udp_payload_size") {
-        config.set_max_udp_payload_size(*value);
+    if let Some(value) = matches.get_one::<u16>("max_udp_payload_size") {
+        config.set_max_udp_payload_size(*value)?;
     }
 
     if let Some(value) = matches.get_one::<u64>("trigger_key_update") {
         config.set_trigger_key_update(*value);
     }
 
+    if let Some(value) = matches.get_one::<u64>("mtu_discovery_timeout") {
+        config.set_mtu_discovery_timeout(*value);
+    }
+
+    if let Some(value) = matches.get_one::<u8>("mtu_discovery_retry_count") {
+        config.set_mtu_discovery_retry_count(*value);
+    }
+
     let max_quic_packet_send_count = matches
         .get_one::<u64>("max_quic_packet_send_count")
         .copied();
+
+    let drop_packets_above_size = matches.get_one::<u16>("drop_packets_above_size").copied();
 
     let loss_rate = matches.get_one::<f32>("packet_loss_rate").copied();
 
@@ -556,10 +599,10 @@ fn main() -> Result<()> {
         io_uring_capacity: 256,
         buffer_size: 1 << 16,
         target_address: target_addr,
+        drop_packets_above_size,
     };
 
     let mut qconn = QuicConnection::new(config);
-
     let mut runtime = QuicRuntime::new(runtime_config);
 
     // Create appropriate context based on echo option

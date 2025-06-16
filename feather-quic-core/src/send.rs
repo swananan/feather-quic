@@ -8,6 +8,7 @@ use crate::ack::{QuicAckGenerator, QuicAckRange};
 use crate::buffer::QuicBuffer;
 use crate::connection::QuicLevel;
 use crate::frame::QuicFrame;
+use crate::mtu_discovery::MtuDiscovery;
 use crate::rtt::QuicRttGenerator;
 
 #[allow(dead_code)]
@@ -276,7 +277,7 @@ impl QuicSendContext {
         let time_threshold = rtt.get_time_threhold();
 
         let mut split_index = None;
-        self.sent_queue.iter().try_for_each(|f| {
+        let _ = self.sent_queue.iter().try_for_each(|f| {
             trace!("Loss Detection, current {:?}", f);
             if matches!(f, QuicFrame::Ack(_)) {
                 split_index = Some(split_index.unwrap_or(0) + 1);
@@ -387,6 +388,7 @@ impl QuicSendContext {
         get_send_time: bool,
         acked_stream_frames: &mut Vec<QuicFrame>,
         current_ts: &Instant,
+        mtu_probe_pns: Option<&mut HashSet<u64>>,
     ) -> Result<(bool, Option<Instant>)> {
         trace!(
             "Processing ACK range [{}..{}], get_send_time: {}",
@@ -396,6 +398,9 @@ impl QuicSendContext {
         );
         let mut ackeliciting_packet_acked = false;
         let mut send_time = None;
+
+        MtuDiscovery::retain_acked_probe(mtu_probe_pns, smallest, largest);
+
         self.sent_queue.retain(|f| {
             let pn = if let Some(pn) = f.get_packet_number() {
                 pn
@@ -516,6 +521,7 @@ impl QuicSendContext {
         rtt: &mut QuicRttGenerator,
         current_ts: &Instant,
         delay: u64,
+        mut mtu_probe_pns: Option<&mut HashSet<u64>>,
     ) -> Result<Vec<QuicFrame>> {
         let mut largest = top_range;
         let mut smallest = top_range.checked_sub(first_range).ok_or_else(|| {
@@ -529,6 +535,8 @@ impl QuicSendContext {
 
         let mut largest_acked_updated = false;
         let mut ackeliciting_packet_acked = false;
+
+        MtuDiscovery::retain_acked_probe(mtu_probe_pns.as_deref_mut(), smallest, largest);
 
         if let Some(lgna) = self.largest_acked.as_mut() {
             if *lgna < top_range {
@@ -547,6 +555,7 @@ impl QuicSendContext {
         let mut index = 0;
         let mut sent_time = None;
         let mut acked_stream_frames = vec![];
+
         loop {
             let get_send_time = largest_acked_updated && largest == top_range;
             let (acked, send_time) = self.handle_ack_range(
@@ -555,6 +564,7 @@ impl QuicSendContext {
                 get_send_time,
                 &mut acked_stream_frames,
                 current_ts,
+                mtu_probe_pns.as_deref_mut(),
             )?;
             ackeliciting_packet_acked |= acked;
             if get_send_time && send_time.is_none() {
@@ -690,6 +700,7 @@ mod tests {
             &mut rtt,
             &current_ts,
             1000, // delay in microseconds
+            Some(HashSet::new()).as_mut(),
         );
 
         assert!(result.is_ok());
@@ -725,6 +736,7 @@ mod tests {
             &mut rtt,
             &current_ts,
             1000,
+            Some(HashSet::new()).as_mut(),
         );
 
         assert!(result.is_ok());
@@ -746,6 +758,7 @@ mod tests {
             &mut rtt,
             &current_ts,
             1000,
+            Some(HashSet::new()).as_mut(),
         );
 
         assert!(result.is_err());
@@ -771,6 +784,7 @@ mod tests {
             &mut rtt,
             &current_ts,
             1000,
+            Some(HashSet::new()).as_mut(),
         );
 
         assert!(result.is_ok());
@@ -807,6 +821,7 @@ mod tests {
             &mut rtt,
             &current_ts,
             1000,
+            Some(HashSet::new()).as_mut(),
         );
 
         assert!(result.is_ok());

@@ -3,12 +3,15 @@ use byteorder::{BigEndian, WriteBytesExt};
 use std::fmt;
 use std::io::{Cursor, Read, Seek, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use tracing::{trace, warn};
+use tracing::{info, trace, warn};
 
 use crate::config::QuicConfig;
 use crate::connection::QUIC_STATELESS_RESET_TOKEN_SIZE;
 use crate::tls::TlsContext;
 use crate::utils::{decode_variable_length, encode_variable_length, get_variable_length};
+
+pub const MAX_UDP_PAYLOAD_SIZE: u16 = 65527;
+pub const MIN_UDP_PAYLOAD_SIZE: u16 = 1200;
 
 #[allow(dead_code)]
 // https://www.rfc-editor.org/rfc/rfc9000.html#section-18
@@ -31,7 +34,7 @@ pub(crate) enum TransportParameter {
     // The maximum UDP payload size parameter is an integer value that limits the size of UDP payloads
     // that the endpoint is willing to receive.
     // UDP datagrams with payloads larger than this limit are not likely to be processed by the receiver.
-    MaxUdpPayloadSize(u32),
+    MaxUdpPayloadSize(u16),
 
     InitialMaxData(u64),
 
@@ -233,13 +236,21 @@ impl TransportParameter {
                     len,
                     cursor.position()
                 );
-                let size = decode_variable_length(cursor)?;
+                let size = decode_variable_length(cursor)? as u16;
+                if !(MIN_UDP_PAYLOAD_SIZE..=MAX_UDP_PAYLOAD_SIZE).contains(&size) {
+                    return Err(anyhow!(
+                        "Invalid UDP payload size: {}, must be between {} and {}",
+                        size,
+                        MIN_UDP_PAYLOAD_SIZE,
+                        MAX_UDP_PAYLOAD_SIZE
+                    ));
+                }
                 trace!(
                     "MaxUdpPayloadSize value {} at position {}",
                     size,
                     cursor.position()
                 );
-                TransportParameter::MaxUdpPayloadSize(size as u32)
+                TransportParameter::MaxUdpPayloadSize(size)
             }
             0x04 => {
                 let len = decode_variable_length(cursor)?;
@@ -380,9 +391,6 @@ impl TransportParameter {
                 );
                 TransportParameter::DisableActiveMigration(value == 0)
             }
-            // 0x0D => {
-            //     unimplemented!();
-            // }
             0x0E => {
                 let len = decode_variable_length(cursor)?;
                 trace!(
@@ -600,7 +608,7 @@ pub(crate) fn create_client_transport_parameters(
     quic_config: &QuicConfig,
     scid: &[u8],
 ) -> Vec<TransportParameter> {
-    vec![
+    let mut parameters = vec![
         TransportParameter::MaxIdleTimeout(quic_config.get_idle_timeout()),
         TransportParameter::InitialMaxData(quic_config.get_initial_max_data()),
         TransportParameter::InitialSourceConnectionId(scid.to_vec()),
@@ -617,8 +625,14 @@ pub(crate) fn create_client_transport_parameters(
         TransportParameter::MaxAckDelay(quic_config.get_max_ack_delay()),
         TransportParameter::DisableActiveMigration(quic_config.get_disable_active_migration()),
         TransportParameter::ActiveConnectionIdLimit(quic_config.get_active_connection_id_limit()),
-        TransportParameter::MaxUdpPayloadSize(quic_config.get_max_udp_payload_size()),
-    ]
+    ];
+
+    if let Some(max_udp_payload_size) = quic_config.get_max_udp_payload_size() {
+        info!("Sending max UDP payload size: {}", max_udp_payload_size);
+        parameters.push(TransportParameter::MaxUdpPayloadSize(max_udp_payload_size));
+    }
+
+    parameters
 }
 
 #[derive(Debug, Default)]
@@ -633,6 +647,7 @@ pub(crate) struct PeerTransportParameters {
     initial_max_streams_bidi: Option<u64>,
     initial_max_streams_uni: Option<u64>,
     stateless_reset_token: Option<[u8; QUIC_STATELESS_RESET_TOKEN_SIZE as usize]>,
+    max_udp_payload_size: Option<u16>,
     updated: bool,
 }
 
@@ -656,7 +671,12 @@ impl PeerTransportParameters {
         self.initial_max_streams_bidi = tls.get_peer_initial_max_streams_bidi();
         self.initial_max_streams_uni = tls.get_peer_initial_max_streams_uni();
         self.stateless_reset_token = tls.get_peer_stateless_reset_token();
+        self.max_udp_payload_size = tls.get_peer_max_udp_payload_size();
         self.updated = true;
+    }
+
+    pub(crate) fn get_max_udp_payload_size(&self) -> Option<u16> {
+        self.max_udp_payload_size
     }
 
     pub(crate) fn get_max_idle_timeout(&self) -> Option<u64> {

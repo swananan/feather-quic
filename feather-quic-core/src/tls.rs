@@ -255,6 +255,7 @@ impl FromTransportParam for u16 {
     fn from_param(param: &TransportParameter) -> Self {
         match param {
             TransportParameter::MaxAckDelay(v) => *v,
+            TransportParameter::MaxUdpPayloadSize(v) => *v,
             _ => panic!("Unexpected transport parameter type"),
         }
     }
@@ -374,6 +375,12 @@ impl TlsContext {
     {
         self.s_tp.as_ref().and_then(|params| {
             search_transport_parameters(params, predicate).map(|t| T::from_param(t))
+        })
+    }
+
+    pub(crate) fn get_peer_max_udp_payload_size(&self) -> Option<u16> {
+        self.get_peer_transport_param(|item| {
+            matches!(item, TransportParameter::MaxUdpPayloadSize(_))
         })
     }
 
