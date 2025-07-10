@@ -1,4 +1,5 @@
 use crate::connection::{QuicConnection, QuicLevel};
+use std::fmt;
 use tracing::{error, info};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6,6 +7,28 @@ pub(crate) enum QuicConnectionErrorCode {
     ApplicationErrorCode(u64),
     TransportErrorCode((TransportErrorCode, Option<u64>)),
 }
+
+impl fmt::Display for QuicConnectionErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            QuicConnectionErrorCode::ApplicationErrorCode(code) => {
+                write!(f, "Application error code: {code}")
+            }
+            QuicConnectionErrorCode::TransportErrorCode((transport_error, frame_type)) => {
+                if let Some(ft) = frame_type {
+                    write!(
+                        f,
+                        "Transport error: {transport_error:?} (frame type: 0x{ft:x})",
+                    )
+                } else {
+                    write!(f, "Transport error: {transport_error:?}")
+                }
+            }
+        }
+    }
+}
+
+impl std::error::Error for QuicConnectionErrorCode {}
 
 impl QuicConnectionErrorCode {
     pub(crate) fn create_application_error_code(error_code: u64) -> Self {
@@ -19,10 +42,78 @@ impl QuicConnectionErrorCode {
         ))
     }
 
+    pub(crate) fn create_connection_id_limit_error() -> Self {
+        Self::create_transport_error_code(
+            u64::from(TransportErrorCode::ConnectionIdLimitError),
+            Some(crate::frame::QuicFrameType::NewConnectionId as u64), // NEW_CONNECTION_ID frame type
+        )
+    }
+
     pub(crate) fn get_error_code(&self) -> u64 {
         match self {
             QuicConnectionErrorCode::TransportErrorCode((te, _)) => u64::from(*te),
             QuicConnectionErrorCode::ApplicationErrorCode(e) => *e,
+        }
+    }
+
+    /// Unified connection close frame sending method
+    pub(crate) fn send_connection_close_frame(
+        &self,
+        qconn: &mut QuicConnection,
+        is_short_header: bool,
+    ) {
+        match self {
+            QuicConnectionErrorCode::TransportErrorCode((transport_error, frame_type)) => {
+                match transport_error {
+                    TransportErrorCode::ConnectionIdLimitError => {
+                        TransportErrorCode::send_connection_id_limit_error_cc_frame(
+                            qconn,
+                            *frame_type,
+                        );
+                    }
+                    TransportErrorCode::CryptoBufferExceeded => {
+                        TransportErrorCode::send_crypto_buffer_exceeded_cc_frame(
+                            qconn,
+                            *frame_type,
+                        );
+                    }
+                    TransportErrorCode::FrameEncodingError => {
+                        TransportErrorCode::send_frame_encoding_error_cc_frame(
+                            qconn,
+                            is_short_header,
+                            *frame_type,
+                        );
+                    }
+                    TransportErrorCode::TransportParameterError => {
+                        TransportErrorCode::send_transport_parameter_error_cc_frame(
+                            qconn,
+                            "Transport parameter error".to_string(),
+                            *frame_type,
+                        );
+                    }
+                    TransportErrorCode::StreamLimitError => {
+                        TransportErrorCode::send_stream_limit_error_cc_frame(qconn, *frame_type);
+                    }
+                    TransportErrorCode::FlowControlError => {
+                        TransportErrorCode::send_flow_control_error_cc_frame(qconn, *frame_type);
+                    }
+                    TransportErrorCode::KeyUpdateError => {
+                        TransportErrorCode::send_key_update_error_cc_frame(qconn, *frame_type);
+                    }
+                    _ => {
+                        // For other transport errors, send generic frame encoding error
+                        TransportErrorCode::send_frame_encoding_error_cc_frame(
+                            qconn,
+                            is_short_header,
+                            *frame_type,
+                        );
+                    }
+                }
+            }
+            QuicConnectionErrorCode::ApplicationErrorCode(_) => {
+                // Application errors are usually not handled here
+                error!("Unexpected application error code in transport error handling");
+            }
         }
     }
 }
@@ -157,31 +248,11 @@ pub(crate) enum TransportErrorCode {
 }
 
 impl TransportErrorCode {
-    pub(crate) fn send_crypto_buffer_exceeded_cc_frame(qconn: &mut QuicConnection) {
-        error!("Crypto buffer exceeded, so closed the connection");
-        qconn.send_transport_connection_close_frame(
-            &[QuicLevel::Initial, QuicLevel::Handshake],
-            u64::from(TransportErrorCode::CryptoBufferExceeded),
-            Some("Crypto buffer exceeded".to_string()),
-            None,
-        );
-    }
-
-    pub(crate) fn send_crypto_error_cc_frame(
+    pub(crate) fn send_no_error_cc_frame(
         qconn: &mut QuicConnection,
-        tls_error: TlsError,
-        levels: Vec<QuicLevel>,
+        level: QuicLevel,
+        frame_type: Option<u64>,
     ) {
-        error!("TLS error occurred: {:?}", tls_error);
-        qconn.send_transport_connection_close_frame(
-            &levels,
-            tls_error.to_quic_error_code(),
-            Some(tls_error.to_error_message()),
-            None,
-        );
-    }
-
-    pub(crate) fn send_no_error_cc_frame(qconn: &mut QuicConnection, level: QuicLevel) {
         info!("Received connection close frame, so reponse a no-error connection close frame, level: {:?}", level);
         qconn.send_transport_connection_close_frame(
             &[level],
@@ -190,33 +261,66 @@ impl TransportErrorCode {
                 "Received connection close frame, so reponse a no-error connection close frame"
                     .to_string(),
             ),
-            None,
+            frame_type,
         );
     }
 
-    pub(crate) fn send_stream_limit_error_cc_frame(qconn: &mut QuicConnection) {
+    pub(crate) fn send_stream_limit_error_cc_frame(
+        qconn: &mut QuicConnection,
+        frame_type: Option<u64>,
+    ) {
         error!("Detected errors in receiving new stream here, so closed the connection");
         qconn.send_transport_connection_close_frame(
             &[QuicLevel::Application],
             u64::from(TransportErrorCode::StreamLimitError),
             Some("Detected limitation errors in opening the new stream".to_string()),
-            None,
+            frame_type,
         );
     }
 
-    pub(crate) fn send_key_update_error_cc_frame(qconn: &mut QuicConnection) {
+    pub(crate) fn send_flow_control_error_cc_frame(
+        qconn: &mut QuicConnection,
+        frame_type: Option<u64>,
+    ) {
+        error!("Flow control limit exceeded, so closed the connection");
+        qconn.send_transport_connection_close_frame(
+            &[QuicLevel::Application],
+            u64::from(TransportErrorCode::FlowControlError),
+            Some("Flow control limit exceeded".to_string()),
+            frame_type,
+        );
+    }
+
+    pub(crate) fn send_key_update_error_cc_frame(
+        qconn: &mut QuicConnection,
+        frame_type: Option<u64>,
+    ) {
         error!("Detected errors in performing key updates here, so closed the connection");
         qconn.send_transport_connection_close_frame(
             &[QuicLevel::Application],
             u64::from(TransportErrorCode::KeyUpdateError),
             Some("Detected errors in performing key updates".to_string()),
-            None,
+            frame_type,
+        );
+    }
+
+    pub(crate) fn send_connection_id_limit_error_cc_frame(
+        qconn: &mut QuicConnection,
+        frame_type: Option<u64>,
+    ) {
+        error!("Active connection ID limit exceeded, so closed the connection");
+        qconn.send_transport_connection_close_frame(
+            &[QuicLevel::Application],
+            u64::from(TransportErrorCode::ConnectionIdLimitError),
+            Some("Active connection ID limit exceeded".to_string()),
+            frame_type,
         );
     }
 
     pub(crate) fn send_frame_encoding_error_cc_frame(
         qconn: &mut QuicConnection,
         is_short_header: bool,
+        frame_type: Option<u64>,
     ) {
         error!(
             "An endpoint received a frame that was badly formatted here, so closed the connection \
@@ -231,7 +335,34 @@ impl TransportErrorCode {
             },
             u64::from(TransportErrorCode::FrameEncodingError),
             Some("An endpoint received a frame that was badly formatted".to_string()),
-            None,
+            frame_type,
+        );
+    }
+
+    pub(crate) fn send_transport_parameter_error_cc_frame(
+        qconn: &mut QuicConnection,
+        reason: String,
+        frame_type: Option<u64>,
+    ) {
+        error!("Transport parameter error: {}", reason);
+        qconn.send_transport_connection_close_frame(
+            &[QuicLevel::Initial, QuicLevel::Handshake],
+            u64::from(TransportErrorCode::TransportParameterError),
+            Some(reason),
+            frame_type,
+        );
+    }
+
+    pub(crate) fn send_crypto_buffer_exceeded_cc_frame(
+        qconn: &mut QuicConnection,
+        frame_type: Option<u64>,
+    ) {
+        error!("Crypto buffer exceeded, so closed the connection");
+        qconn.send_transport_connection_close_frame(
+            &[QuicLevel::Initial, QuicLevel::Handshake],
+            u64::from(TransportErrorCode::CryptoBufferExceeded),
+            Some("Crypto buffer exceeded".to_string()),
+            frame_type,
         );
     }
 }

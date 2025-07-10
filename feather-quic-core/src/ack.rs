@@ -67,7 +67,7 @@ impl Display for QuicAckGenerator {
             let largest = previous_smallest - r.gap - 2;
             let smallest = largest - r.ack_range_length;
             previous_smallest = smallest;
-            write!(f, "[{}, {}], ", smallest, largest)
+            write!(f, "[{smallest}, {largest}], ")
         })?;
         Ok(())
     }
@@ -588,8 +588,8 @@ mod tests {
         gen.update_ack(5, true, &now, QuicLevel::Application)
             .unwrap();
 
-        let display = format!("{}", gen);
-        println!("{}", display);
+        let display = format!("{gen}");
+        println!("{display}");
         assert!(display.contains("top_range Some(10)"));
         assert!(display.contains("[8, 8], [5, 5]"));
     }

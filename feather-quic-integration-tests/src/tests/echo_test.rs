@@ -581,6 +581,8 @@ mod tests {
             "echo",
             "-e",
             "feather-quic-integration-tests/src/tests/test_files/large_payload_input",
+            "--ssl-key-log",
+            "./my_quic.log",
         ];
 
         if use_io_uring {

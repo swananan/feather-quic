@@ -28,6 +28,7 @@ pub struct QuicConfig {
     server_name: String,
     alpn: String,
     trigger_key_update: Option<u64>,
+    stateless_reset_key: Option<[u8; 32]>,
 
     initial_max_data: Option<u64>,
     initial_max_stream_data_bidi_local: Option<u64>,
@@ -251,5 +252,13 @@ impl QuicConfig {
 
     pub(crate) fn get_mtu_discovery_network_type(&self) -> NetworkType {
         self.mtu_discovery_network_type.unwrap_or(NetworkType::IPv4)
+    }
+
+    pub fn set_stateless_reset_key(&mut self, key: [u8; 32]) {
+        self.stateless_reset_key = Some(key);
+    }
+
+    pub(crate) fn get_stateless_reset_key(&self) -> Option<&[u8; 32]> {
+        self.stateless_reset_key.as_ref()
     }
 }

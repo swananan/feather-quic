@@ -289,7 +289,7 @@ impl QuicStream {
 
         // Check stream-level flow control
         let available_bytes = match self.flow_control.get_sent_available_bytes() {
-            Err(e) => panic!("Due to QUIC stream {:?} {e}", self),
+            Err(e) => panic!("Due to QUIC stream {self:?} {e}"),
             Ok(0) => {
                 return Err(QuicStreamError::WouldBlock);
             }

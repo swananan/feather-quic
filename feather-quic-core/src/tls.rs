@@ -14,9 +14,10 @@ use crate::config::QuicConfig;
 use crate::connection::{QuicLevel, QUIC_STATELESS_RESET_TOKEN_SIZE};
 use crate::crypto::{hkdf_expand, QUIC_SHA256_SECRET_LENGTH, QUIC_SHA384_SECRET_LENGTH};
 use crate::error_code::TlsError;
+use crate::frame::QuicFrameType;
 use crate::transport_parameters::{
     create_client_transport_parameters, parse_server_transport_parameters,
-    search_transport_parameters, TransportParameter,
+    search_transport_parameters, PreferredAddress, TransportParameter,
 };
 use crate::utils::{remaining_bytes, write_cursor_bytes_with_pos};
 
@@ -265,6 +266,7 @@ impl FromTransportParam for u8 {
     fn from_param(param: &TransportParameter) -> Self {
         match param {
             TransportParameter::AckDelayExponent(v) => *v,
+            TransportParameter::ActiveConnectionIdLimit(v) => *v,
             _ => panic!("Unexpected transport parameter type"),
         }
     }
@@ -275,6 +277,35 @@ impl FromTransportParam for [u8; QUIC_STATELESS_RESET_TOKEN_SIZE as usize] {
         match param {
             TransportParameter::StatelessResetToken(v) => *v,
             _ => panic!("Unexpected transport parameter type"),
+        }
+    }
+}
+
+impl FromTransportParam for bool {
+    fn from_param(param: &TransportParameter) -> Self {
+        match param {
+            TransportParameter::DisableActiveMigration(v) => *v,
+            _ => panic!("Unexpected transport parameter type"),
+        }
+    }
+}
+
+impl FromTransportParam for PreferredAddress {
+    fn from_param(param: &TransportParameter) -> Self {
+        match param {
+            TransportParameter::PreferredAddress(v) => v.clone(),
+            _ => panic!("Unexpected transport parameter type"),
+        }
+    }
+}
+
+impl FromTransportParam for Vec<u8> {
+    fn from_param(param: &TransportParameter) -> Self {
+        match param {
+            TransportParameter::OriginalDestinationConnectionId(id) => id.clone(),
+            TransportParameter::InitialSourceConnectionId(id) => id.clone(),
+            TransportParameter::RetrySourceConnectionId(id) => id.clone(),
+            _ => panic!("Unexpected transport parameter type for Vec<u8>"),
         }
     }
 }
@@ -435,6 +466,36 @@ impl TlsContext {
     pub(crate) fn get_peer_stateless_reset_token(&self) -> Option<[u8; 16]> {
         self.get_peer_transport_param(|item| {
             matches!(item, TransportParameter::StatelessResetToken(_))
+        })
+    }
+
+    pub(crate) fn get_peer_disable_active_migration(&self) -> Option<bool> {
+        self.get_peer_transport_param(|item| {
+            matches!(item, TransportParameter::DisableActiveMigration(_))
+        })
+    }
+
+    pub(crate) fn get_peer_preferred_address(&self) -> Option<PreferredAddress> {
+        self.get_peer_transport_param(|item| {
+            matches!(item, TransportParameter::PreferredAddress(_))
+        })
+    }
+
+    pub(crate) fn get_peer_active_connection_id_limit(&self) -> Option<u8> {
+        self.get_peer_transport_param(|item| {
+            matches!(item, TransportParameter::ActiveConnectionIdLimit(_))
+        })
+    }
+
+    pub(crate) fn get_peer_original_destination_connection_id(&self) -> Option<Vec<u8>> {
+        self.get_peer_transport_param(|item| {
+            matches!(item, TransportParameter::OriginalDestinationConnectionId(_))
+        })
+    }
+
+    pub(crate) fn get_peer_retry_source_connection_id(&self) -> Option<Vec<u8>> {
+        self.get_peer_transport_param(|item| {
+            matches!(item, TransportParameter::RetrySourceConnectionId(_))
         })
     }
 
@@ -866,7 +927,7 @@ impl TlsContext {
             })?;
 
             let handshake_type = HandshakeType::from_u8(first_byte).ok_or_else(|| {
-                let msg = format!("Invalid TLS handshake type: 0x{:x}", first_byte);
+                let msg = format!("Invalid TLS handshake type: 0x{first_byte:x}");
                 warn!("TLS handshake error: {}", msg);
                 TlsHandshakeError::new(TlsError::UnexpectedMessage, anyhow!(msg))
             })?;
@@ -909,7 +970,7 @@ impl TlsContext {
                     );
                 }
                 _ => {
-                    let msg = format!("Unsupported handshake type: {:?}", handshake_type);
+                    let msg = format!("Unsupported handshake type: {handshake_type:?}");
                     warn!("TLS handshake error: {}", msg);
                     return Err(
                         TlsHandshakeError::new(TlsError::UnexpectedMessage, anyhow!(msg)).into(),
@@ -1012,21 +1073,21 @@ impl TlsContext {
                 .fold(
                     String::with_capacity(TLS_HANDSHAKE_RANDOM_SIZE * 2),
                     |mut acc, &byte| {
-                        acc.push_str(&format!("{:02x}", byte));
+                        acc.push_str(&format!("{byte:02x}"));
                         acc
                     },
                 );
             let cli_ap_str: String = client_ap_secret.iter().fold(
                 String::with_capacity(hash_size * 2),
                 |mut acc, &byte| {
-                    acc.push_str(&format!("{:02x}", byte));
+                    acc.push_str(&format!("{byte:02x}"));
                     acc
                 },
             );
             let ser_ap_str: String = server_ap_secret.iter().fold(
                 String::with_capacity(hash_size * 2),
                 |mut acc, &byte| {
-                    acc.push_str(&format!("{:02x}", byte));
+                    acc.push_str(&format!("{byte:02x}"));
                     acc
                 },
             );
@@ -1071,7 +1132,7 @@ impl TlsContext {
             .fold(
                 String::with_capacity(TLS_HANDSHAKE_RANDOM_SIZE * 2),
                 |mut acc, &byte| {
-                    acc.push_str(&format!("{:02x}", byte));
+                    acc.push_str(&format!("{byte:02x}"));
                     acc
                 },
             );
@@ -1080,7 +1141,7 @@ impl TlsContext {
         let cli_str: String =
             cs.iter()
                 .fold(String::with_capacity(cs_len * 2), |mut acc, &byte| {
-                    acc.push_str(&format!("{:02x}", byte));
+                    acc.push_str(&format!("{byte:02x}"));
                     acc
                 });
         let secret_label = format!("{}{}", TLS_CLIENT_TRAFFIC_SECRET, self.ssl_key_update_times);
@@ -1094,7 +1155,7 @@ impl TlsContext {
         let ser_str: String =
             ss.iter()
                 .fold(String::with_capacity(ss_len * 2), |mut acc, &byte| {
-                    acc.push_str(&format!("{:02x}", byte));
+                    acc.push_str(&format!("{byte:02x}"));
                     acc
                 });
         let secret_label = format!("{}{}", TLS_SERVER_TRAFFIC_SECRET, self.ssl_key_update_times);
@@ -1401,7 +1462,7 @@ impl TlsContext {
                         ));
                     }
                 }
-                _ => panic!("Unexpected extension in server hello: {:?}", ext_type),
+                _ => panic!("Unexpected extension in server hello: {ext_type:?}"),
             }
         }
 
@@ -1480,8 +1541,21 @@ impl TlsContext {
                 }
                 ExtensionType::QuicTransportParameters => {
                     let tp_len = cursor.read_u16::<BigEndian>()?;
-                    self.s_tp = Some(parse_server_transport_parameters(cursor, tp_len)?);
-                    trace!("Received server QUIC transport parameters {:?}", self.s_tp);
+                    match parse_server_transport_parameters(cursor, tp_len) {
+                        Ok(transport_params) => {
+                            self.s_tp = Some(transport_params);
+                            trace!("Received server QUIC transport parameters {:?}", self.s_tp);
+                        }
+                        Err(_e) => {
+                            // Convert anyhow error to QuicConnectionErrorCode
+                            let transport_param_error =
+                                crate::error_code::QuicConnectionErrorCode::create_transport_error_code(
+                                    u64::from(crate::error_code::TransportErrorCode::TransportParameterError),
+                                    Some(QuicFrameType::Crypto as u64), // CRYPTO frame type
+                                );
+                            return Err(anyhow::Error::from(transport_param_error));
+                        }
+                    }
                 }
                 ExtensionType::ServerName => {
                     // https://datatracker.ietf.org/doc/html/rfc6066#section-3
@@ -1505,10 +1579,7 @@ impl TlsContext {
                         panic!("Multiple server names are not supported");
                     }
                 }
-                _ => panic!(
-                    "Unexpected extension in encrypted extensions: {:?}",
-                    ext_type
-                ),
+                _ => panic!("Unexpected extension in encrypted extensions: {ext_type:?}"),
             }
         }
 
@@ -1726,21 +1797,21 @@ impl TlsContext {
                 .fold(
                     String::with_capacity(TLS_HANDSHAKE_RANDOM_SIZE * 2),
                     |mut acc, &byte| {
-                        acc.push_str(&format!("{:02x}", byte));
+                        acc.push_str(&format!("{byte:02x}"));
                         acc
                     },
                 );
             let cli_hs_str: String = client_hs_secret.iter().fold(
                 String::with_capacity(hash_size * 2),
                 |mut acc, &byte| {
-                    acc.push_str(&format!("{:02x}", byte));
+                    acc.push_str(&format!("{byte:02x}"));
                     acc
                 },
             );
             let ser_hs_str: String = server_hs_secret.iter().fold(
                 String::with_capacity(hash_size * 2),
                 |mut acc, &byte| {
-                    acc.push_str(&format!("{:02x}", byte));
+                    acc.push_str(&format!("{byte:02x}"));
                     acc
                 },
             );

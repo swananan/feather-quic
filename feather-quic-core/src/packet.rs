@@ -8,7 +8,8 @@ use crate::connection::{QuicConnection, QuicLevel};
 use crate::crypto::{
     DecryptKeyMode, QuicCrypto, QUIC_PN_OFFSET, QUIC_SAMPLE_LENGTH, QUIC_TAG_LENGTH,
 };
-use crate::error_code::{TlsError, TransportErrorCode};
+use crate::error_code;
+
 use crate::frame::QuicFrame;
 use crate::tls::TLS_AES_128_GCM_SHA256;
 use crate::utils::{
@@ -150,8 +151,8 @@ impl QuicPacket<'_> {
             &qconn.org_dcid
         } else {
             qconn
-                .dcid
-                .as_ref()
+                .migration
+                .get_current_connection_id()
                 .ok_or_else(|| anyhow!("Must have dcid here"))?
         };
 
@@ -379,14 +380,14 @@ impl QuicPacket<'_> {
         cursor.write_u32::<BigEndian>(QUIC_VERSION)?;
 
         /* prepare dcid and scid */
-        let dcid = if qconn.dcid.is_none() {
-            &qconn.org_dcid
+        let dcid = if let Some(current_dcid) = qconn.migration.get_current_dcid() {
+            current_dcid
         } else {
-            qconn.dcid.as_ref().unwrap()
+            qconn.org_dcid.clone()
         };
         let dcid_len = dcid.len();
         cursor.write_u8(dcid_len as u8)?;
-        cursor.write_all(dcid)?;
+        cursor.write_all(&dcid)?;
 
         let scid_len = qconn.scid.len();
         cursor.write_u8(scid_len as u8)?;
@@ -649,8 +650,8 @@ impl QuicPacket<'_> {
 
         /* prepare dcid and scid */
         let dcid = qconn
-            .dcid
-            .as_ref()
+            .migration
+            .get_current_connection_id()
             .ok_or_else(|| anyhow!("Should have dcid here, when creating handshake packet"))?;
         cursor.write_all(dcid)?;
 
@@ -707,7 +708,11 @@ impl QuicPacket<'_> {
             if frame.get_send_time().is_none() {
                 frame.set_send_time(qconn.current_ts);
             }
-            qconn.app_send.insert_sent_queue_back(frame);
+
+            if !frame.is_path_challenge_frame() {
+                qconn.app_send.insert_sent_queue_back(frame);
+            }
+
             frame_sent_cnt += 1;
             if frame_count > 0 && frame_sent_cnt >= frame_count {
                 break;
@@ -860,8 +865,8 @@ impl QuicPacket<'_> {
 
         /* prepare dcid and scid */
         let dcid = qconn
-            .dcid
-            .as_ref()
+            .migration
+            .get_current_connection_id()
             .ok_or_else(|| anyhow!("Should have dcid here, when creating handshake packet"))?;
         let dcid_len = dcid.len();
         cursor.write_u8(dcid_len as u8)?;
@@ -1031,7 +1036,7 @@ impl QuicPacket<'_> {
     pub(crate) fn handle_quic_packet(
         rcvbuf: &[u8],
         qconn: &mut QuicConnection,
-        source_addr: &SocketAddr,
+        remote_addr: &SocketAddr,
     ) -> Result<()> {
         // We could have multiple QUIC packet in only one UDP datagram
         let mut offset = 0;
@@ -1043,21 +1048,30 @@ impl QuicPacket<'_> {
                 flag
             );
             let handler_result = if is_long_header(flag) {
-                Self::handle_long_header_packet(&rcvbuf[offset..], qconn, source_addr)
+                Self::handle_long_header_packet(&rcvbuf[offset..], qconn, remote_addr)
             } else {
                 // Short header packet can be coalesced with the other long header packets,
                 // but short header packet must be the last one
-                Self::handle_short_header_packet(&rcvbuf[offset..], qconn, source_addr, offset == 0)
+                Self::handle_short_header_packet(&rcvbuf[offset..], qconn, remote_addr, offset == 0)
             };
 
             let packet_size = match handler_result {
                 Ok(ps) => ps as usize,
                 Err(e) => {
                     error!("Handle packet failure, due to {}", e);
-                    TransportErrorCode::send_frame_encoding_error_cc_frame(
-                        qconn,
-                        !is_long_header(flag),
-                    );
+
+                    // Try to extract QuicConnectionErrorCode from error, use default frame encoding error if not found
+                    let connection_error = if let Some(code) =
+                        e.downcast_ref::<error_code::QuicConnectionErrorCode>()
+                    {
+                        *code
+                    } else {
+                        error_code::QuicConnectionErrorCode::create_transport_error_code(
+                            u64::from(error_code::TransportErrorCode::FrameEncodingError),
+                            None,
+                        )
+                    };
+                    connection_error.send_connection_close_frame(qconn, !is_long_header(flag));
                     qconn.close_helper();
                     rcvbuf.len() - offset
                 }
@@ -1096,10 +1110,10 @@ impl QuicPacket<'_> {
     fn handle_long_header_packet(
         rcvbuf: &[u8],
         qconn: &mut QuicConnection,
-        source_addr: &SocketAddr,
+        remote_addr: &SocketAddr,
     ) -> Result<u16> {
         if let Some((pkt, consumed_size)) =
-            Self::handle_long_header_packet_helper(rcvbuf, qconn, source_addr)?
+            Self::handle_long_header_packet_helper(rcvbuf, qconn, remote_addr)?
         {
             let pkt = QuicPacket::LongHeader(pkt);
 
@@ -1176,19 +1190,19 @@ impl QuicPacket<'_> {
     fn handle_short_header_packet(
         rcvbuf: &[u8],
         qconn: &mut QuicConnection,
-        source_addr: &SocketAddr,
+        remote_addr: &SocketAddr,
         first_packet: bool,
     ) -> Result<u16> {
         let span = span!(
             Level::TRACE,
             "handle_short_header_packet",
             packet_len = ?rcvbuf.len(),
-            scid = ?qconn.scid.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""),
+            scid = ?qconn.scid.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<String>>().join(""),
         );
         let _enter = span.enter();
 
         if let Some(consumed_size) =
-            Self::handle_short_header_packet_helper(rcvbuf, qconn, source_addr)?
+            Self::handle_short_header_packet_helper(rcvbuf, qconn, remote_addr)?
         {
             qconn.update_idle_timeout_threshold();
             Ok(consumed_size)
@@ -1203,7 +1217,7 @@ impl QuicPacket<'_> {
     fn handle_short_header_packet_helper(
         rcvbuf: &[u8],
         qconn: &mut QuicConnection,
-        source_addr: &SocketAddr,
+        remote_addr: &SocketAddr,
     ) -> Result<Option<u16>> {
         //  https://www.rfc-editor.org/rfc/rfc9000.html#section-17.3
         //  1-RTT Packet {
@@ -1230,12 +1244,12 @@ impl QuicPacket<'_> {
         let mut cursor = Cursor::new(rcvbuf);
         let flag = read_or_none!(cursor.read_u8());
 
-        // TODO: assume all the scid share the same length
+        // All the scid share the same length
         let dcid_len = qconn.scid.len();
         let mut dcid = vec![0u8; dcid_len];
         read_or_none!(cursor.read_exact(&mut dcid));
 
-        if !qconn.check_dcid(&dcid) {
+        if !qconn.check_peer_dcid(&dcid) {
             trace!(
                 "Got invalid QUIC short header packet, wrong packet dcid {:?}, expected {:?}",
                 dcid,
@@ -1320,9 +1334,13 @@ impl QuicPacket<'_> {
                 key_phase, qconn.key_phase,
             );
             if qconn.app_send.largest_acked.is_none() {
-                TransportErrorCode::send_key_update_error_cc_frame(qconn);
-                qconn.close_helper();
-                return Ok(None);
+                // Create key update error and throw it
+                let connection_error =
+                    error_code::QuicConnectionErrorCode::create_transport_error_code(
+                        u64::from(error_code::TransportErrorCode::KeyUpdateError),
+                        None, // No specific frame type for key update error
+                    );
+                return Err(anyhow::Error::from(connection_error));
             }
             if qconn.crypto.is_last_key_available() {
                 vec![DecryptKeyMode::Last, DecryptKeyMode::Next]
@@ -1334,7 +1352,7 @@ impl QuicPacket<'_> {
         };
 
         for m in key_modes.iter() {
-            span.record("current_key_mode", format!("{:?}", m));
+            span.record("current_key_mode", format!("{m:?}"));
 
             match qconn.crypto.decrypt_packet(
                 QuicLevel::Application,
@@ -1372,7 +1390,7 @@ impl QuicPacket<'_> {
                     }
 
                     let spkt = QuicShortHeaderPacket {
-                        from: *source_addr,
+                        from: *remote_addr,
                         flag: unprotected_flag,
                         pn: real_pn,
                         dcid,
@@ -1409,7 +1427,7 @@ impl QuicPacket<'_> {
     pub(crate) fn handle_long_header_packet_helper<'b>(
         rcvbuf: &'b [u8],
         qconn: &mut QuicConnection,
-        source_addr: &SocketAddr,
+        remote_addr: &SocketAddr,
     ) -> Result<Option<(QuicLongHeaderPacket<'b>, u16)>> {
         // https://datatracker.ietf.org/doc/html/rfc9000#section-17.2.2
         // An Initial packet uses long headers with a type value of 0x00.
@@ -1470,7 +1488,7 @@ impl QuicPacket<'_> {
             }
         };
 
-        span.record("header_type", format!("{:?}", header_type));
+        span.record("header_type", format!("{header_type:?}"));
 
         let level = match header_type {
             LongHeaderType::Initial => QuicLevel::Initial,
@@ -1483,7 +1501,7 @@ impl QuicPacket<'_> {
             }
         };
 
-        span.record("level", format!("{:?}", level));
+        span.record("level", format!("{level:?}"));
 
         if !qconn.crypto.is_key_available(level) {
             warn!(
@@ -1518,18 +1536,7 @@ impl QuicPacket<'_> {
         let mut scid = vec![0u8; scid_len as usize];
         read_or_none!(cursor.read_exact(&mut scid));
 
-        if qconn.dcid.is_some() && qconn.retry_token.is_none() {
-            // After retry verification, server will change the scid usually
-            if !qconn.check_scid(&scid) {
-                warn!(
-                    "Invalid QUIC connection id in {:?}, bad scid {:x?}",
-                    level, scid
-                );
-                return Ok(None);
-            }
-        }
-
-        if !qconn.check_dcid(&dcid) {
+        if !qconn.check_peer_dcid(&dcid) {
             trace!(
                 "Invalid QUIC connection id in {:?}, bad dcid {:x?}",
                 level,
@@ -1549,14 +1556,17 @@ impl QuicPacket<'_> {
             return Ok(None);
         }
 
-        if qconn.dcid.is_none() || qconn.retry_token.is_some() {
+        if qconn.migration.get_current_dcid().is_none() || qconn.retry_token.is_some() {
             info!(
                 "Switched to dcid {:x?}, is retry {}",
                 &scid,
                 qconn.retry_token.is_some()
             );
-            qconn.add_peer_connection_id(&scid);
-            qconn.dcid = Some(scid.clone());
+            // Set the first connection ID with sequence number 0 during handshake
+            // Update the first path's dcid when receiving first peer packet
+            if let Err(e) = qconn.migration.set_current_connection_id(scid.clone()) {
+                warn!("Failed to set current dcid: {}", e);
+            }
             qconn.retry_token = None;
         }
 
@@ -1630,6 +1640,7 @@ impl QuicPacket<'_> {
                 }
                 Ok(true) => {
                     qconn.retry_token = Some(retry_token.to_vec());
+                    qconn.retry_source_connection_id = Some(scid.clone());
                     trace!("Got correct retry token, will send initial packet again");
                     Self::start_tls_handshake(qconn, true)?;
 
@@ -1637,11 +1648,11 @@ impl QuicPacket<'_> {
                 }
                 Err(e) => {
                     warn!(
-                        "Retry packet tag validation failed: {}, discarding this packet, add size {} {:x?}",
-                        e,
-                        add.len(),
-                        add,
-                    );
+                            "Retry packet tag validation failed: {}, discarding this packet, add size {} {:x?}",
+                            e,
+                            add.len(),
+                            add,
+                        );
                     return Ok(None);
                 }
             }
@@ -1770,12 +1781,13 @@ impl QuicPacket<'_> {
             Err(e) => {
                 error!("Failed to decrypt the long header packet, due to {e}");
                 if matches!(level, QuicLevel::Handshake) {
-                    TransportErrorCode::send_crypto_error_cc_frame(
-                        qconn,
-                        TlsError::DecryptError,
-                        vec![level],
-                    );
-                    qconn.close_helper();
+                    // Create crypto error and throw it
+                    let connection_error =
+                        error_code::QuicConnectionErrorCode::create_transport_error_code(
+                            error_code::TlsError::DecryptError.to_quic_error_code(),
+                            None, // No specific frame type for packet decryption error
+                        );
+                    return Err(anyhow::Error::from(connection_error));
                 }
                 return Ok(None);
             }
@@ -1797,7 +1809,7 @@ impl QuicPacket<'_> {
         let lpkt = QuicLongHeaderPacket {
             packet_type: header_type,
             level,
-            from: *source_addr,
+            from: *remote_addr,
             flag: unprotected_flag,
             pn: Some(real_pn),
             dcid,

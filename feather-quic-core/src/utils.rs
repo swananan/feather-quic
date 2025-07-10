@@ -147,9 +147,9 @@ pub(crate) fn format_instant(instant: Instant, current_ts: Instant) -> String {
 
     let ms = duration.as_secs_f64() * 1000.0;
     if instant > current_ts {
-        format!("+{:.3}ms", ms)
+        format!("+{ms:.3}ms")
     } else {
-        format!("-{:.3}ms", ms)
+        format!("-{ms:.3}ms")
     }
 }
 

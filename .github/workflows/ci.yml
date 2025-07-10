@@ -10,12 +10,9 @@ on:
 
 jobs:
   test:
-    name: Run Miri and Clippy
+    name: Run Clippy and Integration Tests
     runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        rust: [stable, nightly]
+    timeout-minutes: 20
 
     steps:
       # Step 1: Checkout code
@@ -27,34 +24,56 @@ jobs:
         uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: ${{ matrix.rust }}
+          toolchain: stable
           override: true
 
-      # Step 3: Install Miri for nightly
+      # Step 3: Install Clippy
+      - name: Install Clippy
+        run: rustup component add clippy
+
+      # Step 4: Run Clippy (Lint checks)
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # Step 5: Run Integration Tests
+      - name: Run Integration Tests
+        run: PRINT_TO_STDOUT=1 cargo test -p feather-quic-integration-tests -- --test-threads=1
+
+  miri:
+    name: Run Miri Memory Safety Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Only run on main branch and PRs to main
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+
+    steps:
+      # Step 1: Checkout code
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Step 2: Set up Rust nightly toolchain
+      - name: Set up Rust nightly toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: nightly
+          override: true
+
+      # Step 3: Install Miri
       - name: Install Miri
-        if: matrix.rust == 'nightly'
         run: |
           rustup component add miri
           rustup component add rust-src
 
-      # Step 4: Install Clippy for stable
-      - name: Install Clippy
-        if: matrix.rust == 'stable'
-        run: rustup component add clippy
+      # Step 4: Setup Miri
+      - name: Setup Miri
+        run: cargo miri setup
 
-      # Step 5: Run Clippy (Lint checks)
-      - name: Run Clippy
-        if: matrix.rust == 'stable'
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      # Step 5: Run Clippy (Lint checks)
-      - name: Run Intergration Tests
-        if: matrix.rust == 'stable'
-        run: PRINT_TO_STDOUT=1 cargo test -p feather-quic-integration-tests -- --test-threads=1
-
-      # Step 7: Run Miri (Test memory safety)
-      - name: Run Miri
-        if: matrix.rust == 'nightly'
+      # Step 5: Run Miri tests with optimizations
+      - name: Run Miri Tests
         run: |
-          cargo miri setup
-          cargo miri test -p feather-quic-core
+          # Run core tests with reduced parallelism and timeout
+          cargo miri test -p feather-quic-core --no-default-features -- --test-threads=1
+          
+          # Run doc tests separately with timeout
+          timeout 300 cargo miri test -p feather-quic-core --doc --no-default-features

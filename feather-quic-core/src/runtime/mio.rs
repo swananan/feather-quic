@@ -1,4 +1,4 @@
-use crate::runtime::QuicUserContext;
+use crate::runtime::{socket_utils, QuicUserContext};
 use crate::QuicCallbacks;
 use crate::QuicConnection;
 use anyhow::{Context, Result};
@@ -10,7 +10,7 @@ use rand::Rng;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tracing::{info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 pub struct MioEventLoop {
     sent_cnt: u64,
@@ -33,6 +33,10 @@ pub struct MioEventLoop {
 }
 
 impl MioEventLoop {
+    const UDP_SOCKET: Token = Token(0);
+    #[cfg(target_os = "linux")]
+    const QUIC_TIMER_TOKEN: Token = Token(1);
+
     pub fn new(
         target_address: SocketAddr,
         max_quic_packet_send_count: Option<u64>,
@@ -118,10 +122,6 @@ impl MioEventLoop {
         let std_socket = std::net::UdpSocket::bind("0.0.0.0:0".parse::<SocketAddr>()?)
             .with_context(|| "Failed to bind random address".to_string())?;
 
-        std_socket
-            .connect(self.target_address)
-            .with_context(|| format!("Failed to connect target {:?}", self.target_address))?;
-
         let max_udp_payload_size =
             super::socket_utils::get_max_udp_payload_size_from_device_mtu(&std_socket);
 
@@ -135,6 +135,43 @@ impl MioEventLoop {
         let client_socket = UdpSocket::from_std(std_socket);
 
         Ok((client_socket, max_udp_payload_size))
+    }
+
+    fn socket_recv_with_error_handling(
+        &mut self,
+        client_socket: &mut UdpSocket,
+        buffer: &mut [u8],
+    ) -> Result<Option<(usize, SocketAddr)>> {
+        match client_socket.recv_from(buffer) {
+            Ok((packet_size, remote_addr)) => {
+                trace!("Received {} bytes from {}", packet_size, remote_addr);
+                Ok(Some((packet_size, remote_addr)))
+            }
+            Err(err) => match socket_utils::handle_socket_recv_error(&err) {
+                Ok(()) => Ok(None),
+                Err(e) => Err(e),
+            },
+        }
+    }
+
+    fn socket_send_with_error_handling(
+        &mut self,
+        client_socket: &mut UdpSocket,
+        snd_buf: &[u8],
+    ) -> Result<()> {
+        match self.socket_send(client_socket, snd_buf) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(io_error) = e.downcast_ref::<std::io::Error>() {
+                    socket_utils::handle_socket_send_error(
+                        io_error,
+                        &self.target_address,
+                        Some(snd_buf.len()),
+                    )?;
+                }
+                Err(e)
+            }
+        }
     }
 
     fn socket_send(&mut self, client_socket: &mut UdpSocket, snd_buf: &[u8]) -> Result<()> {
@@ -164,15 +201,16 @@ impl MioEventLoop {
 
             if !self.tx_reorder_queue.is_empty() && self.rng.gen::<f32>() < 0.5 {
                 if let Some(delayed_packet) = self.tx_reorder_queue.pop_front() {
-                    client_socket.send(&delayed_packet)?;
+                    client_socket.send_to(&delayed_packet, self.target_address)?;
                     trace!(
-                        "Sending reordered TX packet - {} bytes",
-                        delayed_packet.len()
+                        "Sending reordered TX packet - {} bytes to {}",
+                        delayed_packet.len(),
+                        self.target_address
                     );
                 }
             }
         } else {
-            client_socket.send(snd_buf)?;
+            client_socket.send_to(snd_buf, self.target_address)?;
             trace!("Sending {} bytes to {}", snd_buf.len(), self.target_address);
         }
 
@@ -184,7 +222,7 @@ impl MioEventLoop {
         &mut self,
         qconn: &mut QuicConnection,
         packet_data: &[u8],
-        source_addr: SocketAddr,
+        remote_addr: SocketAddr,
     ) -> Result<()> {
         if self.should_drop_rx_packet(packet_data.len()) {
             trace!(
@@ -200,7 +238,7 @@ impl MioEventLoop {
                 packet_data.len()
             );
             self.rx_reorder_queue
-                .push_back((packet_data.to_vec(), source_addr));
+                .push_back((packet_data.to_vec(), remote_addr));
 
             if !self.rx_reorder_queue.is_empty() && self.rng.gen::<f32>() < 0.5 {
                 if let Some((delayed_packet, addr)) = self.rx_reorder_queue.pop_front() {
@@ -212,11 +250,11 @@ impl MioEventLoop {
                 }
             }
         } else {
-            qconn.provide_data(packet_data, source_addr)?;
+            qconn.provide_data(packet_data, remote_addr)?;
             trace!(
                 "Processing {} bytes from {}",
                 packet_data.len(),
-                source_addr
+                remote_addr
             );
         }
 
@@ -225,16 +263,15 @@ impl MioEventLoop {
 
     fn flush_tx_reorder_queue(&mut self, client_socket: &mut UdpSocket) -> Result<()> {
         while let Some(packet) = self.tx_reorder_queue.pop_front() {
-            client_socket.send(&packet)?;
+            self.socket_send_with_error_handling(client_socket, &packet)?;
             trace!("Flushing reordered TX packet - {} bytes", packet.len());
         }
         Ok(())
     }
 
     fn flush_rx_reorder_queue(&mut self, qconn: &mut QuicConnection) -> Result<()> {
-        while let Some((packet, addr)) = self.rx_reorder_queue.pop_front() {
-            qconn.provide_data(&packet, addr)?;
-            trace!("Flushing reordered RX packet - {} bytes", packet.len());
+        while let Some((packet_data, remote_addr)) = self.rx_reorder_queue.pop_front() {
+            self.handle_received_packet(qconn, &packet_data, remote_addr)?;
         }
         Ok(())
     }
@@ -247,10 +284,6 @@ impl MioEventLoop {
     where
         T: QuicCallbacks,
     {
-        const UDP_SOCKET: Token = Token(0);
-        #[cfg(target_os = "linux")]
-        const QUIC_TIMER_TOKEN: Token = Token(1);
-
         let mut poll = Poll::new()?;
         let mut events = Events::with_capacity(5);
 
@@ -267,10 +300,7 @@ impl MioEventLoop {
         let (mut client_socket, max_udp_payload_size) = self.create_client_socket()?;
 
         let local_addr = client_socket.local_addr().with_context(|| {
-            format!(
-                "Failed to get local address from Mio socket {:?}",
-                client_socket
-            )
+            format!("Failed to get local address from Mio socket {client_socket:?}",)
         })?;
         let _span = tracing::span!(
             tracing::Level::TRACE,
@@ -281,24 +311,29 @@ impl MioEventLoop {
         .entered();
 
         poll.registry()
-            .register(&mut client_socket, UDP_SOCKET, Interest::READABLE)?;
+            .register(&mut client_socket, Self::UDP_SOCKET, Interest::READABLE)?;
 
         #[cfg(target_os = "linux")]
         {
             if let Some(ref mut timer) = self.quic_timer {
                 poll.registry()
-                    .register(timer, QUIC_TIMER_TOKEN, Interest::READABLE)?;
+                    .register(timer, Self::QUIC_TIMER_TOKEN, Interest::READABLE)?;
             }
         }
 
         qconn.connect(max_udp_payload_size)?;
-        let udp_sndbuf = qconn
+        let (udp_sndbuf, target_addr) = qconn
             .consume_data()
             .expect("Should have first initial QUIC packet");
-        self.socket_send(&mut client_socket, &udp_sndbuf)?;
+
+        // Update target address from QUIC path management
+        self.target_address = target_addr;
+
+        self.socket_send_with_error_handling(&mut client_socket, &udp_sndbuf)?;
         info!(
-            "Initiating QUIC handshake, first UDP Datagram size {}",
-            udp_sndbuf.len()
+            "Initiating QUIC handshake, first UDP Datagram size {}, target: {}",
+            udp_sndbuf.len(),
+            target_addr
         );
 
         #[cfg(target_os = "linux")]
@@ -350,14 +385,18 @@ impl MioEventLoop {
                         qconn.run_timer()?;
                     }
 
-                    while let Some(send_buf) = qconn.consume_data() {
-                        self.socket_send(&mut client_socket, &send_buf)?;
+                    while let Some((send_buf, target_addr)) = qconn.consume_data() {
+                        // Update target address if it has changed
+                        self.target_address = target_addr;
+                        self.socket_send_with_error_handling(&mut client_socket, &send_buf)?;
                     }
 
                     if let Some(timeout) = qconn.next_time() {
-                        self.next_timeout = Some(Duration::from_micros(timeout));
-                    } else {
-                        self.next_timeout = None;
+                        self.next_timeout = if timeout != u64::MAX {
+                            Some(Duration::from_micros(timeout))
+                        } else {
+                            None
+                        }
                     }
 
                     if qconn.is_closed() {
@@ -370,34 +409,31 @@ impl MioEventLoop {
 
             for event in events.iter() {
                 match event.token() {
-                    UDP_SOCKET => {
+                    Self::UDP_SOCKET => {
                         loop {
                             // TODO: Consider processing ICMP packets to optimize MTU discovery:
                             // 1. ICMP "Packet Too Big" messages can provide immediate feedback about path MTU
                             // 2. This could accelerate MTU discovery by avoiding unnecessary probe attempts
                             // 3. May improve connection performance by finding optimal MTU faster
-                            match client_socket.recv_from(&mut udp_rcvbuf) {
-                                Ok((packet_size, source_addr)) => {
-                                    trace!("Received {} bytes from {}", packet_size, source_addr);
+                            match self.socket_recv_with_error_handling(
+                                &mut client_socket,
+                                &mut udp_rcvbuf,
+                            ) {
+                                Ok(Some((packet_size, remote_addr))) => {
                                     self.handle_received_packet(
                                         qconn,
                                         &udp_rcvbuf[..packet_size],
-                                        source_addr,
+                                        remote_addr,
                                     )?;
                                 }
-                                Err(err)
-                                    if err.kind() == std::io::ErrorKind::WouldBlock
-                                        || err.kind() == std::io::ErrorKind::Interrupted =>
-                                {
+                                Ok(None) => {
+                                    // No data available or recoverable error occurred
                                     break;
                                 }
                                 Err(err) => {
-                                    // TODO: Handle QUIC connection migration (when UDP 4-tuple changes)
-                                    return Err(anyhow::anyhow!("Socket read failed: {}", err)
-                                        .context(format!(
-                                            "Error while reading from {:?}",
-                                            client_socket
-                                        )));
+                                    // Critical error that requires terminating the connection
+                                    error!("Critical UDP receive error: {}", err);
+                                    return Err(err);
                                 }
                             }
                         }
@@ -407,8 +443,17 @@ impl MioEventLoop {
                             qconn.run_timer()?;
                         }
 
-                        while let Some(send_buf) = qconn.consume_data() {
-                            self.socket_send(&mut client_socket, &send_buf)?;
+                        while let Some((send_buf, target_addr)) = qconn.consume_data() {
+                            // Update target address if it has changed (migration happens automatically)
+                            if target_addr != self.target_address {
+                                info!(
+                                    "Connection migration detected: {} -> {}",
+                                    self.target_address, target_addr
+                                );
+                                self.target_address = target_addr;
+                            }
+
+                            self.socket_send_with_error_handling(&mut client_socket, &send_buf)?;
                         }
 
                         #[cfg(target_os = "linux")]
@@ -445,7 +490,7 @@ impl MioEventLoop {
                         }
                     }
                     #[cfg(target_os = "linux")]
-                    QUIC_TIMER_TOKEN => {
+                    Self::QUIC_TIMER_TOKEN => {
                         if let Some(ref mut timer) = self.quic_timer {
                             if let Ok(real_timeout) = timer.read() {
                                 trace!("Timer event triggered {} times!", real_timeout);
@@ -455,8 +500,13 @@ impl MioEventLoop {
                                     qconn.run_timer()?;
                                 }
 
-                                while let Some(send_buf) = qconn.consume_data() {
-                                    self.socket_send(&mut client_socket, &send_buf)?;
+                                while let Some((send_buf, target_addr)) = qconn.consume_data() {
+                                    // Update target address if it has changed
+                                    self.target_address = target_addr;
+                                    self.socket_send_with_error_handling(
+                                        &mut client_socket,
+                                        &send_buf,
+                                    )?;
                                 }
                                 if !self.tx_reorder_queue.is_empty() {
                                     self.flush_tx_reorder_queue(&mut client_socket)?;
