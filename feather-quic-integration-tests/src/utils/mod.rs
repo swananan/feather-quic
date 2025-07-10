@@ -189,7 +189,7 @@ impl TestEnvironment {
             if self.print_to_stdout {
                 let log_content = fs::read_to_string(self.server_log_file.path())?;
                 println!("=== Server Logs ===");
-                println!("{}", log_content);
+                println!("{log_content}");
                 println!("==================");
             } else {
                 let persist_path = self.workspace_root.join(format!(
@@ -300,7 +300,7 @@ impl TestEnvironment {
             // Print logs to stdout if requested
             if self.print_to_stdout {
                 println!("=== Client Logs ===");
-                println!("{}", log_content);
+                println!("{log_content}");
                 println!("==================");
             } else {
                 let persist_path = self.workspace_root.join(format!(

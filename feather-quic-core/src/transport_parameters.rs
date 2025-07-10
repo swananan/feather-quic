@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Result};
-use byteorder::{BigEndian, WriteBytesExt};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::fmt;
 use std::io::{Cursor, Read, Seek, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
+
 use tracing::{info, trace, warn};
 
 use crate::config::QuicConfig;
@@ -12,6 +13,33 @@ use crate::utils::{decode_variable_length, encode_variable_length, get_variable_
 
 pub const MAX_UDP_PAYLOAD_SIZE: u16 = 65527;
 pub const MIN_UDP_PAYLOAD_SIZE: u16 = 1200;
+
+// Validate according to RFC 9000: active_connection_id_limit must be at least 2
+// https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.30.1
+pub const MIN_ACTIVE_CONNECTION_ID_LIMIT: u8 = 2;
+
+// Transport Parameter Type IDs as defined in RFC 9000 Section 18.2
+pub(crate) mod transport_param_type {
+    pub const ORIGINAL_DESTINATION_CONNECTION_ID: u64 = 0x00;
+    pub const MAX_IDLE_TIMEOUT: u64 = 0x01;
+    pub const STATELESS_RESET_TOKEN: u64 = 0x02;
+    pub const MAX_UDP_PAYLOAD_SIZE: u64 = 0x03;
+    pub const INITIAL_MAX_DATA: u64 = 0x04;
+    pub const INITIAL_MAX_STREAM_DATA_BIDI_LOCAL: u64 = 0x05;
+    pub const INITIAL_MAX_STREAM_DATA_BIDI_REMOTE: u64 = 0x06;
+    pub const INITIAL_MAX_STREAM_DATA_UNI: u64 = 0x07;
+    pub const INITIAL_MAX_STREAMS_BIDI: u64 = 0x08;
+    pub const INITIAL_MAX_STREAMS_UNI: u64 = 0x09;
+    pub const ACK_DELAY_EXPONENT: u64 = 0x0A;
+    pub const MAX_ACK_DELAY: u64 = 0x0B;
+    pub const DISABLE_ACTIVE_MIGRATION: u64 = 0x0C;
+    pub const PREFERRED_ADDRESS: u64 = 0x0D;
+    pub const ACTIVE_CONNECTION_ID_LIMIT: u64 = 0x0E;
+    pub const INITIAL_SOURCE_CONNECTION_ID: u64 = 0x0F;
+    pub const RETRY_SOURCE_CONNECTION_ID: u64 = 0x10;
+    pub const GREASE_QUIC_BIT: u64 = 0x2ab2;
+    pub const GREASE: u64 = 0x33afd753a0b2efbb;
+}
 
 #[allow(dead_code)]
 // https://www.rfc-editor.org/rfc/rfc9000.html#section-18
@@ -75,8 +103,7 @@ pub(crate) enum TransportParameter {
     RetrySourceConnectionId(Vec<u8>),
 }
 
-#[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PreferredAddress {
     ipv4_address: Ipv4Addr,
     ipv4_port: u16,
@@ -92,14 +119,14 @@ impl fmt::Debug for TransportParameter {
         match self {
             TransportParameter::OriginalDestinationConnectionId(v) => f
                 .debug_tuple("OriginalDestinationConnectionId")
-                .field(&format_args!("{:02x?}", v))
+                .field(&format_args!("{v:02x?}"))
                 .finish(),
             TransportParameter::MaxIdleTimeout(v) => {
                 f.debug_tuple("MaxIdleTimeout").field(v).finish()
             }
             TransportParameter::StatelessResetToken(v) => f
                 .debug_tuple("StatelessResetToken")
-                .field(&format_args!("{:02x?}", v))
+                .field(&format_args!("{v:02x?}"))
                 .finish(),
             TransportParameter::MaxUdpPayloadSize(v) => {
                 f.debug_tuple("MaxUdpPayloadSize").field(v).finish()
@@ -133,43 +160,65 @@ impl fmt::Debug for TransportParameter {
             }
             TransportParameter::PreferredAddress(v) => f
                 .debug_tuple("PreferredAddress")
-                .field(&format_args!("{:02x?}", v))
+                .field(&format_args!("{v:?}"))
                 .finish(),
             TransportParameter::ActiveConnectionIdLimit(v) => {
                 f.debug_tuple("ActiveConnectionIdLimit").field(v).finish()
             }
             TransportParameter::InitialSourceConnectionId(v) => f
                 .debug_tuple("InitialSourceConnectionId")
-                .field(&format_args!("{:02x?}", v))
+                .field(&format_args!("{v:02x?}"))
                 .finish(),
             TransportParameter::RetrySourceConnectionId(v) => f
                 .debug_tuple("RetrySourceConnectionId")
-                .field(&format_args!("{:02x?}", v))
+                .field(&format_args!("{v:02x?}"))
                 .finish(),
         }
     }
 }
 
 impl TransportParameter {
-    fn type_id(&self) -> u8 {
+    fn type_id(&self) -> u64 {
         match self {
-            TransportParameter::OriginalDestinationConnectionId(_) => 0x00,
-            TransportParameter::MaxIdleTimeout(_) => 0x01,
-            TransportParameter::StatelessResetToken(_) => 0x02,
-            TransportParameter::MaxUdpPayloadSize(_) => 0x03,
-            TransportParameter::InitialMaxData(_) => 0x04,
-            TransportParameter::InitialMaxStreamDataBidiLocal(_) => 0x05,
-            TransportParameter::InitialMaxStreamDataBidiRemote(_) => 0x06,
-            TransportParameter::InitialMaxStreamDataUni(_) => 0x07,
-            TransportParameter::InitialMaxStreamsBidi(_) => 0x08,
-            TransportParameter::InitialMaxStreamsUni(_) => 0x09,
-            TransportParameter::AckDelayExponent(_) => 0x0A,
-            TransportParameter::MaxAckDelay(_) => 0x0B,
-            TransportParameter::DisableActiveMigration(_) => 0x0C,
-            TransportParameter::PreferredAddress(_) => 0x0D,
-            TransportParameter::ActiveConnectionIdLimit(_) => 0x0E,
-            TransportParameter::InitialSourceConnectionId(_) => 0x0F,
-            TransportParameter::RetrySourceConnectionId(_) => 0x10,
+            TransportParameter::OriginalDestinationConnectionId(_) => {
+                transport_param_type::ORIGINAL_DESTINATION_CONNECTION_ID
+            }
+            TransportParameter::MaxIdleTimeout(_) => transport_param_type::MAX_IDLE_TIMEOUT,
+            TransportParameter::StatelessResetToken(_) => {
+                transport_param_type::STATELESS_RESET_TOKEN
+            }
+            TransportParameter::MaxUdpPayloadSize(_) => transport_param_type::MAX_UDP_PAYLOAD_SIZE,
+            TransportParameter::InitialMaxData(_) => transport_param_type::INITIAL_MAX_DATA,
+            TransportParameter::InitialMaxStreamDataBidiLocal(_) => {
+                transport_param_type::INITIAL_MAX_STREAM_DATA_BIDI_LOCAL
+            }
+            TransportParameter::InitialMaxStreamDataBidiRemote(_) => {
+                transport_param_type::INITIAL_MAX_STREAM_DATA_BIDI_REMOTE
+            }
+            TransportParameter::InitialMaxStreamDataUni(_) => {
+                transport_param_type::INITIAL_MAX_STREAM_DATA_UNI
+            }
+            TransportParameter::InitialMaxStreamsBidi(_) => {
+                transport_param_type::INITIAL_MAX_STREAMS_BIDI
+            }
+            TransportParameter::InitialMaxStreamsUni(_) => {
+                transport_param_type::INITIAL_MAX_STREAMS_UNI
+            }
+            TransportParameter::AckDelayExponent(_) => transport_param_type::ACK_DELAY_EXPONENT,
+            TransportParameter::MaxAckDelay(_) => transport_param_type::MAX_ACK_DELAY,
+            TransportParameter::DisableActiveMigration(_) => {
+                transport_param_type::DISABLE_ACTIVE_MIGRATION
+            }
+            TransportParameter::PreferredAddress(_) => transport_param_type::PREFERRED_ADDRESS,
+            TransportParameter::ActiveConnectionIdLimit(_) => {
+                transport_param_type::ACTIVE_CONNECTION_ID_LIMIT
+            }
+            TransportParameter::InitialSourceConnectionId(_) => {
+                transport_param_type::INITIAL_SOURCE_CONNECTION_ID
+            }
+            TransportParameter::RetrySourceConnectionId(_) => {
+                transport_param_type::RETRY_SOURCE_CONNECTION_ID
+            }
         }
     }
 
@@ -182,7 +231,7 @@ impl TransportParameter {
         );
 
         let tp = match type_id {
-            0x00 => {
+            transport_param_type::ORIGINAL_DESTINATION_CONNECTION_ID => {
                 let id_len = decode_variable_length(cursor)?;
                 trace!(
                     "OriginalDestinationConnectionId length {} at position {}",
@@ -198,7 +247,7 @@ impl TransportParameter {
                 );
                 TransportParameter::OriginalDestinationConnectionId(org_dcid)
             }
-            0x01 => {
+            transport_param_type::MAX_IDLE_TIMEOUT => {
                 let timeout_len = decode_variable_length(cursor)?;
                 trace!(
                     "MaxIdleTimeout length {} at position {}",
@@ -213,7 +262,7 @@ impl TransportParameter {
                 );
                 TransportParameter::MaxIdleTimeout(timeout)
             }
-            0x02 => {
+            transport_param_type::STATELESS_RESET_TOKEN => {
                 let token_len = decode_variable_length(cursor)?;
                 trace!(
                     "StatelessResetToken length {} at position {}",
@@ -229,7 +278,7 @@ impl TransportParameter {
                 );
                 TransportParameter::StatelessResetToken(token.try_into().unwrap())
             }
-            0x03 => {
+            transport_param_type::MAX_UDP_PAYLOAD_SIZE => {
                 let len = decode_variable_length(cursor)?;
                 trace!(
                     "MaxUdpPayloadSize length {} at position {}",
@@ -252,7 +301,7 @@ impl TransportParameter {
                 );
                 TransportParameter::MaxUdpPayloadSize(size)
             }
-            0x04 => {
+            transport_param_type::INITIAL_MAX_DATA => {
                 let len = decode_variable_length(cursor)?;
                 trace!(
                     "InitialMaxData length {} at position {}",
@@ -267,7 +316,7 @@ impl TransportParameter {
                 );
                 TransportParameter::InitialMaxData(max_data)
             }
-            0x05 => {
+            transport_param_type::INITIAL_MAX_STREAM_DATA_BIDI_LOCAL => {
                 let len = decode_variable_length(cursor)?;
                 trace!(
                     "InitialMaxStreamDataBidiLocal length {} at position {}",
@@ -282,7 +331,7 @@ impl TransportParameter {
                 );
                 TransportParameter::InitialMaxStreamDataBidiLocal(value)
             }
-            0x06 => {
+            transport_param_type::INITIAL_MAX_STREAM_DATA_BIDI_REMOTE => {
                 let len = decode_variable_length(cursor)?;
                 trace!(
                     "InitialMaxStreamDataBidiRemote length {} at position {}",
@@ -297,7 +346,7 @@ impl TransportParameter {
                 );
                 TransportParameter::InitialMaxStreamDataBidiRemote(value)
             }
-            0x07 => {
+            transport_param_type::INITIAL_MAX_STREAM_DATA_UNI => {
                 let len = decode_variable_length(cursor)?;
                 trace!(
                     "InitialMaxStreamDataUni length {} at position {}",
@@ -312,7 +361,7 @@ impl TransportParameter {
                 );
                 TransportParameter::InitialMaxStreamDataUni(value)
             }
-            0x08 => {
+            transport_param_type::INITIAL_MAX_STREAMS_BIDI => {
                 let len = decode_variable_length(cursor)?;
                 trace!(
                     "InitialMaxStreamsBidi length {} at position {}",
@@ -327,7 +376,7 @@ impl TransportParameter {
                 );
                 TransportParameter::InitialMaxStreamsBidi(value)
             }
-            0x09 => {
+            transport_param_type::INITIAL_MAX_STREAMS_UNI => {
                 let len = decode_variable_length(cursor)?;
                 trace!(
                     "InitialMaxStreamsUni length {} at position {}",
@@ -342,7 +391,7 @@ impl TransportParameter {
                 );
                 TransportParameter::InitialMaxStreamsUni(value)
             }
-            0x0A => {
+            transport_param_type::ACK_DELAY_EXPONENT => {
                 let len = decode_variable_length(cursor)?;
                 trace!(
                     "AckDelayExponent length {} at position {}",
@@ -350,19 +399,20 @@ impl TransportParameter {
                     cursor.position()
                 );
                 let value = decode_variable_length(cursor)?;
+                if value > 20 {
+                    return Err(anyhow!(
+                        "ack_delay_exponent value {} is not valid, must be 20 or below",
+                        value
+                    ));
+                }
                 trace!(
                     "AckDelayExponent value {} at position {}",
                     value,
                     cursor.position()
                 );
-                if value > 20 {
-                    return Err(anyhow!(
-                        "ack_delay_exponent value {value} is not valid, must below 20"
-                    ));
-                }
                 TransportParameter::AckDelayExponent(value as u8)
             }
-            0x0B => {
+            transport_param_type::MAX_ACK_DELAY => {
                 let len = decode_variable_length(cursor)?;
                 trace!(
                     "MaxAckDelay length {} at position {}",
@@ -372,7 +422,8 @@ impl TransportParameter {
                 let value = decode_variable_length(cursor)?;
                 if value >= 1 << 14 {
                     return Err(anyhow!(
-                        "max_ack_delay value {value} is not valid, must greater then 213"
+                        "max_ack_delay value {} is not valid, must be less than 2^14",
+                        value
                     ));
                 }
                 trace!(
@@ -382,7 +433,7 @@ impl TransportParameter {
                 );
                 TransportParameter::MaxAckDelay(value as u16)
             }
-            0x0C => {
+            transport_param_type::DISABLE_ACTIVE_MIGRATION => {
                 let value = decode_variable_length(cursor)?;
                 trace!(
                     "DisableActiveMigration value {} at position {}",
@@ -391,7 +442,7 @@ impl TransportParameter {
                 );
                 TransportParameter::DisableActiveMigration(value == 0)
             }
-            0x0E => {
+            transport_param_type::ACTIVE_CONNECTION_ID_LIMIT => {
                 let len = decode_variable_length(cursor)?;
                 trace!(
                     "ActiveConnectionIdLimit length {} at position {}",
@@ -399,6 +450,13 @@ impl TransportParameter {
                     cursor.position()
                 );
                 let value = decode_variable_length(cursor)?;
+                if value < MIN_ACTIVE_CONNECTION_ID_LIMIT as u64 {
+                    return Err(anyhow!(
+                        "active_connection_id_limit must be at least {}, got {}",
+                        MIN_ACTIVE_CONNECTION_ID_LIMIT,
+                        value
+                    ));
+                }
                 trace!(
                     "ActiveConnectionIdLimit value {} at position {}",
                     value,
@@ -406,7 +464,7 @@ impl TransportParameter {
                 );
                 TransportParameter::ActiveConnectionIdLimit(value as u8)
             }
-            0x0F => {
+            transport_param_type::INITIAL_SOURCE_CONNECTION_ID => {
                 let len = decode_variable_length(cursor)?;
                 trace!(
                     "InitialSourceConnectionId length {} at position {}",
@@ -422,7 +480,7 @@ impl TransportParameter {
                 );
                 TransportParameter::InitialSourceConnectionId(value)
             }
-            0x10 => {
+            transport_param_type::RETRY_SOURCE_CONNECTION_ID => {
                 let len = decode_variable_length(cursor)?;
                 trace!(
                     "RetrySourceConnectionId length {} at position {}",
@@ -437,6 +495,109 @@ impl TransportParameter {
                     cursor.position()
                 );
                 TransportParameter::RetrySourceConnectionId(value)
+            }
+            transport_param_type::PREFERRED_ADDRESS => {
+                let len = decode_variable_length(cursor)?;
+                trace!(
+                    "PreferredAddress length {} at position {}",
+                    len,
+                    cursor.position()
+                );
+
+                // According to RFC 9000 Section 18.2, preferred address format:
+                // IPv4 Address (32), IPv4 Port (16), IPv6 Address (128), IPv6 Port (16),
+                // Connection ID Length (8), Connection ID (8..160), Stateless Reset Token (128)
+                // Minimum length: 4 + 2 + 16 + 2 + 1 + 0 + 16 = 41 bytes
+                if len < 41 {
+                    return Err(anyhow!(
+                        "Invalid preferred address length: expected at least 41 bytes, got {}",
+                        len
+                    ));
+                }
+
+                // Read IPv4 address (4 bytes)
+                let mut ipv4_bytes = [0u8; 4];
+                cursor.read_exact(&mut ipv4_bytes)?;
+                let ipv4_address = Ipv4Addr::from(ipv4_bytes);
+
+                // Read IPv4 port (2 bytes)
+                let ipv4_port = cursor.read_u16::<BigEndian>()?;
+
+                // Read IPv6 address (16 bytes)
+                let mut ipv6_bytes = [0u8; 16];
+                cursor.read_exact(&mut ipv6_bytes)?;
+                let ipv6_address = Ipv6Addr::from(ipv6_bytes);
+
+                // Read IPv6 port (2 bytes)
+                let ipv6_port = cursor.read_u16::<BigEndian>()?;
+
+                // Read connection ID length (1 byte)
+                let connection_id_length = cursor.read_u8()?;
+
+                // Validate connection ID length (RFC 9000: 0-20 bytes)
+                if connection_id_length > 20 {
+                    return Err(anyhow!(
+                        "Invalid connection ID length in preferred address: {}",
+                        connection_id_length
+                    ));
+                }
+
+                // Read connection ID
+                let mut connection_id = vec![0u8; connection_id_length as usize];
+                cursor.read_exact(&mut connection_id)?;
+
+                // Read stateless reset token (16 bytes)
+                let mut stateless_reset_token = [0u8; 16];
+                cursor.read_exact(&mut stateless_reset_token)?;
+
+                trace!(
+                    "PreferredAddress: IPv4={}:{}, IPv6=[{}]:{}, cid_len={}, cid={:02x?}, token={:02x?}",
+                    ipv4_address, ipv4_port, ipv6_address, ipv6_port,
+                    connection_id_length, connection_id, stateless_reset_token
+                );
+
+                TransportParameter::PreferredAddress(PreferredAddress {
+                    ipv4_address,
+                    ipv4_port,
+                    ipv6_address,
+                    ipv6_port,
+                    connection_id_length,
+                    connection_id,
+                    stateless_reset_token,
+                })
+            }
+            transport_param_type::GREASE_QUIC_BIT => {
+                let len = decode_variable_length(cursor)?;
+                trace!(
+                    "GreaseQuicBit length {} at position {}",
+                    len,
+                    cursor.position()
+                );
+                // For grease_quic_bit, length should be 0
+                if len != 0 {
+                    warn!(
+                        "grease_quic_bit parameter should have length 0, got {}",
+                        len
+                    );
+                    let mut dummy = vec![0; len as usize];
+                    cursor.read_exact(&mut dummy)?;
+                }
+                // Ignore GREASE parameters as per spec
+                return Ok(None);
+            }
+            transport_param_type::GREASE => {
+                let len = decode_variable_length(cursor)?;
+                trace!(
+                    "Grease parameter length {} at position {}",
+                    len,
+                    cursor.position()
+                );
+                // Skip the GREASE parameter value
+                let mut dummy = vec![0; len as usize];
+                cursor.read_exact(&mut dummy)?;
+                trace!("Grease parameter value {:02x?}", dummy);
+                // Ignore GREASE parameters as per spec
+                return Ok(None);
             }
             _ => {
                 // TODO: Could be version_infomation parameter
@@ -465,7 +626,7 @@ impl TransportParameter {
         W: Write + Seek + Read,
     {
         // Write the type ID for this transport parameter
-        encode_variable_length(cursor, self.type_id() as u64)?;
+        encode_variable_length(cursor, self.type_id())?;
 
         match self {
             TransportParameter::OriginalDestinationConnectionId(id) => {
@@ -519,9 +680,11 @@ impl TransportParameter {
             TransportParameter::DisableActiveMigration(_) => {
                 encode_variable_length(cursor, 0)?;
             }
-            TransportParameter::PreferredAddress(_) => {
-                unimplemented!();
-                /* address.serialize(cursor)?; */
+            TransportParameter::PreferredAddress(address) => {
+                // Calculate the length: 4+2+16+2+1+cid_len+16 bytes
+                let length = 4 + 2 + 16 + 2 + 1 + address.connection_id.len() + 16;
+                encode_variable_length(cursor, length as u64)?;
+                address.serialize(cursor)?;
             }
             TransportParameter::ActiveConnectionIdLimit(data) => {
                 encode_variable_length(cursor, get_variable_length(*data as u64)? as u64)?;
@@ -542,7 +705,10 @@ impl TransportParameter {
 }
 
 impl PreferredAddress {
-    fn _serialize(&self, cursor: &mut Cursor<&mut [u8]>) -> Result<()> {
+    fn serialize<W>(&self, cursor: &mut W) -> Result<()>
+    where
+        W: Write,
+    {
         // Preferred Address {
         //   IPv4 Address (32),
         //   IPv4 Port (16),
@@ -560,6 +726,31 @@ impl PreferredAddress {
         cursor.write_all(&self.connection_id)?;
         cursor.write_all(&self.stateless_reset_token)?;
         Ok(())
+    }
+
+    /// Get the IPv4 address
+    pub(crate) fn get_ipv4_address(&self) -> Ipv4Addr {
+        self.ipv4_address
+    }
+
+    /// Get the IPv4 port
+    pub(crate) fn get_ipv4_port(&self) -> u16 {
+        self.ipv4_port
+    }
+
+    /// Get the IPv6 address
+    pub(crate) fn get_ipv6_address(&self) -> Ipv6Addr {
+        self.ipv6_address
+    }
+
+    /// Get the IPv6 port
+    pub(crate) fn get_ipv6_port(&self) -> u16 {
+        self.ipv6_port
+    }
+
+    /// Get the connection ID
+    pub(crate) fn get_connection_id(&self) -> &Vec<u8> {
+        &self.connection_id
     }
 }
 
@@ -648,6 +839,11 @@ pub(crate) struct PeerTransportParameters {
     initial_max_streams_uni: Option<u64>,
     stateless_reset_token: Option<[u8; QUIC_STATELESS_RESET_TOKEN_SIZE as usize]>,
     max_udp_payload_size: Option<u16>,
+    disable_active_migration: Option<bool>,
+    preferred_address: Option<PreferredAddress>,
+    active_connection_id_limit: Option<u8>,
+    original_destination_connection_id: Option<Vec<u8>>,
+    retry_source_connection_id: Option<Vec<u8>>,
     updated: bool,
 }
 
@@ -672,6 +868,12 @@ impl PeerTransportParameters {
         self.initial_max_streams_uni = tls.get_peer_initial_max_streams_uni();
         self.stateless_reset_token = tls.get_peer_stateless_reset_token();
         self.max_udp_payload_size = tls.get_peer_max_udp_payload_size();
+        // Migration related parameters
+        self.disable_active_migration = tls.get_peer_disable_active_migration();
+        self.preferred_address = tls.get_peer_preferred_address();
+        self.active_connection_id_limit = tls.get_peer_active_connection_id_limit();
+        self.original_destination_connection_id = tls.get_peer_original_destination_connection_id();
+        self.retry_source_connection_id = tls.get_peer_retry_source_connection_id();
         self.updated = true;
     }
 
@@ -719,5 +921,35 @@ impl PeerTransportParameters {
         &self,
     ) -> Option<[u8; QUIC_STATELESS_RESET_TOKEN_SIZE as usize]> {
         self.stateless_reset_token
+    }
+
+    /// Get disable_active_migration parameter from peer
+    /// Returns true if peer has disabled active migration
+    pub(crate) fn get_disable_active_migration(&self) -> Option<bool> {
+        self.disable_active_migration
+    }
+
+    /// Get preferred_address parameter from peer
+    /// Contains IPv4/IPv6 addresses that peer prefers for connection migration
+    pub(crate) fn get_preferred_address(&self) -> Option<&PreferredAddress> {
+        self.preferred_address.as_ref()
+    }
+
+    /// Get active_connection_id_limit parameter from peer
+    /// Limits the number of connection IDs that the peer is willing to store
+    pub(crate) fn get_active_connection_id_limit(&self) -> Option<u8> {
+        self.active_connection_id_limit
+    }
+
+    /// Get original_destination_connection_id parameter from peer
+    /// This should match the original DCID used when establishing the connection
+    pub(crate) fn get_original_destination_connection_id(&self) -> Option<&Vec<u8>> {
+        self.original_destination_connection_id.as_ref()
+    }
+
+    /// Get retry_source_connection_id parameter from peer
+    /// This should be present if a Retry packet was used during connection establishment
+    pub(crate) fn get_retry_source_connection_id(&self) -> Option<&Vec<u8>> {
+        self.retry_source_connection_id.as_ref()
     }
 }

@@ -24,8 +24,7 @@ fn more_then_zero(s: &str) -> Result<u64, String> {
 fn parse_hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
     if hex.len() % 2 != 0 {
         return Err(format!(
-            "Hex string '{}' must have an even number of characters.",
-            hex
+            "Hex string '{hex}' must have an even number of characters."
         ));
     }
 
@@ -44,6 +43,7 @@ struct FeatherQuicClientContext {
     // TODO: Support HTTP/3
     sent_bytes: u64,
     recv_bytes: u64,
+    migrate_to_addr: Option<SocketAddr>,
 }
 
 #[allow(unused_variables)]
@@ -66,6 +66,12 @@ impl QuicCallbacks for FeatherQuicClientContext {
         match result {
             QuicConnectResult::Success => {
                 info!("QUIC connection established successfully");
+                // Migration logic: if migrate_to_addr is set, migrate after handshake
+                if let Some(addr) = self.migrate_to_addr {
+                    info!("Attempting migration to address: {}", addr);
+                    use feather_quic_core::user_api::QuicConnectionInterface;
+                    QuicConnectionInterface::migrate_to_address(qconn, addr)?;
+                }
             }
             QuicConnectResult::Timeout(duration) => {
                 info!(
@@ -148,14 +154,37 @@ impl QuicCallbacks for FeatherQuicClientContext {
         // TODO: Resume sending data if previously blocked since QUIC stack send queue is full
         Ok(())
     }
+
+    fn migration_switch_result(
+        &mut self,
+        _qconn: &mut QuicConnection,
+        old_path_id: u64,
+        new_path_id: u64,
+        result: feather_quic_core::runtime::MigrationResult,
+    ) -> anyhow::Result<()> {
+        use feather_quic_core::runtime::MigrationResult;
+        match &result {
+            MigrationResult::MigrationSuccess => info!(
+                "Migration Callback: switch success: {} -> {}",
+                old_path_id, new_path_id
+            ),
+            MigrationResult::MigrationPreferredAddressSuccess => info!(
+                "Migration Callback: to preferred address success: {} -> {}",
+                old_path_id, new_path_id
+            ),
+            MigrationResult::MigrationFailed(e) => info!(
+                "Migration Callback: switch failed: {} -> {}, reason: {}",
+                old_path_id, new_path_id, e
+            ),
+        }
+        Ok(())
+    }
 }
 
 fn validate_rate(s: &str) -> Result<f32, String> {
-    let rate: f32 = s
-        .parse()
-        .map_err(|_| format!("Invalid float value: {}", s))?;
+    let rate: f32 = s.parse().map_err(|_| format!("Invalid float value: {s}"))?;
     if !(0.0..=1.0).contains(&rate) {
-        return Err(format!("Rate must be between 0.0 and 1.0, got {}", rate));
+        return Err(format!("Rate must be between 0.0 and 1.0, got {rate}"));
     }
     Ok(rate)
 }
@@ -407,6 +436,12 @@ fn main() -> Result<()> {
                 .value_parser(clap::value_parser!(u8)),
         )
         .arg(
+            Arg::new("migrate_to_addr")
+                .long("migrate-to-addr")
+                .help("If set, client will actively migrate to this address after handshake (SOCKETADDR)")
+                .num_args(1),
+        )
+        .arg(
             Arg::new("log_file")
                 .long("log-file")
                 .help("Path to write all logs to (default: stdout/stderr)")
@@ -418,6 +453,14 @@ fn main() -> Result<()> {
                 .help("Enable debug mode to include source code line numbers in logs")
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("stateless_reset_key")
+                .long("stateless-reset-key")
+                .help("Stateless reset key (hex string, 64 hex chars, optional). Used to generate \
+                    Stateless Reset Token for QUIC stateless reset (see RFC 9000 10.3). \
+                    In production, this should be a persistent, secure random key.")
+                .num_args(1),
+        )
         .get_matches();
 
     let env_filter = EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()));
@@ -426,7 +469,7 @@ fn main() -> Result<()> {
 
     if let Some(log_file) = matches.get_one::<String>("log_file") {
         let file = std::fs::File::create(log_file)
-            .with_context(|| format!("Failed to create log file: {}", log_file))?;
+            .with_context(|| format!("Failed to create log file: {log_file}"))?;
         tracing_subscriber::fmt::SubscriberBuilder::default()
             .with_env_filter(env_filter)
             .with_writer(file)
@@ -453,7 +496,7 @@ fn main() -> Result<()> {
     let target_addr: SocketAddr = target_address
         .to_socket_addrs()?
         .next()
-        .with_context(|| format!("Invalid target address: {}", target_address))?;
+        .with_context(|| format!("Invalid target address: {target_address}"))?;
 
     // Set MTU discovery network type based on target address
     match target_addr {
@@ -602,8 +645,25 @@ fn main() -> Result<()> {
         drop_packets_above_size,
     };
 
-    let mut qconn = QuicConnection::new(config);
+    if let Some(hex) = matches.get_one::<String>("stateless_reset_key") {
+        let bytes = parse_hex_to_bytes(hex)
+            .map_err(|e| anyhow::anyhow!("Invalid stateless reset key: {}", e))?;
+        if bytes.len() != 32 {
+            return Err(anyhow::anyhow!(
+                "Stateless reset key must be 32 bytes (64 hex chars)"
+            ));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        config.set_stateless_reset_key(arr);
+    }
+
+    let mut qconn = QuicConnection::new(config, target_addr);
     let mut runtime = QuicRuntime::new(runtime_config);
+
+    let migrate_to_addr = matches
+        .get_one::<String>("migrate_to_addr")
+        .and_then(|s| s.to_socket_addrs().ok()?.next());
 
     // Create appropriate context based on echo option
     if let Some(echo_file) = matches.get_one::<String>("echo_file") {
@@ -611,10 +671,14 @@ fn main() -> Result<()> {
         let mut uctx = QuicUserContext::new(FeatherQuicEchoContext::new(
             echo_file.clone(),
             *num_streams,
+            migrate_to_addr,
         )?);
         runtime.run(&mut qconn, &mut uctx)?;
     } else {
-        let mut uctx = QuicUserContext::new(FeatherQuicClientContext::default());
+        let mut uctx = QuicUserContext::new(FeatherQuicClientContext {
+            migrate_to_addr,
+            ..Default::default()
+        });
         runtime.run(&mut qconn, &mut uctx)?;
     };
 

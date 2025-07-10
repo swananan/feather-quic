@@ -13,9 +13,9 @@ mod tests {
     ) -> Result<()> {
         init_logging();
         let io_uring_str = if use_io_uring { " with io_uring" } else { "" };
-        let mtu_str = format!(" with MTU {}", target_mtu);
-        let timeout_str = mtu_timeout_ms.map_or("".to_string(), |t| format!(" timeout {}ms", t));
-        let retry_str = mtu_retry_count.map_or("".to_string(), |r| format!(" retry {}", r));
+        let mtu_str = format!(" with MTU {target_mtu}");
+        let timeout_str = mtu_timeout_ms.map_or("".to_string(), |t| format!(" timeout {t}ms"));
+        let retry_str = mtu_retry_count.map_or("".to_string(), |r| format!(" retry {r}"));
 
         info!(
             "Starting MTU discovery test{}{}{}{}",
@@ -66,10 +66,7 @@ mod tests {
         // We expect to see MTU discovery success message with the target MTU
         let success_patterns = [
             "QUIC connection established successfully",
-            &format!(
-                "MTU discovery completed successfully, final MTU: {}",
-                target_mtu
-            ),
+            &format!("MTU discovery completed successfully, final MTU: {target_mtu}",),
             "Echo verification successful for stream",
             "All streams finished, exiting",
         ];

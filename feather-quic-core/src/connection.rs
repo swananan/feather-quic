@@ -12,6 +12,7 @@ use crate::crypto::QuicCrypto;
 use crate::error_code::{QuicConnectionErrorCode, TransportErrorCode};
 use crate::flow_control::QuicConnectionFlowControl;
 use crate::frame::{QuicFrame, QuicPing};
+use crate::migration::QuicMigration;
 use crate::mtu_discovery::{MtuDiscovery, MtuDiscoveryConfig};
 use crate::packet::QuicPacket;
 use crate::rtt::QuicRttGenerator;
@@ -19,13 +20,14 @@ use crate::runtime::QuicUserContext;
 use crate::send::QuicSendContext;
 use crate::stream::{QuicStream, QuicStreamError, QuicStreamHandle};
 use crate::tls::TlsContext;
-use crate::transport_parameters::PeerTransportParameters;
+use crate::transport_parameters::{PeerTransportParameters, MIN_ACTIVE_CONNECTION_ID_LIMIT};
 use crate::utils::{decode_variable_length, format_instant, remaining_bytes};
 use crate::QuicCallbacks;
 
 // https://www.rfc-editor.org/rfc/rfc9000.html#section-10.3-11
 const QUIC_RESET_PACKET_MIN_SIZE: u16 = 21;
 pub(crate) const QUIC_STATELESS_RESET_TOKEN_SIZE: u16 = 16;
+const QUIC_PATH_MAX_SIZE: usize = 100;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum QuicLevel {
@@ -90,17 +92,11 @@ pub struct QuicConnection {
     idle_close_trigger: bool,
 
     pub(crate) scid: Vec<u8>,
-    pub(crate) org_dcid: Vec<u8>,
-    pub(crate) dcid: Option<Vec<u8>>,
     pub(crate) crypto: QuicCrypto,
     pub(crate) tls: TlsContext,
     pub(crate) retry_token: Option<Vec<u8>>,
+    pub(crate) retry_source_connection_id: Option<Vec<u8>>,
     pub(crate) new_token: Option<Vec<u8>>,
-
-    conn_ids: HashSet<Vec<u8>>,
-    reset_tokens: HashSet<Vec<u8>>,
-    peer_conn_ids: HashSet<Vec<u8>>,
-    peer_reset_tokens: HashSet<Vec<u8>>,
 
     pub(crate) key_phase: u8,
     discard_oldkey_threshold: Option<Instant>,
@@ -112,7 +108,7 @@ pub struct QuicConnection {
     should_send_asap: bool,
     send_event_threshold: Option<Instant>,
 
-    send_queue: VecDeque<Vec<Vec<u8>>>, // UDP datagram could carry multiple Long Header QUIC packet
+    send_queue: VecDeque<(Vec<Vec<u8>>, SocketAddr)>, // UDP datagram with target address
     pub(crate) init_send: QuicSendContext,
     pub(crate) hs_send: QuicSendContext,
     pub(crate) app_send: QuicSendContext,
@@ -139,11 +135,23 @@ pub struct QuicConnection {
     pub(crate) mtu: MtuDiscovery,
     mtu_probe_size: Option<u16>,
     mtu_probe_timeout_threshold: Option<Instant>,
+
+    // QUIC Path management for connection migration
+    pub(crate) migration: QuicMigration,
+
+    pub(crate) org_dcid: Vec<u8>,
+    pub(crate) available_local_connection_ids: HashMap<u64, (Vec<u8>, [u8; 16])>,
+    pub(crate) local_connection_ids_lookup: HashSet<Vec<u8>>,
+    pub(crate) next_local_connection_id_sequence: u64,
+    pub(crate) suggested_peer_retire_prior_to: u64,
+
+    // Migration parameters from peer transport parameters
+    peer_disable_active_migration: bool,
+    peer_active_connection_id_limit: u8,
 }
 
-#[allow(dead_code)]
 impl QuicConnection {
-    pub fn new(mut quic_config: QuicConfig) -> Self {
+    pub fn new(mut quic_config: QuicConfig, target_address: SocketAddr) -> Self {
         const CID_LENGTH: usize = 16;
         let mut rng = rand::thread_rng();
         let scid = if quic_config.scid.is_none() {
@@ -173,6 +181,22 @@ impl QuicConnection {
 
         let mut scids = HashSet::new();
         scids.insert(scid.clone());
+
+        // Initialize available_local_connection_ids with the initial scid (sequence 0)
+        let mut available_local_connection_ids = HashMap::new();
+        available_local_connection_ids.insert(0, (scid.clone(), [0; 16]));
+
+        // Initialize lookup set for fast scid checking
+        let mut local_connection_ids_lookup = HashSet::new();
+        local_connection_ids_lookup.insert(scid.clone());
+
+        // Initialize QUIC path management (do not insert path yet)
+        let mut migration = QuicMigration::new(QUIC_PATH_MAX_SIZE);
+        let handshake_path_id = migration
+            .add_path(target_address, now)
+            .expect("Failed to add handshake path");
+        migration.set_active_path_id(handshake_path_id);
+
         QuicConnection {
             state: QuicConnectionState::Init,
             crypto: QuicCrypto::default(),
@@ -181,17 +205,12 @@ impl QuicConnection {
             idle_timeout_threshold: None,
             idle_close_trigger: false,
             scid,
-            dcid: None,
             retry_token: None,
+            retry_source_connection_id: None,
             new_token: None,
             idle_timeout: None,
             org_dcid,
             quic_config,
-
-            conn_ids: scids,
-            reset_tokens: HashSet::new(),
-            peer_conn_ids: HashSet::new(),
-            peer_reset_tokens: HashSet::new(),
 
             key_phase: 0,
             discard_oldkey_threshold: None,
@@ -228,22 +247,36 @@ impl QuicConnection {
             mtu: MtuDiscovery::new(mtu_config),
             mtu_probe_size: None,
             mtu_probe_timeout_threshold: None,
+
+            // QUIC Path management for connection migration
+            migration,
+
+            // Local connection ID management
+            available_local_connection_ids,
+            local_connection_ids_lookup,
+            // Start from 1, sequence 0 is the initial scid
+            next_local_connection_id_sequence: 1,
+            suggested_peer_retire_prior_to: 0,
+
+            // Migration parameters (will be updated from transport parameters)
+            peer_disable_active_migration: false, // Default: migration allowed
+            peer_active_connection_id_limit: MIN_ACTIVE_CONNECTION_ID_LIMIT, // Default value per RFC 9000
         }
     }
 
-    pub fn is_established(&self) -> bool {
+    pub(crate) fn is_established(&self) -> bool {
         self.state == QuicConnectionState::Established
     }
 
-    pub fn is_closing(&self) -> bool {
+    pub(crate) fn is_closing(&self) -> bool {
         self.state == QuicConnectionState::ConnectionClosing
     }
 
-    pub fn is_closed(&self) -> bool {
+    pub(crate) fn is_closed(&self) -> bool {
         self.state == QuicConnectionState::ConnectionClosed
     }
 
-    pub fn is_draining(&self) -> bool {
+    pub(crate) fn is_draining(&self) -> bool {
         self.state == QuicConnectionState::ConnectionDraining
     }
 
@@ -254,8 +287,17 @@ impl QuicConnection {
         self.expected_state(QuicConnectionState::Connecting)?;
         self.state = QuicConnectionState::Established;
 
+        self.migration.set_active_path_validated();
+
         // TODO: Consider starting MTU discovery during connection establishment
         self.start_mtu_discovery()?;
+
+        // Generate and send initial local connection IDs to reach the configured limit
+        // This is done after handshake completion to ensure all transport parameters are negotiated
+        self.generate_and_send_initial_local_connection_ids()?;
+
+        // Check for preferred address and initiate migration if available
+        self.handle_preferred_address_migration()?;
 
         Ok(())
     }
@@ -269,8 +311,8 @@ impl QuicConnection {
         let span = span!(
             Level::TRACE,
             "quic_timer",
-            scid = ?self.scid.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""),
-            dcid = ?self.dcid.as_ref().map(|d| d.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""))
+            scid = ?self.scid.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<String>>().join(""),
+            dcid = ?self.format_span_dcid()
         );
         let _enter = span.enter();
         trace!("Processing timers at {:?}", self.current_ts);
@@ -361,6 +403,9 @@ impl QuicConnection {
             QuicPacket::update_quic_send_queue(self)?;
         }
 
+        // Clean up expired path challenges
+        self.cleanup_expired_path_challenges();
+
         if self.is_draining() {
             info!("Only need to reply the QUIC connection close frame, since got connection close");
             self.real_close_handler();
@@ -397,9 +442,9 @@ impl QuicConnection {
 
     pub(crate) fn next_time(&self) -> Option<u64> {
         let _span =
-            span!(Level::TRACE, "calculating next timer", 
-                scid = ?self.scid.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""), 
-                dcid = ?self.dcid.as_ref().map(|d| d.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""))
+            span!(Level::TRACE,             "calculating next timer",
+                scid = ?self.scid.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<String>>().join(""),
+                dcid = ?self.format_span_dcid()
             )
             .entered();
 
@@ -482,13 +527,12 @@ impl QuicConnection {
         };
     }
 
-    #[allow(unused_variables)]
-    pub(crate) fn provide_data(&mut self, rcvbuf: &[u8], source_addr: SocketAddr) -> Result<()> {
+    pub(crate) fn provide_data(&mut self, rcvbuf: &[u8], remote_addr: SocketAddr) -> Result<()> {
         let span = span!(
             Level::TRACE,
             "providing_data",
-            scid = ?self.scid.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""),
-            dcid = ?self.dcid.as_ref().map(|d| d.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""))
+            scid = ?self.scid.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<String>>().join(""),
+            dcid = ?self.format_span_dcid()
         );
         let _enter = span.enter();
 
@@ -497,22 +541,27 @@ impl QuicConnection {
             return Ok(());
         }
 
-        QuicPacket::handle_quic_packet(rcvbuf, self, &source_addr).with_context(|| {
+        // TODO: Should check if remote address changes (migration/rebinding),
+        // but feather-quic only supports client implementation for now, so this is not considered.
+        // This situation is mostly a server-side concern.
+        QuicPacket::handle_quic_packet(rcvbuf, self, &remote_addr).with_context(|| {
             format!(
                 "Quic connection scid {:x?}, dcid {:x?}, org dcid {:x?}",
-                self.scid, self.dcid, self.org_dcid
+                self.scid,
+                self.migration.get_current_dcid(),
+                self.org_dcid
             )
         })?;
 
         Ok(())
     }
 
-    pub(crate) fn consume_data(&mut self) -> Option<Vec<u8>> {
+    pub(crate) fn consume_data(&mut self) -> Option<(Vec<u8>, SocketAddr)> {
         let span = span!(
             Level::TRACE,
             "consuming data",
-            scid = ?self.scid.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""),
-            dcid = ?self.dcid.as_ref().map(|d| d.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""))
+            scid = ?self.scid.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<String>>().join(""),
+            dcid = ?self.format_span_dcid()
         );
         let _enter = span.enter();
 
@@ -522,9 +571,17 @@ impl QuicConnection {
             }
         }
 
-        self.send_queue
-            .pop_front()
-            .map(|v| v.into_iter().flat_map(|v| v.into_iter()).collect())
+        if let Some((datagram_packets, target_address)) = self.send_queue.pop_front() {
+            // Flatten the datagram packets into a single buffer
+            let data: Vec<u8> = datagram_packets
+                .into_iter()
+                .flat_map(|packet| packet.into_iter())
+                .collect();
+
+            Some((data, target_address))
+        } else {
+            None
+        }
     }
 
     pub fn connect(
@@ -534,7 +591,7 @@ impl QuicConnection {
         let span = span!(
             Level::TRACE,
             "connecting",
-            scid = ?self.scid.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""),
+            scid = ?self.scid.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<String>>().join(""),
         );
         let _enter = span.enter();
 
@@ -542,10 +599,12 @@ impl QuicConnection {
             .with_context(|| {
                 format!(
                     "Quic connection scid {:x?}, dcid {:x?}, org dcid {:x?}",
-                    self.scid, self.dcid, self.org_dcid
+                    self.scid,
+                    self.migration.get_current_dcid(),
+                    self.org_dcid
                 )
             })
-            .map_err(|e| QuicConnectionError::ConnectionWrongState(format!("Due to {}", e)))?;
+            .map_err(|e| QuicConnectionError::ConnectionWrongState(format!("Due to {e}")))?;
 
         self.state = QuicConnectionState::Connecting;
         self.update_current_time();
@@ -557,17 +616,19 @@ impl QuicConnection {
             );
             self.quic_config
                 .set_max_udp_payload_size(max_udp_payload_size)
-                .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
+                .map_err(|e| QuicConnectionError::InternalError(format!("Due to {e}")))?;
         }
 
         QuicPacket::start_tls_handshake(self, false)
             .with_context(|| {
                 format!(
                     "Quic connection scid {:x?}, dcid {:x?}, org dcid {:x?}",
-                    self.scid, self.dcid, self.org_dcid
+                    self.scid,
+                    self.migration.get_current_dcid(),
+                    self.org_dcid
                 )
             })
-            .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
+            .map_err(|e| QuicConnectionError::InternalError(format!("Due to {e}")))?;
 
         self.update_idle_timeout_threshold();
 
@@ -638,7 +699,7 @@ impl QuicConnection {
             .checked_add(Duration::from_millis(self.three_times_pto()));
     }
 
-    pub fn close(
+    pub(crate) fn close_internal(
         &mut self,
         error_code: u64,
         reason_phrase: Option<String>,
@@ -653,10 +714,12 @@ impl QuicConnection {
         .with_context(|| {
             format!(
                 "Quic connection scid {:x?}, dcid {:x?}, org dcid {:x?}",
-                self.scid, self.dcid, self.org_dcid
+                self.scid,
+                self.migration.get_current_dcid(),
+                self.org_dcid
             )
         })
-        .map_err(|e| QuicConnectionError::ConnectionWrongState(format!("Due to {}", e)))?;
+        .map_err(|e| QuicConnectionError::ConnectionWrongState(format!("Due to {e}")))?;
 
         self.error_code = Some(QuicConnectionErrorCode::create_application_error_code(
             error_code,
@@ -679,7 +742,7 @@ impl QuicConnection {
         Ok(())
     }
 
-    pub fn open_stream(
+    pub(crate) fn open_stream_internal(
         &mut self,
         is_bidirectional: bool,
     ) -> Result<QuicStreamHandle, QuicConnectionError> {
@@ -701,7 +764,7 @@ impl QuicConnection {
                 true,
                 self.flow_control.get_max_streams_bidi_remote().unwrap_or(0),
             )
-            .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
+            .map_err(|e| QuicConnectionError::InternalError(format!("Due to {e}")))?;
             return Err(QuicConnectionError::StreamLimitations(
                 "Bidirectional".to_string(),
                 self.flow_control.get_max_streams_bidi_remote(),
@@ -719,7 +782,7 @@ impl QuicConnection {
                 false,
                 self.flow_control.get_max_streams_uni_remote().unwrap_or(0),
             )
-            .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
+            .map_err(|e| QuicConnectionError::InternalError(format!("Due to {e}")))?;
 
             return Err(QuicConnectionError::StreamLimitations(
                 "Unidirectional".to_string(),
@@ -765,7 +828,7 @@ impl QuicConnection {
 
         match self.streams.entry(new_id) {
             std::collections::hash_map::Entry::Occupied(e) => {
-                panic!("Stream {:?} already exists", e);
+                panic!("Stream {e:?} already exists");
             }
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(new_stream);
@@ -796,7 +859,7 @@ impl QuicConnection {
 
     /// Only stop the sending for specific stream, ensure all the stream data be delivered in the
     /// peer side
-    pub fn stream_finish(
+    pub(crate) fn stream_finish_internal(
         &mut self,
         stream_handle: QuicStreamHandle,
     ) -> Result<(), QuicConnectionError> {
@@ -821,7 +884,7 @@ impl QuicConnection {
     }
 
     /// Reset the QUIC stream sending immediately
-    pub fn stream_shutdown_write(
+    pub(crate) fn stream_shutdown_write_internal(
         &mut self,
         stream_handle: QuicStreamHandle,
         application_error_code: u64,
@@ -866,7 +929,7 @@ impl QuicConnection {
     }
 
     /// Reset the QUIC stream receiving immediately
-    pub fn stream_shutdown_read(
+    pub(crate) fn stream_shutdown_read_internal(
         &mut self,
         stream_handle: QuicStreamHandle,
         application_error_code: u64,
@@ -904,7 +967,7 @@ impl QuicConnection {
         Ok(())
     }
 
-    pub fn stream_recv(
+    pub(crate) fn stream_recv_internal(
         &mut self,
         stream_handle: QuicStreamHandle,
         recv_len: usize,
@@ -949,8 +1012,7 @@ impl QuicConnection {
                 self.create_and_insert_max_data_stream(Some(stream_handle), stream_max_size)
                     .map_err(|e| {
                         QuicConnectionError::InternalError(format!(
-                            "Stream {} failure, due to {}",
-                            stream_handle, e
+                            "Stream {stream_handle} failure, due to {e}"
                         ))
                     })?;
             }
@@ -964,7 +1026,7 @@ impl QuicConnection {
                     None,
                     self.flow_control.get_new_max_recv_size(),
                 )
-                .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
+                .map_err(|e| QuicConnectionError::InternalError(format!("Due to {e}")))?;
             }
         }
 
@@ -979,7 +1041,7 @@ impl QuicConnection {
             .clear_stream_frame_from_sent_queue(stream_handle.as_u64());
     }
 
-    pub fn stream_send(
+    pub(crate) fn stream_send_internal(
         &mut self,
         stream_handle: QuicStreamHandle,
         snd_buf: &[u8],
@@ -1007,14 +1069,14 @@ impl QuicConnection {
         let available_bytes = self
             .flow_control
             .get_sent_available_bytes()
-            .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
+            .map_err(|e| QuicConnectionError::InternalError(format!("Due to {e}")))?;
 
         if available_bytes == 0 {
             // Actually QUIC stream frame length can be zero, but we provide the `finish` api
             warn!("Connection flow control was triggered here");
             let max_send_size = self.flow_control.get_max_send_size();
             self.create_and_insert_data_blocked_stream(None, max_send_size)
-                .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
+                .map_err(|e| QuicConnectionError::InternalError(format!("Due to {e}")))?;
 
             return Err(QuicConnectionError::ConnectionMaxDataLimitations(
                 self.flow_control.get_max_send_size(),
@@ -1048,14 +1110,14 @@ impl QuicConnection {
             Err(e) => {
                 if matches!(e, QuicStreamError::WouldBlock) {
                     self.create_and_insert_data_blocked_stream(Some(stream_handle), max_send_size)
-                        .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
+                        .map_err(|e| QuicConnectionError::InternalError(format!("Due to {e}")))?;
                 }
                 Err(QuicConnectionError::QuicStreamError(e))
             }
         }
     }
 
-    pub fn set_stream_write_active(
+    pub(crate) fn set_stream_write_active_internal(
         &mut self,
         stream_handle: QuicStreamHandle,
         flag: bool,
@@ -1084,7 +1146,7 @@ impl QuicConnection {
         Ok(())
     }
 
-    pub fn set_stream_read_active(
+    pub(crate) fn set_stream_read_active_internal(
         &mut self,
         stream_handle: QuicStreamHandle,
         flag: bool,
@@ -1113,12 +1175,96 @@ impl QuicConnection {
         Ok(())
     }
 
-    pub(crate) fn check_dcid(&self, dcid: &[u8]) -> bool {
-        self.conn_ids.contains(dcid)
+    /// Migrate the connection to a new target address
+    ///
+    /// This is a client-only API that allows the client to actively migrate
+    /// the connection to a different server address. The migration process
+    /// involves adding the new address as a potential path and sending
+    /// PATH_CHALLENGE frames to validate it.
+    ///
+    /// # Arguments
+    /// * `new_target_address` - The new target server address to migrate to
+    ///
+    /// # Returns
+    /// * `Result<(), QuicConnectionError>` - Success or error
+    pub(crate) fn migrate_to_address_internal(
+        &mut self,
+        new_target_address: SocketAddr,
+    ) -> Result<(), QuicConnectionError> {
+        let span = span!(
+            Level::TRACE,
+            "migrating to address",
+            new_address = ?new_target_address
+        );
+        let _enter = span.enter();
+
+        // Only one migration can be in progress at a time
+        if self.migration.has_validating_path() {
+            // TODO: Support multiple concurrent migrations in the future
+            return Err(QuicConnectionError::ConnectionWrongState(
+                "Migration already in progress".to_string(),
+            ));
+        }
+
+        if self.is_closed() || self.is_closing() || self.is_draining() {
+            info!("Connection is in {:?}, so we can't migrate", self.state);
+            return Err(QuicConnectionError::ConnectionLost(self.state));
+        }
+
+        if !self.is_established() {
+            info!("Connection is not established, cannot migrate");
+            return Err(QuicConnectionError::ConnectionWrongState(
+                "Connection must be established to migrate".to_string(),
+            ));
+        }
+
+        if self.is_peer_migration_disabled() {
+            info!("Peer has disabled active migration");
+            return Err(QuicConnectionError::ConnectionWrongState(
+                "Peer has disabled active migration".to_string(),
+            ));
+        }
+
+        if self.quic_config.get_disable_active_migration() {
+            info!("Active migration is disabled by configuration");
+            return Err(QuicConnectionError::ConnectionWrongState(
+                "Active migration is disabled by configuration".to_string(),
+            ));
+        }
+
+        // Add the new path to the migration system (will auto-assign CID if available)
+        match self.migration.add_path(new_target_address, self.current_ts) {
+            Ok(path_id) => {
+                info!(
+                    "Added new migration path: path_id={}, address={:?}",
+                    path_id, new_target_address
+                );
+
+                // Send PATH_CHALLENGE to validate the new path
+                self.create_and_send_path_challenge_for_path(path_id)
+                    .map_err(|e| {
+                        QuicConnectionError::InternalError(format!(
+                            "Failed to send path challenge: {e}"
+                        ))
+                    })?;
+
+                info!(
+                    "Migration to {:?} initiated successfully",
+                    new_target_address
+                );
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to add migration path: {e}");
+                Err(QuicConnectionError::InternalError(format!(
+                    "Failed to add migration path: {e}"
+                )))
+            }
+        }
     }
 
-    pub(crate) fn check_scid(&self, scid: &[u8]) -> bool {
-        self.peer_conn_ids.contains(scid)
+    pub(crate) fn check_peer_dcid(&self, dcid: &[u8]) -> bool {
+        self.local_connection_ids_lookup.contains(dcid)
     }
 
     fn draining(&mut self, level: QuicLevel, reply_cc: bool) {
@@ -1139,7 +1285,7 @@ impl QuicConnection {
 
         if reply_cc {
             // https://www.rfc-editor.org/rfc/rfc9000.html#section-10.2.2-2
-            TransportErrorCode::send_no_error_cc_frame(self, level);
+            TransportErrorCode::send_no_error_cc_frame(self, level, None);
         } else {
             // Trigger close event immediately
             self.close_threshold = Some(self.current_ts);
@@ -1159,49 +1305,605 @@ impl QuicConnection {
             reset_token
         );
 
-        if self.peer_reset_tokens.contains(reset_token) {
-            self.peer_error_code = None;
-            self.peer_reason_phrase = Some("quic stateless reset packet detected".to_string());
-            // https://www.rfc-editor.org/rfc/rfc9000.html#section-10.3.1-5
-            // the endpoint MUST enter the draining period and not send any further packets on this connection
-            self.draining(QuicLevel::Application, false);
+        // Check if the reset token matches any of our peer connection IDs
+        let mut reset_token_array = [0u8; 16];
+        if reset_token.len() == 16 {
+            reset_token_array.copy_from_slice(reset_token);
+
+            let available_cids = self.migration.get_all_peer_connection_ids();
+            if available_cids
+                .values()
+                .any(|(_, token)| token == &reset_token_array)
+            {
+                self.peer_error_code = None;
+                self.peer_reason_phrase = Some("quic stateless reset packet detected".to_string());
+                // https://www.rfc-editor.org/rfc/rfc9000.html#section-10.3.1-5
+                // the endpoint MUST enter the draining period and not send any further packets on this connection
+                self.draining(QuicLevel::Application, false);
+            }
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn add_reset_token(&mut self, reset_token: &[u8]) {
-        if reset_token.len() as u16 != QUIC_STATELESS_RESET_TOKEN_SIZE {
-            error!(
-                "Attempting to add invalid reset token length: {}",
-                reset_token.len()
-            );
-            return;
-        }
-        info!("Adding reset token: {:x?}", reset_token);
-        self.reset_tokens.insert(reset_token.into());
-    }
-
-    pub(crate) fn add_connection_id(&mut self, new_scid: &[u8]) {
-        self.conn_ids.insert(new_scid.into());
-    }
-
-    pub(crate) fn add_peer_reset_token(&mut self, reset_token: &[u8]) {
+    pub(crate) fn handle_new_conncetion_id_frame(
+        &mut self,
+        sequence_number: u64,
+        retire_prior_to: u64,
+        new_scid: &[u8],
+        reset_token: &[u8],
+    ) -> Result<()> {
         if reset_token.len() as u16 != QUIC_STATELESS_RESET_TOKEN_SIZE {
             error!("Invalid reset token length: {}", reset_token.len());
-            return;
+            return Ok(());
         }
-        info!("Adding peer reset token: {:x?}", reset_token);
-        self.peer_reset_tokens.insert(reset_token.into());
+
+        info!(
+            "Stored new peer connection ID: seq={}, retire_prior_to={}, cid={:x?}, token={:x?}",
+            sequence_number, retire_prior_to, new_scid, reset_token
+        );
+
+        // Update max_peer_retire_prior_to and handle retirement of peer connection IDs
+        self.migration
+            .update_max_peer_retire_prior_to(retire_prior_to);
+
+        if retire_prior_to > 0 {
+            self.migration
+                .retire_peer_connection_ids_before(retire_prior_to);
+        }
+
+        // Check if this peer connection ID sequence number has already been retired
+        if self
+            .migration
+            .is_peer_connection_id_retired(sequence_number)
+        {
+            info!(
+                "Ignoring NEW_CONNECTION_ID for already retired peer sequence {}: \
+                cid={:x?} (max_peer_retire_prior_to={})",
+                sequence_number,
+                new_scid,
+                self.migration.get_active_connection_id_sequence()
+            );
+            return Ok(());
+        }
+
+        // Check if this sequence number already exists in available connection IDs
+        let available_cids = self.migration.get_all_peer_connection_ids();
+        if available_cids.contains_key(&sequence_number) {
+            info!(
+                "Connection ID {:x?} already exists, dropping new connection ID {:x?}",
+                available_cids.get(&sequence_number).unwrap().0,
+                new_scid
+            );
+            if available_cids.get(&sequence_number).unwrap().0 != new_scid {
+                error!(
+                    "Current connection ID {:x?} is different from the new connection ID {:x?}",
+                    available_cids.get(&sequence_number).unwrap().0,
+                    new_scid
+                );
+            }
+            return Ok(());
+        }
+
+        if self.migration.get_available_peer_connection_id_count()
+            > self.get_local_connection_id_limit() as usize
+        {
+            error!(
+                "Peer connection ID limit exceeded: {}, current: {}",
+                self.get_local_connection_id_limit(),
+                self.migration.get_available_peer_connection_id_count()
+            );
+            return Err(anyhow::Error::from(
+                crate::error_code::QuicConnectionErrorCode::create_connection_id_limit_error(),
+            ));
+        }
+
+        let mut reset_token_array = [0u8; 16];
+        reset_token_array.copy_from_slice(reset_token);
+
+        // Store the new connection ID with its sequence number from the frame
+        self.migration.add_peer_connection_id(
+            sequence_number,
+            new_scid.to_vec(),
+            reset_token_array,
+        )?;
+
+        Ok(())
     }
 
-    pub(crate) fn add_peer_connection_id(&mut self, new_scid: &[u8]) {
-        self.peer_conn_ids.insert(new_scid.into());
+    pub(crate) fn handle_path_challenge_frame(&mut self, data: [u8; 8]) -> Result<()> {
+        trace!("Got PATH_CHALLENGE frame: data={:x?}", data);
+
+        // Send PATH_RESPONSE frame immediately
+        let response_frame = QuicFrame::create_path_response_frame(data);
+        self.app_send.insert_send_queue_front(response_frame);
+        self.set_next_send_event_time(0);
+
+        // Consider triggering MTU discovery if conditions are met
+        self.reset_mtu();
+        self.start_mtu_discovery()?;
+
+        trace!("PATH_CHALLENGE handled, PATH_RESPONSE queued for immediate send");
+        Ok(())
     }
 
-    pub(crate) fn handle_new_conncetion_id_frame(&mut self, new_scid: &[u8], reset_token: &[u8]) {
-        self.add_peer_connection_id(new_scid);
-        self.add_peer_reset_token(reset_token);
-        // TODO: https://www.rfc-editor.org/rfc/rfc9000.html#section-19.15-8
+    pub(crate) fn handle_path_response_frame(&mut self, data: [u8; 8]) -> Result<()> {
+        trace!("Got PATH_RESPONSE frame: data={:x?}", data);
+
+        // Use the migration system to handle the response and get the validated path ID
+        if let Some(validated_path_id) = self.migration.handle_path_response(data)? {
+            info!(
+                "Path validation completed successfully for path: {}",
+                validated_path_id
+            );
+
+            // Check if the validated path is different from the current active path
+            if let Some(current_active_path) = self.migration.get_active_path() {
+                if current_active_path.path_id != validated_path_id {
+                    // Switch to the newly validated path and get the old path ID
+                    match self.migration.switch_to_path(validated_path_id, true) {
+                        Ok(old_path_id) => {
+                            info!(
+                                "Successfully switched to newly validated path: {} (from path: {})",
+                                validated_path_id, old_path_id
+                            );
+
+                            // Reset and restart MTU discovery on migration
+                            self.reset_mtu();
+                            self.start_mtu_discovery()?;
+
+                            // Set migration result pending in migration
+                            let is_preferred = validated_path_id == 1
+                                && self.get_peer_preferred_address().is_some();
+                            if is_preferred {
+                                self.migration.set_migration_result_pending(
+                                    old_path_id,
+                                    validated_path_id,
+                                    crate::migration::MigrationResult::MigrationPreferredAddressSuccess,
+                                );
+                            } else {
+                                self.migration.set_migration_result_pending(
+                                    old_path_id,
+                                    validated_path_id,
+                                    crate::migration::MigrationResult::MigrationSuccess,
+                                );
+                            }
+                            // Send RETIRE_CONNECTION_ID frame for the old path's connection ID
+                            if let Some(old_sequence) =
+                                self.migration.get_path_connection_id_sequence(old_path_id)
+                            {
+                                self.send_retire_connection_id_frame(old_sequence)?;
+                            } else {
+                                error!(
+                                    "No connection ID sequence found for old path {}",
+                                    old_path_id
+                                );
+                            }
+
+                            self.migration.set_path_retired(old_path_id);
+                            self.cleanup_expired_path_challenges();
+                        }
+                        Err(e) => {
+                            error!(
+                                "Error switching to validated path {}: {}",
+                                validated_path_id, e
+                            );
+                        }
+                    }
+                } else {
+                    info!(
+                        "Validated path {} is already the active path",
+                        validated_path_id
+                    );
+                }
+            } else {
+                error!(
+                    "No active path found, cannot switch to validated path {}",
+                    validated_path_id
+                );
+            }
+        } else {
+            warn!(
+                "Received PATH_RESPONSE for unknown challenge: data={:x?}",
+                data
+            );
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn handle_retire_connection_id_frame(&mut self, sequence_number: u64) -> Result<()> {
+        info!(
+            "Handling RETIRE_CONNECTION_ID frame: sequence_number={}",
+            sequence_number
+        );
+
+        // This frame is asking us to retire one of OUR connection IDs that we gave to the peer
+        if let Some((retired_cid, _)) = self.available_local_connection_ids.remove(&sequence_number)
+        {
+            // Also remove from lookup set
+            self.local_connection_ids_lookup.remove(&retired_cid);
+            info!(
+                "Peer requested retirement of our local connection ID: sequence={}, cid={:x?}",
+                sequence_number, retired_cid
+            );
+
+            // Calculate a suitable retire_prior_to value to suggest peer retirement
+            // We should suggest retiring peer connection IDs that are older but not including
+            // any currently active connection IDs
+            let suggested_retire_prior_to = self.calculate_suggested_peer_retire_prior_to();
+
+            // Try to generate a new connection ID to maintain the limit
+            // If we have a retirement suggestion, use it; otherwise use None to keep current behavior
+            if suggested_retire_prior_to > self.suggested_peer_retire_prior_to {
+                self.suggested_peer_retire_prior_to = suggested_retire_prior_to;
+                self.generate_new_local_connection_id_with_retire_prior_to(Some(
+                    suggested_retire_prior_to,
+                ))?;
+                info!(
+                    "Suggesting peer retire connection IDs with sequence < {} when sending new connection ID",
+                    suggested_retire_prior_to
+                );
+            } else {
+                self.maybe_generate_new_local_connection_id()?;
+            }
+        } else {
+            warn!(
+                "Peer requested retirement of unknown local connection ID: sequence={}",
+                sequence_number
+            );
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn create_and_send_path_challenge_for_path(&mut self, path_id: u64) -> Result<()> {
+        let challenge_data = rand::random::<[u8; 8]>();
+
+        // Integration with migration system for path validation tracking
+        if let Some(path) = self.migration.get_path_mut(path_id) {
+            let active_path_id = path.path_id;
+
+            // If the active path is not currently being validated, start validation
+            if !path.is_validating() {
+                path.start_validation(challenge_data, self.current_ts);
+                info!(
+                    "Started path validation for active path {}: challenge_data={:x?}",
+                    active_path_id, challenge_data
+                );
+            } else {
+                // Path is already being validated, but we can still send a challenge
+                warn!("Active path {} is already being validated, sending additional challenge: data={:x?}", 
+                      active_path_id, challenge_data);
+            }
+        } else {
+            error!("No {path_id} path found for PATH_CHALLENGE, sending generic challenge");
+        }
+
+        let challenge_frame = QuicFrame::create_path_challenge_frame(challenge_data);
+
+        self.app_send.insert_send_queue_front(challenge_frame);
+
+        let tmp_active_path_id = self.migration.switch_to_path(path_id, false)?;
+
+        // Immediately create and send QUIC packet (following standard pattern)
+        let datagram_buf = QuicPacket::create_quic_packet(self, QuicLevel::Application, 1)?
+            .ok_or_else(|| {
+                anyhow!("Must create the QUIC packet successfully for PATH_CHALLENGE")
+            })?;
+        self.update_packet_send_queue(vec![datagram_buf]);
+        self.set_next_send_event_time(0);
+        self.migration.switch_to_path(tmp_active_path_id, false)?;
+
+        info!(
+            "Created and sent PATH_CHALLENGE frame: data={:x?}, path_id={}",
+            challenge_data, path_id
+        );
+
+        Ok(())
+    }
+
+    fn cleanup_expired_path_challenges(&mut self) {
+        let retry_paths = self.migration.check_validation_timeouts(self.current_ts);
+        for path_id in retry_paths {
+            if let Err(e) = self.create_and_send_path_challenge_for_path(path_id) {
+                error!("Failed to send path challenge for path {}: {}", path_id, e);
+            }
+        }
+    }
+
+    /// Handle preferred address migration after handshake completion
+    ///
+    /// According to RFC 9000 Section 9.5, when a server provides a preferred address,
+    /// the client SHOULD migrate to that address after the handshake completes.
+    fn handle_preferred_address_migration(&mut self) -> Result<()> {
+        if self.quic_config.get_disable_active_migration() {
+            warn!("Active migration is disabled, skipping preferred address migration");
+            return Ok(());
+        }
+
+        // Check if peer has provided a preferred address
+        if let Some(preferred_addr) = self.get_peer_preferred_address() {
+            info!(
+                "Peer provided preferred address: IPv4={}:{}, IPv6=[{}]:{}, connection_id={:x?}",
+                preferred_addr.get_ipv4_address(),
+                preferred_addr.get_ipv4_port(),
+                preferred_addr.get_ipv6_address(),
+                preferred_addr.get_ipv6_port(),
+                preferred_addr.get_connection_id()
+            );
+
+            // Check if migration is disabled
+            if self.is_peer_migration_disabled() {
+                warn!("Preferred address provided but peer has disabled active migration");
+                return Ok(());
+            }
+
+            // Validate that the preferred address has a valid connection ID
+            if preferred_addr.get_connection_id().is_empty() {
+                warn!("Preferred address has empty connection ID, cannot migrate");
+                return Ok(());
+            }
+
+            // Determine which preferred address to use (prioritize IPv4 for now)
+            let preferred_socket_addr =
+                if preferred_addr.get_ipv4_address() != std::net::Ipv4Addr::new(0, 0, 0, 0) {
+                    std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                        preferred_addr.get_ipv4_address(),
+                        preferred_addr.get_ipv4_port(),
+                    ))
+                } else if preferred_addr.get_ipv6_address()
+                    != std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)
+                {
+                    std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                        preferred_addr.get_ipv6_address(),
+                        preferred_addr.get_ipv6_port(),
+                        0,
+                        0,
+                    ))
+                } else {
+                    warn!("Preferred address has no valid IPv4 or IPv6 address");
+                    return Ok(());
+                };
+
+            // Add the preferred address as a new path using the migration system
+            // The preferred address connection ID should have sequence number 1
+            // (sequence 0 is the initial connection ID from handshake)
+            match self.migration.add_path_with_connection_id(
+                preferred_addr.get_connection_id().clone(),
+                preferred_socket_addr,
+                self.migration.get_active_connection_id_sequence() + 1, // Must be one
+                self.current_ts,
+            ) {
+                Ok(path_id) => {
+                    info!(
+                        "Added preferred address path: path_id={}, address={:?}, sequence=1",
+                        path_id, preferred_socket_addr
+                    );
+
+                    self.create_and_send_path_challenge_for_path(path_id)?;
+                }
+                Err(e) => {
+                    error!("Failed to add preferred address path: {}", e);
+                }
+            }
+        } else {
+            trace!("No preferred address provided by peer");
+        }
+
+        Ok(())
+    }
+
+    /// Validate client-specific transport parameters according to RFC 9000 Section 7.3
+    ///
+    /// This function validates transport parameters that are required for QUIC clients
+    /// to verify when receiving them from the server during the handshake.
+    fn validate_client_transport_parameters(&self) -> Result<()> {
+        // RFC 9000 Section 7.3: Transport parameters are authenticated by including them in the
+        // transport layer security (TLS) handshake. A client MUST validate that certain parameters
+        // match values that were included in the connection attempt.
+
+        // 1. Validate original_destination_connection_id (REQUIRED for clients)
+        // RFC 9000 Section 18.2: A client MUST treat the absence of the
+        // original_destination_connection_id transport parameter from the server
+        // as a connection error of type TRANSPORT_PARAMETER_ERROR.
+        match self
+            .peer_transport_params
+            .get_original_destination_connection_id()
+        {
+            Some(peer_original_dcid) => {
+                if peer_original_dcid != &self.org_dcid {
+                    error!(
+                        "Transport parameter validation failed: original_destination_connection_id mismatch. \
+                        Server sent {:x?}, expected {:x?}",
+                        peer_original_dcid, self.org_dcid
+                    );
+                    return Err(anyhow!("original_destination_connection_id does not match"));
+                }
+                info!(
+                    "Transport parameter validation passed: original_destination_connection_id={:x?}",
+                    peer_original_dcid
+                );
+            }
+            None => {
+                error!("Transport parameter validation failed: server did not send original_destination_connection_id");
+                return Err(anyhow!(
+                    "Missing original_destination_connection_id transport parameter"
+                ));
+            }
+        }
+
+        // 2. Validate retry_source_connection_id (if a retry packet was received)
+        // RFC 9000 Section 7.3: If a client receives a Retry packet, the transport parameters
+        // sent by the server MUST include a retry_source_connection_id transport parameter.
+        if self.retry_source_connection_id.is_some() {
+            // We received a retry packet, so retry_source_connection_id MUST be present
+            match self.peer_transport_params.get_retry_source_connection_id() {
+                Some(retry_scid) => {
+                    // The retry_source_connection_id should match the source connection ID
+                    // from the Retry packet we received
+                    info!(
+                        "Transport parameter validation passed: retry_source_connection_id={:x?} \
+                        (retry token present)",
+                        retry_scid
+                    );
+                    // We already checked that self.retry_source_connection_id.is_some() above,
+                    // so it's safe to unwrap here
+                    if let Some(ref expected_retry_scid) = self.retry_source_connection_id {
+                        if retry_scid != expected_retry_scid {
+                            error!(
+                                "Transport parameter validation failed: retry_source_connection_id mismatch. \
+                                Server sent {:x?}, expected {:x?}",
+                                retry_scid, expected_retry_scid
+                            );
+                            return Err(anyhow!("retry_source_connection_id does not match"));
+                        }
+                    }
+                }
+                None => {
+                    error!(
+                        "Transport parameter validation failed: retry_source_connection_id missing \
+                        but retry token was received"
+                    );
+                    return Err(anyhow!(
+                        "Missing retry_source_connection_id after receiving retry packet"
+                    ));
+                }
+            }
+        } else {
+            // We did not receive a retry packet, so retry_source_connection_id MUST NOT be present
+            if let Some(retry_scid) = self.peer_transport_params.get_retry_source_connection_id() {
+                error!(
+                    "Transport parameter validation failed: retry_source_connection_id={:x?} \
+                    present but no retry packet was received",
+                    retry_scid
+                );
+                return Err(anyhow!(
+                    "Unexpected retry_source_connection_id without retry packet"
+                ));
+            }
+        }
+
+        info!("All client transport parameter validations passed successfully");
+        Ok(())
+    }
+
+    /// Calculate a suggested retire_prior_to value based on our local connection IDs
+    ///
+    /// This function finds the minimum sequence number in our available_local_connection_ids
+    /// to suggest as retire_prior_to when sending NEW_CONNECTION_ID frames. This tells the peer
+    /// to retire all our connection IDs with sequence numbers less than this value.
+    fn calculate_suggested_peer_retire_prior_to(&self) -> u64 {
+        if self.available_local_connection_ids.is_empty() {
+            return 0;
+        }
+
+        // Find the minimum sequence number in our available local connection IDs
+        // This is the earliest connection ID we still have available
+        let min_sequence = self
+            .available_local_connection_ids
+            .keys()
+            .min()
+            .copied()
+            .unwrap_or(0);
+
+        min_sequence
+    }
+
+    /// Generate a new local connection ID if we haven't reached the limit
+    fn maybe_generate_new_local_connection_id(&mut self) -> Result<()> {
+        if self.can_generate_local_connection_id() {
+            self.generate_new_local_connection_id()?;
+        }
+
+        Ok(())
+    }
+
+    /// Generate and send a new local connection ID to the peer
+    fn generate_new_local_connection_id(&mut self) -> Result<()> {
+        self.generate_new_local_connection_id_with_retire_prior_to(None)
+    }
+
+    /// Generate and send a new local connection ID to the peer with optional retire_prior_to
+    fn generate_new_local_connection_id_with_retire_prior_to(
+        &mut self,
+        retire_prior_to: Option<u64>,
+    ) -> Result<()> {
+        use crate::frame::QuicFrame;
+        use rand::Rng;
+
+        let mut rng = rand::thread_rng();
+        let sequence_number = self.next_local_connection_id_sequence;
+        self.next_local_connection_id_sequence += 1;
+
+        // Generate a new connection ID with the same length as our initial scid
+        let cid_length = self.scid.len();
+        let mut new_cid = vec![0u8; cid_length];
+        rng.fill(&mut new_cid[..]);
+
+        // Generate stateless reset token using cryptographic derivation
+        let reset_token = QuicCrypto::generate_stateless_reset_token_with_key(
+            &new_cid,
+            self.quic_config.get_stateless_reset_key(),
+        );
+
+        // Store the new connection ID
+        self.available_local_connection_ids
+            .insert(sequence_number, (new_cid.clone(), reset_token));
+
+        // Also add to lookup set for fast checking
+        self.local_connection_ids_lookup.insert(new_cid.clone());
+
+        // Determine retire_prior_to value
+        let retire_prior_to_value = retire_prior_to.unwrap_or(self.suggested_peer_retire_prior_to);
+
+        // Send NEW_CONNECTION_ID frame to peer
+        let new_conn_id_frame = QuicFrame::create_new_connection_id_frame(
+            sequence_number,
+            retire_prior_to_value,
+            &new_cid,
+            &reset_token,
+        );
+
+        self.app_send.insert_send_queue_back(new_conn_id_frame);
+        self.set_next_send_event_time(0);
+
+        info!(
+            "Generated new local connection ID: sequence={}, cid={:x?}, token={:x?}, retire_prior_to={}",
+            sequence_number, new_cid, reset_token, retire_prior_to_value
+        );
+
+        Ok(())
+    }
+
+    fn get_local_connection_id_count(&self) -> usize {
+        self.available_local_connection_ids.len()
+    }
+
+    /// Check if we can generate more local connection IDs
+    fn can_generate_local_connection_id(&self) -> bool {
+        let local_limit = self.get_peer_active_connection_id_limit();
+        self.get_local_connection_id_count() < local_limit as usize
+    }
+
+    /// Generate and send initial local connection IDs to reach the configured limit
+    fn generate_and_send_initial_local_connection_ids(&mut self) -> Result<()> {
+        while self.can_generate_local_connection_id() {
+            self.generate_new_local_connection_id()?;
+        }
+
+        Ok(())
+    }
+    fn send_retire_connection_id_frame(&mut self, sequence_number: u64) -> Result<()> {
+        // Note: The actual removal is handled by the migration system
+        let retire_frame = QuicFrame::create_retire_connection_id_frame(sequence_number);
+        self.app_send.insert_send_queue_back(retire_frame);
+        self.set_next_send_event_time(0);
+
+        info!(
+            "Sent RETIRE_CONNECTION_ID frame: sequence_number={}",
+            sequence_number
+        );
+
+        Ok(())
     }
 
     pub(crate) fn handle_reset_stream_frame(
@@ -1222,7 +1924,7 @@ impl QuicConnection {
                 stream
                     .handle_reset_stream_frame(application_error_code, final_size)
                     .with_context(|| {
-                        format!("Failed to handle RESET_STREAM frame for stream {}", handle)
+                        format!("Failed to handle RESET_STREAM frame for stream {handle}")
                     })
             }
             None => {
@@ -1252,7 +1954,7 @@ impl QuicConnection {
                 if let Some(frame) = stream
                     .handle_stop_sending_frame(application_error_code)
                     .with_context(|| {
-                        format!("Failed to handle STOP_SENDING frame for stream {}", handle)
+                        format!("Failed to handle STOP_SENDING frame for stream {handle}")
                     })?
                 {
                     self.app_send.insert_send_queue_back(frame);
@@ -1298,7 +2000,7 @@ impl QuicConnection {
         match self.streams.get_mut(&handle) {
             Some(stream) => stream
                 .update_max_stream_data(max_stream_data)
-                .with_context(|| format!("Failed to update max stream data for stream {}", handle)),
+                .with_context(|| format!("Failed to update max stream data for stream {handle}")),
             None => {
                 warn!(
                     "Received MAX_STREAM_DATA frame for non-existent stream {} with max_stream_data={}",
@@ -1383,7 +2085,7 @@ impl QuicConnection {
         info!("Handling DATA_BLOCKED frame: max_data={}", max_data);
         if self.flow_control.check_if_update_max_recv_data(true) {
             self.create_and_insert_max_data_stream(None, self.flow_control.get_new_max_recv_size())
-                .map_err(|e| QuicConnectionError::InternalError(format!("Due to {}", e)))?;
+                .map_err(|e| QuicConnectionError::InternalError(format!("Due to {e}")))?;
         }
         Ok(())
     }
@@ -1407,10 +2109,7 @@ impl QuicConnection {
                 if res {
                     self.create_and_insert_max_data_stream(Some(handle), stream_max_size)
                         .with_context(|| {
-                            format!(
-                                "Failed to create MAX_STREAM_DATA frame for stream {}",
-                                handle
-                            )
+                            format!("Failed to create MAX_STREAM_DATA frame for stream {handle}")
                         })?;
                 }
                 Ok(())
@@ -1474,13 +2173,13 @@ impl QuicConnection {
 
         // Check connection level flow control
         if self.flow_control.get_recv_available_bytes()? <= length {
-            return Err(anyhow!(
-                "Receive connection flow control limit exceeded, \
-                available_bytes {}, stream offset {}, stream length {}",
-                self.flow_control.get_recv_available_bytes()?,
-                offset,
-                length
-            ));
+            // Create flow control error and throw it
+            let connection_error =
+                crate::error_code::QuicConnectionErrorCode::create_transport_error_code(
+                    u64::from(crate::error_code::TransportErrorCode::FlowControlError),
+                    Some(crate::frame::QuicFrameType::Stream as u64), // STREAM frame type that triggered the flow control error
+                );
+            return Err(anyhow::Error::from(connection_error));
         }
 
         Ok(())
@@ -1523,13 +2222,13 @@ impl QuicConnection {
                 .unwrap_or(true)
         {
             // https://www.rfc-editor.org/rfc/rfc9000.html#section-4.6-3
-
-            TransportErrorCode::send_stream_limit_error_cc_frame(self);
-            self.close_helper();
-            return Err(anyhow!(
-                "Can not open bidirectional stream, current limitation is {:?}!",
-                self.flow_control.get_max_streams_bidi_remote()
-            ));
+            // Create stream limit error and throw it
+            let connection_error =
+                crate::error_code::QuicConnectionErrorCode::create_transport_error_code(
+                    u64::from(crate::error_code::TransportErrorCode::StreamLimitError),
+                    Some(crate::frame::QuicFrameType::Stream as u64), // STREAM frame type that triggered the flow control error
+                );
+            return Err(anyhow::Error::from(connection_error));
         }
 
         if !stream_id.is_bidirectional()
@@ -1540,12 +2239,13 @@ impl QuicConnection {
                 .unwrap_or(true)
         {
             // https://www.rfc-editor.org/rfc/rfc9000.html#section-4.6-3
-            TransportErrorCode::send_stream_limit_error_cc_frame(self);
-            self.close_helper();
-            return Err(anyhow!(
-                "Can not open unidirectional stream, current limitation is {:?}!",
-                self.flow_control.get_max_streams_uni_local()
-            ));
+            // Create stream limit error and throw it
+            let connection_error =
+                crate::error_code::QuicConnectionErrorCode::create_transport_error_code(
+                    u64::from(crate::error_code::TransportErrorCode::StreamLimitError),
+                    Some(crate::frame::QuicFrameType::Stream as u64), // STREAM frame type that triggered the flow control error
+                );
+            return Err(anyhow::Error::from(connection_error));
         }
 
         // https://www.rfc-editor.org/rfc/rfc9000.html#section-2.1-7
@@ -1626,7 +2326,7 @@ impl QuicConnection {
                         );
                     }
                 }
-                _ => panic!("Can not handle the unexpected frame {:?}", frame),
+                _ => panic!("Can not handle the unexpected frame {frame:?}"),
             }
 
             Ok(())
@@ -1642,8 +2342,8 @@ impl QuicConnection {
         let span = span!(
             Level::TRACE,
             "quic_streams",
-            scid = ?self.scid.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""),
-            dcid = ?self.dcid.as_ref().map(|d| d.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join(""))
+            scid = ?self.scid.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<String>>().join(""),
+            dcid = ?self.format_span_dcid()
         );
         let _enter = span.enter();
 
@@ -1670,6 +2370,12 @@ impl QuicConnection {
                     )?;
                 }
             }
+        }
+
+        if let Some((old_path_id, new_path_id, result)) =
+            self.migration.migration_result_pending.take()
+        {
+            uctx.run_migration_switch_result_event(self, old_path_id, new_path_id, result)?;
         }
 
         if !self.is_closed() && !self.is_closing() && !self.is_draining() {
@@ -1794,7 +2500,10 @@ impl QuicConnection {
     }
 
     pub(crate) fn update_packet_send_queue(&mut self, new_pkt: Vec<Vec<u8>>) {
-        self.send_queue.push_back(new_pkt);
+        // Get the target address from the current active path when inserting into queue
+        let target_address = self.migration.get_current_target_address().unwrap();
+
+        self.send_queue.push_back((new_pkt, target_address));
     }
 
     pub(crate) fn detect_lost(&mut self) -> Result<()> {
@@ -2150,12 +2859,64 @@ impl QuicConnection {
         Ok(())
     }
 
-    pub(crate) fn handle_encrypted_extensions(&mut self) {
+    pub(crate) fn handle_encrypted_extensions(&mut self) -> Result<()> {
+        use crate::error_code::{QuicConnectionErrorCode, TransportErrorCode};
+        use crate::frame::QuicFrameType;
+
         self.peer_transport_params.update_from_tls(&self.tls);
 
-        if let Some(rt) = self.peer_transport_params.get_stateless_reset_token() {
-            self.add_peer_reset_token(&rt);
+        // Validate client-specific transport parameters according to RFC 9000 Section 7.3
+        if self.validate_client_transport_parameters().is_err() {
+            let error_code = QuicConnectionErrorCode::create_transport_error_code(
+                u64::from(TransportErrorCode::TransportParameterError),
+                Some(QuicFrameType::Crypto as u64),
+            );
+            return Err(anyhow::Error::from(error_code));
         }
+
+        // Update migration parameters from transport parameters
+        self.peer_disable_active_migration = self
+            .peer_transport_params
+            .get_disable_active_migration()
+            .unwrap_or(false);
+
+        self.peer_active_connection_id_limit = self
+            .peer_transport_params
+            .get_active_connection_id_limit()
+            .unwrap_or(MIN_ACTIVE_CONNECTION_ID_LIMIT);
+
+        info!(
+            "Updated migration parameters: disable_migration={}, connection_id_limit={}",
+            self.peer_disable_active_migration, self.peer_active_connection_id_limit
+        );
+
+        // Handle stateless reset token from transport parameters
+        // This typically corresponds to the initial connection ID (sequence 0)
+        if let Some(rt) = self.peer_transport_params.get_stateless_reset_token() {
+            if rt.len() as u16 == QUIC_STATELESS_RESET_TOKEN_SIZE {
+                let mut reset_token_array = [0u8; QUIC_STATELESS_RESET_TOKEN_SIZE as usize];
+                reset_token_array.copy_from_slice(&rt);
+
+                // If we have a current connection ID from handshake, update/associate the reset token
+                let current_dcid = self.migration.get_current_connection_id();
+                let current_seq = self.migration.get_active_connection_id_sequence();
+                if let Some(dcid) = current_dcid {
+                    let dcid_vec = dcid.to_vec();
+                    let dcid_debug = dcid.to_vec(); // For logging
+                                                    // Update the existing entry or insert if it doesn't exist
+                    self.migration.add_peer_connection_id(
+                        current_seq, // Must be zero
+                        dcid_vec,
+                        reset_token_array,
+                    )?;
+                    info!(
+                        "Updated handshake connection ID with transport parameter reset token: seq={}, cid={:x?}, token={:x?}",
+                        current_seq, dcid_debug, reset_token_array
+                    );
+                }
+            }
+        }
+
         self.flow_control.set_initial_limits(
             self.quic_config.get_initial_max_data(),
             self.get_peer_initial_max_data().unwrap_or(0),
@@ -2164,6 +2925,8 @@ impl QuicConnection {
             self.get_peer_initial_max_streams_bidi().unwrap_or(0),
             self.get_peer_initial_max_streams_uni().unwrap_or(0),
         );
+
+        Ok(())
     }
 
     // Replace all the get_peer_* methods with direct access to peer_transport_params
@@ -2207,6 +2970,27 @@ impl QuicConnection {
 
     pub(crate) fn get_peer_initial_max_data(&self) -> Option<u64> {
         self.peer_transport_params.get_initial_max_data()
+    }
+
+    /// Check if peer has disabled active migration
+    pub(crate) fn is_peer_migration_disabled(&self) -> bool {
+        self.peer_disable_active_migration
+    }
+
+    /// Get peer's preferred address for connection migration
+    pub(crate) fn get_peer_preferred_address(
+        &self,
+    ) -> Option<&crate::transport_parameters::PreferredAddress> {
+        self.peer_transport_params.get_preferred_address()
+    }
+
+    /// Get peer's active connection ID limit
+    pub(crate) fn get_peer_active_connection_id_limit(&self) -> u8 {
+        self.peer_active_connection_id_limit
+    }
+
+    pub(crate) fn get_local_connection_id_limit(&self) -> u8 {
+        self.quic_config.get_active_connection_id_limit()
     }
 
     fn discard_keys_safely(&mut self, level: QuicLevel) {
@@ -2317,5 +3101,34 @@ impl QuicConnection {
         self.set_next_send_event_time(0);
 
         Ok(())
+    }
+
+    pub(crate) fn format_span_dcid(&self) -> String {
+        self.migration
+            .get_current_dcid()
+            .as_ref()
+            .map(|d| {
+                d.iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<String>>()
+                    .join("")
+            })
+            .or_else(|| {
+                Some(
+                    self.org_dcid
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<Vec<String>>()
+                        .join(""),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn reset_mtu(&mut self) {
+        self.mtu.reset();
+        self.mtu_probe_size = None;
+        self.mtu_probe_timeout_threshold = None;
+        info!("Reset MTU discovery");
     }
 }

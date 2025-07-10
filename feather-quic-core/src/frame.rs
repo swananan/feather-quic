@@ -6,11 +6,11 @@ use std::fmt::Debug;
 use std::io::{Cursor, Read, Seek, Write};
 use std::ops::Div;
 use std::time::{Duration, Instant};
-use tracing::{info, info_span, span, trace, trace_span, warn, Level};
+use tracing::{error, info, info_span, span, trace, trace_span, warn, Level};
 
 use crate::ack::QuicAckRange;
 use crate::connection::{QuicConnection, QuicLevel};
-use crate::error_code::{QuicConnectionErrorCode, TransportErrorCode};
+use crate::error_code::QuicConnectionErrorCode;
 use crate::packet::QuicPacket;
 use crate::utils::{
     decode_variable_length, encode_variable_length, encode_variable_length_force_two_bytes,
@@ -105,7 +105,7 @@ impl From<u8> for QuicFrameType {
             0x1b => QuicFrameType::PathResponse,
             0x1c..=0x1d => QuicFrameType::ConnectionClose,
             0x1e => QuicFrameType::HandshakeDone,
-            _ => panic!("Invalid QuicFrameType value {:x}", value),
+            _ => panic!("Invalid QuicFrameType value {value:x}"),
         }
     }
 }
@@ -265,7 +265,6 @@ struct QuicStreamsBlocked {
     is_bidirectional: bool,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct QuicNewConnectionId {
     common: QuicFrameCommon,
@@ -275,21 +274,18 @@ struct QuicNewConnectionId {
     stateless_reset_token: [u8; 16],
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct QuicRetireConnectionId {
     common: QuicFrameCommon,
     sequence_number: u64,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct QuicPathChallenge {
     common: QuicFrameCommon,
     data: [u8; 8],
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct QuicPathResponse {
     common: QuicFrameCommon,
@@ -713,7 +709,100 @@ impl QuicFrame {
                     encode_variable_length(cursor, 0)?;
                 }
             }
-            _ => unimplemented!(),
+            QuicFrame::RetireConnectionId(frame) => {
+                // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.16
+                // RETIRE_CONNECTION_ID Frame {
+                //   Type (i) = 0x19,
+                //   Sequence Number (i),
+                // }
+                if remain < 2 * MAX_VARIABLE_FIELD_SIZE {
+                    trace!(
+                        "Can not serialize the {:?}, since we only have {} bytes",
+                        frame,
+                        remain
+                    );
+                    return Ok((false, None));
+                }
+                trace!("Serialized {:?} frame", frame);
+                encode_variable_length(
+                    cursor,
+                    Into::<u8>::into(QuicFrameType::RetireConnectionId) as u64,
+                )?;
+                encode_variable_length(cursor, frame.sequence_number)?;
+            }
+            QuicFrame::PathChallenge(frame) => {
+                // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.17
+                // PATH_CHALLENGE Frame {
+                //   Type (i) = 0x1a,
+                //   Data (64),
+                // }
+                if remain < 1 + 8 {
+                    trace!(
+                        "Can not serialize the {:?}, since we only have {} bytes",
+                        frame,
+                        remain
+                    );
+                    return Ok((false, None));
+                }
+                trace!("Serialized {:?} frame", frame);
+                encode_variable_length(
+                    cursor,
+                    Into::<u8>::into(QuicFrameType::PathChallenge) as u64,
+                )?;
+                cursor.write_all(&frame.data)?;
+            }
+            QuicFrame::PathResponse(frame) => {
+                // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.18
+                // PATH_RESPONSE Frame {
+                //   Type (i) = 0x1b,
+                //   Data (64),
+                // }
+                if remain < 1 + 8 {
+                    trace!(
+                        "Can not serialize the {:?}, since we only have {} bytes",
+                        frame,
+                        remain
+                    );
+                    return Ok((false, None));
+                }
+                trace!("Serialized {:?} frame", frame);
+                encode_variable_length(
+                    cursor,
+                    Into::<u8>::into(QuicFrameType::PathResponse) as u64,
+                )?;
+                cursor.write_all(&frame.data)?;
+            }
+            QuicFrame::NewConnectionId(frame) => {
+                // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.15
+                // NEW_CONNECTION_ID Frame {
+                //   Type (i) = 0x18,
+                //   Sequence Number (i),
+                //   Retire Prior To (i),
+                //   Length (8),
+                //   Connection ID (8..160),
+                //   Stateless Reset Token (128),
+                // }
+                if remain < 4 * MAX_VARIABLE_FIELD_SIZE + 1 + frame.connection_id.len() as u16 + 16
+                {
+                    trace!(
+                        "Can not serialize the {:?}, since we only have {} bytes",
+                        frame,
+                        remain
+                    );
+                    return Ok((false, None));
+                }
+                trace!("Serialized {:?} frame", frame);
+                encode_variable_length(
+                    cursor,
+                    Into::<u8>::into(QuicFrameType::NewConnectionId) as u64,
+                )?;
+                encode_variable_length(cursor, frame.sequence_number)?;
+                encode_variable_length(cursor, frame.retire_prior_to)?;
+                cursor.write_u8(frame.connection_id.len() as u8)?;
+                cursor.write_all(&frame.connection_id)?;
+                cursor.write_all(&frame.stateless_reset_token)?;
+            }
+            _ => unimplemented!("Not implemented frame type: {:?}", self),
         }
 
         Ok((true, None))
@@ -724,6 +813,10 @@ impl QuicFrame {
             self,
             QuicFrame::Ack(_) | QuicFrame::Padding(_) | QuicFrame::ConnectionClose(_)
         )
+    }
+
+    pub(crate) fn is_path_challenge_frame(&self) -> bool {
+        matches!(self, QuicFrame::PathChallenge(_))
     }
 
     pub(crate) fn _is_crypto_frame(&self) -> bool {
@@ -1152,7 +1245,7 @@ impl QuicFrame {
             let frame_type_val = decode_variable_length(&mut cursor)?;
             let frame_type = QuicFrameType::from(frame_type_val as u8);
 
-            span.record("frame_type", format!("{:?}", frame_type));
+            span.record("frame_type", format!("{frame_type:?}"));
             trace!(
                 "Start to process QUIC frame {:?}, offset {}, frame_type {:?}, frame_type_val {}",
                 level,
@@ -1171,9 +1264,18 @@ impl QuicFrame {
                 QuicFrameType::NewConnectionId => {
                     Self::handle_new_conncetion_id_frame(&mut cursor, qconn, level)?
                 }
+                QuicFrameType::RetireConnectionId => {
+                    Self::handle_retire_connection_id_frame(&mut cursor, qconn, level)?
+                }
+                QuicFrameType::PathChallenge => {
+                    Self::handle_path_challenge_frame(&mut cursor, qconn, level)?
+                }
+                QuicFrameType::PathResponse => {
+                    Self::handle_path_response_frame(&mut cursor, qconn, level)?
+                }
                 QuicFrameType::NewToken => Self::handle_new_token_frame(&mut cursor, qconn, level)?,
                 QuicFrameType::Stream => {
-                    span.record("frame_type_val", format!("0x{:x}", frame_type_val));
+                    span.record("frame_type_val", format!("0x{frame_type_val:x}"));
                     Self::handle_stream_frame(&mut cursor, qconn, frame_type_val)?
                 }
                 QuicFrameType::ResetStream => Self::handle_reset_stream_frame(&mut cursor, qconn)?,
@@ -1263,9 +1365,13 @@ impl QuicFrame {
                 if send_ctx.get_crypto_recv_cbufs_length() + length
                     > QUIC_CRYPTO_FRAME_MAX_BUFFER_SIZE
                 {
-                    TransportErrorCode::send_crypto_buffer_exceeded_cc_frame(qconn);
-                    qconn.close_helper();
-                    return Err(anyhow!("Too much crypto frame data"));
+                    // Create crypto buffer exceeded error and throw it
+                    let connection_error =
+                        crate::error_code::QuicConnectionErrorCode::create_transport_error_code(
+                            u64::from(crate::error_code::TransportErrorCode::CryptoBufferExceeded),
+                            Some(QuicFrameType::Crypto as u64), // CRYPTO frame type
+                        );
+                    return Err(anyhow::Error::from(connection_error));
                 }
                 send_ctx.insert_crypto_recv_cbufs(
                     &cursor.get_ref()
@@ -1348,7 +1454,19 @@ impl QuicFrame {
         }
 
         if qconn.tls.have_server_transport_params() {
-            qconn.handle_encrypted_extensions();
+            if let Err(e) = qconn.handle_encrypted_extensions() {
+                // Convert generic error from handle_encrypted_extensions to transport parameter error
+                error!("Transport parameter validation failed: {}", e);
+
+                // Create transport parameter error with CRYPTO frame type
+                let transport_param_error =
+                    crate::error_code::QuicConnectionErrorCode::create_transport_error_code(
+                        u64::from(crate::error_code::TransportErrorCode::TransportParameterError),
+                        Some(QuicFrameType::Crypto as u64), // CRYPTO frame type
+                    );
+
+                return Err(anyhow::Error::from(transport_param_error));
+            }
 
             if qconn.idle_timeout.is_none() {
                 // Max_idle_timeout: Idle timeout is disabled when both endpoints
@@ -1410,25 +1528,32 @@ impl QuicFrame {
     }
 
     // Helper function to handle TLS handshake errors
-    fn handle_tls_handshake_error(qconn: &mut QuicConnection, e: anyhow::Error) -> Result<()> {
-        if let Some(tls_err) = e.downcast_ref::<crate::tls::TlsHandshakeError>() {
+    fn handle_tls_handshake_error(_qconn: &mut QuicConnection, e: anyhow::Error) -> Result<()> {
+        // Check for QuicConnectionErrorCode first
+        if let Some(_connection_error) =
+            e.downcast_ref::<crate::error_code::QuicConnectionErrorCode>()
+        {
+            // Already a QuicConnectionErrorCode, just re-throw it
+            return Err(e);
+        } else if let Some(tls_err) = e.downcast_ref::<crate::tls::TlsHandshakeError>() {
             let tls_error = tls_err.get_tls_error();
 
-            // Send connection close frame on appropriate encryption levels
-            let levels = if qconn.is_established() {
-                vec![QuicLevel::Application]
-            } else {
-                vec![QuicLevel::Initial, QuicLevel::Handshake]
-            };
-
-            TransportErrorCode::send_crypto_error_cc_frame(qconn, tls_error, levels);
-
-            // Enter closing state
-            qconn.close_helper();
+            // Convert TLS error to QuicConnectionErrorCode and throw it
+            let connection_error =
+                crate::error_code::QuicConnectionErrorCode::create_transport_error_code(
+                    tls_error.to_quic_error_code(),
+                    Some(QuicFrameType::Crypto as u64), // CRYPTO frame type
+                );
+            return Err(anyhow::Error::from(connection_error));
         }
 
-        // Return the original error
-        Err(e)
+        // For other errors, convert to generic transport error
+        let transport_error =
+            crate::error_code::QuicConnectionErrorCode::create_transport_error_code(
+                u64::from(crate::error_code::TransportErrorCode::InternalError),
+                Some(QuicFrameType::Crypto as u64),
+            );
+        Err(anyhow::Error::from(transport_error))
     }
 
     fn handle_reset_stream_frame(
@@ -1704,7 +1829,13 @@ impl QuicFrame {
             stateless_reset_token
         );
 
-        qconn.handle_new_conncetion_id_frame(&scid, &stateless_reset_token);
+        // Handle the new connection ID and check for errors
+        qconn.handle_new_conncetion_id_frame(
+            sequence_number,
+            retire_prior,
+            &scid,
+            &stateless_reset_token,
+        )?;
 
         Ok(())
     }
@@ -1876,5 +2007,125 @@ impl QuicFrame {
         }
 
         Ok(())
+    }
+
+    fn handle_path_challenge_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+        level: QuicLevel,
+    ) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.17
+        // PATH_CHALLENGE Frame {
+        //   Type (i) = 0x1a,
+        //   Data (64),
+        // }
+        if level != QuicLevel::Application {
+            return Err(anyhow::anyhow!("Invalid level for path challenge frame"));
+        }
+
+        let mut data = [0u8; 8];
+        cursor.read_exact(&mut data)?;
+
+        // Delegate to connection-level handler which has access to migration detection logic
+        qconn.handle_path_challenge_frame(data)
+    }
+
+    fn handle_path_response_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+        level: QuicLevel,
+    ) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.18
+        // PATH_RESPONSE Frame {
+        //   Type (i) = 0x1b,
+        //   Data (64),
+        // }
+        assert_eq!(level, QuicLevel::Application);
+
+        let mut data = [0u8; 8];
+        cursor.read_exact(&mut data)?;
+
+        trace!("Got path response frame, data {:x?}", data);
+
+        // Handle path response in connection context
+        qconn.handle_path_response_frame(data)?;
+
+        Ok(())
+    }
+
+    fn handle_retire_connection_id_frame(
+        cursor: &mut Cursor<&[u8]>,
+        qconn: &mut QuicConnection,
+        level: QuicLevel,
+    ) -> Result<()> {
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-19.16
+        // RETIRE_CONNECTION_ID Frame {
+        //   Type (i) = 0x19,
+        //   Sequence Number (i),
+        // }
+        assert_eq!(level, QuicLevel::Application);
+
+        let sequence_number = decode_variable_length(cursor)?;
+
+        trace!(
+            "Got retire connection id frame, sequence_number {}",
+            sequence_number
+        );
+
+        qconn.handle_retire_connection_id_frame(sequence_number)?;
+
+        Ok(())
+    }
+
+    pub(crate) fn create_path_challenge_frame(data: [u8; 8]) -> QuicFrame {
+        let frame = QuicFrame::PathChallenge(QuicPathChallenge {
+            common: QuicFrameCommon::default(),
+            data,
+        });
+
+        trace!("Now we are creating {:?} frame", frame);
+
+        frame
+    }
+
+    pub(crate) fn create_path_response_frame(data: [u8; 8]) -> QuicFrame {
+        let frame = QuicFrame::PathResponse(QuicPathResponse {
+            common: QuicFrameCommon::default(),
+            data,
+        });
+
+        trace!("Now we are creating {:?} frame", frame);
+
+        frame
+    }
+
+    pub(crate) fn create_retire_connection_id_frame(sequence_number: u64) -> QuicFrame {
+        let frame = QuicFrame::RetireConnectionId(QuicRetireConnectionId {
+            common: QuicFrameCommon::default(),
+            sequence_number,
+        });
+
+        trace!("Now we are creating {:?} frame", frame);
+
+        frame
+    }
+
+    pub(crate) fn create_new_connection_id_frame(
+        sequence_number: u64,
+        retire_prior_to: u64,
+        connection_id: &[u8],
+        stateless_reset_token: &[u8; 16],
+    ) -> QuicFrame {
+        let frame = QuicFrame::NewConnectionId(QuicNewConnectionId {
+            common: QuicFrameCommon::default(),
+            sequence_number,
+            retire_prior_to,
+            connection_id: connection_id.to_vec(),
+            stateless_reset_token: *stateless_reset_token,
+        });
+
+        trace!("Now we are creating {:?} frame", frame);
+
+        frame
     }
 }

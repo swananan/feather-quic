@@ -287,10 +287,7 @@ impl QuicSendContext {
             let pn = if let Some(pn) = f.get_packet_number() {
                 pn
             } else {
-                panic!(
-                    "Frame in the sent queue must have the packet number {:?}",
-                    f
-                );
+                panic!("Frame must have the packet number!");
             };
 
             if pn > largest_acked {
@@ -305,7 +302,7 @@ impl QuicSendContext {
             let send_time = if let Some(send_time) = f.get_send_time() {
                 send_time
             } else {
-                panic!("Frame in the sent queue must have the send_time {:?}", f);
+                panic!("Frame in the sent queue must have the send_time {f:?}");
             };
 
             let packets_threshold = self.packet_threshold.unwrap_or(QUIC_PACKET_THRESHOLD);
@@ -405,7 +402,7 @@ impl QuicSendContext {
             let pn = if let Some(pn) = f.get_packet_number() {
                 pn
             } else {
-                panic!("Frame {:?} must have the packet number!", f);
+                panic!("Frame {f:?} must have the packet number!");
             };
 
             if pn > largest {
@@ -582,18 +579,16 @@ impl QuicSendContext {
                 .checked_sub(ranges[index].get_gap() + 2)
                 .ok_or_else(|| {
                     anyhow!(
-                        "The smallest {} must be larger then next gap {}",
-                        smallest,
-                        ranges[index].get_gap()
+                        "The smallest {smallest} must be larger then next gap {gap}",
+                        gap = ranges[index].get_gap()
                     )
                 })?;
             smallest = largest
                 .checked_sub(ranges[index].get_ack_range_length())
                 .ok_or_else(|| {
                     anyhow!(
-                        "The largest {} must be larger then cur ack range length {}",
-                        largest,
-                        ranges[index].get_ack_range_length()
+                        "The largest {largest} must be larger then cur ack range length {len}",
+                        len = ranges[index].get_ack_range_length()
                     )
                 })?;
             index += 1;

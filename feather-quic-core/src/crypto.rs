@@ -3,6 +3,7 @@ use aes::Aes128;
 use anyhow::{anyhow, Result};
 use ring::aead::{self};
 use ring::hkdf::{KeyType, Prk, Salt, HKDF_SHA256, HKDF_SHA384};
+use ring::hmac;
 use std::io::Cursor;
 use std::rc::Rc;
 use tracing::{info, trace, warn};
@@ -57,6 +58,12 @@ const QUIC_RETRY_SECRET_KEY: [u8; 16] = [
 ];
 const QUIC_RETRY_NONCE: [u8; 12] = [
     0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
+];
+
+// Stateless reset token derivation default key
+const STATELESS_RESET_KEY: [u8; 32] = [
+    0x9c, 0x85, 0x18, 0x93, 0xd4, 0x3e, 0x7f, 0x2a, 0x64, 0x89, 0x12, 0xfe, 0x90, 0x34, 0xc7, 0xb1,
+    0x4a, 0x73, 0x6f, 0x85, 0x28, 0x91, 0xd5, 0xe3, 0xa8, 0x44, 0x6b, 0x2c, 0x17, 0x59, 0x88, 0x3a,
 ];
 
 const QUIC_PN_LENGTH_MASK: u8 = 0x03;
@@ -771,5 +778,26 @@ impl QuicCrypto {
         );
 
         Ok(())
+    }
+
+    /// Generate a stateless reset token using HMAC-SHA256 with a custom key
+    pub(crate) fn generate_stateless_reset_token_with_key(
+        connection_id: &[u8],
+        reset_key: Option<&[u8; 32]>,
+    ) -> [u8; 16] {
+        let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, reset_key.unwrap_or(&STATELESS_RESET_KEY));
+        let signature = hmac::sign(&hmac_key, connection_id);
+
+        // Take the first 16 bytes of the HMAC output as the reset token
+        let mut reset_token = [0u8; 16];
+        reset_token.copy_from_slice(&signature.as_ref()[..16]);
+
+        trace!(
+            "Generated stateless reset token: {:x?} for connection ID: {:x?}",
+            reset_token,
+            connection_id
+        );
+
+        reset_token
     }
 }

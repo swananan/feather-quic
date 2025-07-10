@@ -18,15 +18,21 @@ pub struct FeatherQuicEchoContext {
     stream_contexts: HashMap<QuicStreamHandle, QuicStreamContext>,
     stream_handles: Vec<QuicStreamHandle>,
     num_streams: u64,
+    migrate_to_addr: Option<std::net::SocketAddr>,
 }
 
 impl FeatherQuicEchoContext {
-    pub fn new(file_path: String, num_streams: u64) -> Result<Self> {
+    pub fn new(
+        file_path: String,
+        num_streams: u64,
+        migrate_to_addr: Option<std::net::SocketAddr>,
+    ) -> Result<Self> {
         Ok(Self {
             file_path,
             stream_contexts: HashMap::new(),
             stream_handles: Vec::new(),
             num_streams,
+            migrate_to_addr,
         })
     }
 
@@ -123,7 +129,7 @@ impl FeatherQuicEchoContext {
                         }
                         break;
                     }
-                    _ => panic!("Unknown error: {:?}", e),
+                    _ => panic!("Unknown error: {e:?}"),
                 },
             }
         }
@@ -190,7 +196,7 @@ impl FeatherQuicEchoContext {
                         )?;
                     }
                 }
-                _ => panic!("Unknown error: {:?}", e),
+                _ => panic!("Unknown error: {e:?}"),
             },
         }
         Ok(())
@@ -241,6 +247,12 @@ impl QuicCallbacks for FeatherQuicEchoContext {
         match result {
             QuicConnectResult::Success => {
                 info!("QUIC connection established successfully");
+                // Migration logic: if migrate_to_addr is set, migrate after handshake
+                if let Some(addr) = self.migrate_to_addr {
+                    info!("Attempting migration to address: {}", addr);
+                    use feather_quic_core::user_api::QuicConnectionInterface;
+                    QuicConnectionInterface::migrate_to_address(qconn, addr)?;
+                }
             }
             QuicConnectResult::Timeout(duration) => {
                 info!(
@@ -266,7 +278,7 @@ impl QuicCallbacks for FeatherQuicEchoContext {
                     qconn.close(2077, Some("can not open stream".to_string()))?;
                     return Ok(());
                 }
-                Err(e) => panic!("Can not open stream due to {:?}", e),
+                Err(e) => panic!("Can not open stream due to {e:?}"),
                 Ok(s) => s,
             };
             self.stream_handles.push(new_stream);
@@ -372,6 +384,31 @@ impl QuicCallbacks for FeatherQuicEchoContext {
             },
         }
 
+        Ok(())
+    }
+
+    fn migration_switch_result(
+        &mut self,
+        _qconn: &mut QuicConnection,
+        old_path_id: u64,
+        new_path_id: u64,
+        result: feather_quic_core::runtime::MigrationResult,
+    ) -> anyhow::Result<()> {
+        use feather_quic_core::runtime::MigrationResult;
+        match &result {
+            MigrationResult::MigrationSuccess => info!(
+                "Migration Callback: switch success: {} -> {}",
+                old_path_id, new_path_id
+            ),
+            MigrationResult::MigrationPreferredAddressSuccess => info!(
+                "Migration Callback: to preferred address success: {} -> {}",
+                old_path_id, new_path_id
+            ),
+            MigrationResult::MigrationFailed(e) => info!(
+                "Migration Callback: switch failed: {} -> {}, reason: {}",
+                old_path_id, new_path_id, e
+            ),
+        }
         Ok(())
     }
 }

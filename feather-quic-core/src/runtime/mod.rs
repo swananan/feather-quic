@@ -14,6 +14,8 @@ mod socket_utils;
 pub(crate) use io_uring::IoUringEventLoop;
 pub(crate) use mio::MioEventLoop;
 
+pub use crate::migration::MigrationResult;
+
 pub struct QuicUserContext<T: QuicCallbacks> {
     pub callbacks: T,
 }
@@ -54,6 +56,17 @@ impl<T: QuicCallbacks> QuicUserContext<T> {
         stream_handle: QuicStreamHandle,
     ) -> Result<()> {
         self.callbacks.write_event(qconn, stream_handle)
+    }
+
+    pub(crate) fn run_migration_switch_result_event(
+        &mut self,
+        qconn: &mut QuicConnection,
+        old_path_id: u64,
+        new_path_id: u64,
+        result: MigrationResult,
+    ) -> Result<()> {
+        self.callbacks
+            .migration_switch_result(qconn, old_path_id, new_path_id, result)
     }
 }
 
@@ -110,6 +123,21 @@ pub trait QuicCallbacks {
         qconn: &mut QuicConnection,
         error_code: Option<u64>,
         reason: Option<String>,
+    ) -> Result<()>;
+
+    /// Called when migration switch is completed (success or failure).
+    ///
+    /// # Parameters
+    /// * `qconn` - The QUIC connection object
+    /// * `old_path_id` - The old path id before switch
+    /// * `new_path_id` - The new path id after switch
+    /// * `result` - MigrationResult
+    fn migration_switch_result(
+        &mut self,
+        qconn: &mut QuicConnection,
+        old_path_id: u64,
+        new_path_id: u64,
+        result: MigrationResult,
     ) -> Result<()>;
 }
 

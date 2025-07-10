@@ -1,10 +1,17 @@
-use std::{error::Error, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    error::Error,
+    net::{SocketAddr, SocketAddrV4, SocketAddrV6},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use quinn::{Endpoint, ServerConfig};
 use quinn_proto::{crypto::rustls::QuicServerConfig, VarInt};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use tokio::net::UdpSocket;
 
 use tokio::{task::JoinHandle, time::sleep};
 use tracing::{error, info, info_span, trace};
@@ -64,6 +71,25 @@ struct Opt {
     /// Delay before sending each response (in milliseconds)
     #[clap(long = "response-delay", default_value = "0")]
     response_delay: u64,
+    /// Enable preferred address support
+    #[clap(long = "enable-preferred-address")]
+    enable_preferred_address: bool,
+    /// Preferred IPv4 socket address for client migration (e.g. 1.2.3.4:5678)
+    #[clap(long = "preferred-ipv4-addr")]
+    preferred_ipv4_addr: Option<SocketAddrV4>,
+    /// Preferred IPv6 socket address for client migration (e.g. [::1]:5678)
+    #[clap(long = "preferred-ipv6-addr")]
+    preferred_ipv6_addr: Option<SocketAddrV6>,
+    /// Extra address to rebind after startup (independent of preferred address)
+    #[clap(long = "extra-rebind-addr")]
+    extra_rebind_addr: Option<SocketAddr>,
+    /// For testing: wait N milliseconds after the M-th echo message, format: <message_index>:<milliseconds>
+    /// Example: --echo-wait 3:5000  (wait 5000 ms after the 3rd message)
+    #[clap(
+        long = "echo-wait",
+        help = "For testing: wait N milliseconds after the M-th echo message, format: <message_index>:<milliseconds> (e.g. 3:5000)"
+    )]
+    echo_wait: Option<String>,
 }
 
 pub fn make_server_endpoint(
@@ -86,6 +112,55 @@ fn configure_server(
     transport_config.max_concurrent_uni_streams(0_u8.into());
 
     Ok((server_config, cert_der))
+}
+
+/// Configure preferred address support
+/// Returns the selected preferred address (IPv4 first, then IPv6)
+fn configure_preferred_address(
+    server_config: &mut ServerConfig,
+    options: &Opt,
+) -> Option<SocketAddr> {
+    if !options.enable_preferred_address {
+        info!("Preferred address support is disabled");
+        return None;
+    }
+
+    info!("Enabling preferred address support:");
+
+    // Configure preferred IPv4 address
+    let preferred_ipv4 = if let Some(addr) = options.preferred_ipv4_addr {
+        info!("  Preferred IPv4 address: {}", addr);
+        Some(addr)
+    } else {
+        None
+    };
+
+    // Configure preferred IPv6 address
+    let preferred_ipv6 = if let Some(addr) = options.preferred_ipv6_addr {
+        info!("  Preferred IPv6 address: {}", addr);
+        Some(addr)
+    } else {
+        None
+    };
+
+    // Apply preferred address configuration
+    server_config.preferred_address_v4(preferred_ipv4);
+    server_config.preferred_address_v6(preferred_ipv6);
+
+    // Select the address to bind for rebind (prioritize IPv4)
+    let selected_addr = if let Some(ipv4_addr) = preferred_ipv4 {
+        info!("Selected IPv4 address for rebind: {}", ipv4_addr);
+        Some(SocketAddr::V4(ipv4_addr))
+    } else if let Some(ipv6_addr) = preferred_ipv6 {
+        info!("Selected IPv6 address for rebind: {}", ipv6_addr);
+        Some(SocketAddr::V6(ipv6_addr))
+    } else {
+        error!("No preferred address configured, skipping rebind");
+        None
+    };
+
+    info!("Preferred address configuration applied successfully");
+    selected_addr
 }
 
 fn main() -> Result<()> {
@@ -129,6 +204,16 @@ fn main() -> Result<()> {
 
 #[tokio::main]
 async fn run(options: Opt) -> Result<()> {
+    if options.enable_preferred_address && options.extra_rebind_addr.is_some() {
+        return Err(anyhow!("--enable-preferred-address and --extra-rebind-addr cannot be used together; they are mutually exclusive."));
+    }
+
+    if options.enable_preferred_address
+        && options.preferred_ipv4_addr.is_none()
+        && options.preferred_ipv6_addr.is_none()
+    {
+        return Err(anyhow!("At least one of --preferred-ipv4-addr or --preferred-ipv6-addr must be set when --enable-preferred-address is used."));
+    }
     // Initialize the crypto provider
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -166,29 +251,67 @@ async fn run(options: Opt) -> Result<()> {
     transport_config
         .receive_window(VarInt::from_u64(options.max_data).expect("Invalid max_data value"));
 
-    /* transport_config.send_window(options.max_data); */
     transport_config.max_idle_timeout(Some(
         Duration::from_millis(options.max_idle_timeout).try_into()?,
     ));
 
-    let endpoint = quinn::Endpoint::server(server_config, options.listen)?;
-    info!("listening on {}", endpoint.local_addr()?);
+    let selected_addr = configure_preferred_address(&mut server_config, &options);
+
+    let main_endpoint = quinn::Endpoint::server(server_config, options.listen)?;
+    info!("Endpoint listening on {}", main_endpoint.local_addr()?);
+
+    // Rebind to preferred address if configured
+    if let Some(addr) = selected_addr {
+        info!("Rebinding endpoint to preferred address: {}", addr);
+        let preferred_socket = UdpSocket::bind(addr)
+            .await
+            .with_context(|| format!("Failed to bind to preferred address: {addr}"))?;
+        main_endpoint
+            .rebind(preferred_socket.into_std()?)
+            .with_context(|| format!("Failed to rebind endpoint to preferred address: {addr}"))?;
+        info!(
+            "Successfully rebind endpoint to preferred address: {}",
+            addr
+        );
+    }
+
+    // Rebind to extra address if configured
+    if let Some(extra_addr) = options.extra_rebind_addr {
+        info!("Rebinding endpoint to extra address: {}", extra_addr);
+        let extra_socket = UdpSocket::bind(extra_addr)
+            .await
+            .with_context(|| format!("Failed to bind to extra rebind address: {extra_addr}"))?;
+        main_endpoint
+            .rebind(extra_socket.into_std()?)
+            .with_context(|| format!("Failed to rebind endpoint to extra address: {extra_addr}"))?;
+        info!(
+            "Successfully rebound endpoint to extra address: {}",
+            extra_addr
+        );
+    }
+
+    // Run the single endpoint server
+    run_endpoint_server(main_endpoint, options).await
+}
+
+async fn run_endpoint_server(endpoint: quinn::Endpoint, options: Opt) -> Result<()> {
+    info!("Endpoint ready to accept connections");
 
     while let Some(conn) = endpoint.accept().await {
         if options
             .connection_limit
             .is_some_and(|n| endpoint.open_connections() >= n)
         {
-            info!("refusing due to open connection limit");
+            info!("Refusing connection due to open connection limit");
             conn.refuse();
         } else if Some(conn.remote_address()) == options.block {
-            info!("refusing blocked client IP address");
+            info!("Refusing blocked client IP address");
             conn.refuse();
         } else if options.stateless_retry && !conn.remote_address_validated() {
-            info!("requiring connection to validate its address");
+            info!("Requiring connection to validate its address");
             conn.retry().unwrap();
         } else {
-            info!("accepting connection");
+            info!("Accepting connection from {}", conn.remote_address());
             let fut = handle_connection(conn, options.clone());
             tokio::spawn(async move {
                 if let Err(e) = fut.await {
@@ -308,6 +431,16 @@ async fn handle_request(
         return Ok(());
     }
 
+    // Parse echo_wait config if present
+    let (echo_wait_message, echo_wait_millis) = if let Some(ref s) = options.echo_wait {
+        let mut parts = s.split(':');
+        let msg = parts.next().and_then(|x| x.parse::<usize>().ok());
+        let ms = parts.next().and_then(|x| x.parse::<u64>().ok());
+        (msg, ms)
+    } else {
+        (None, None)
+    };
+
     let mut buffer = Vec::with_capacity(8192); // Increased buffer size
     let mut temp_buf = [0u8; 4096]; // Increased read buffer size
     let mut message_count = 0;
@@ -349,12 +482,21 @@ async fn handle_request(
                         sleep(Duration::from_millis(options.response_delay)).await;
                     }
 
+                    message_count += 1;
+
+                    // For testing: wait after the N-th echo message
+                    if let (Some(wait_n), Some(wait_ms)) = (echo_wait_message, echo_wait_millis) {
+                        if message_count == wait_n {
+                            info!("[TEST] Waiting for {} ms after message {}", wait_ms, wait_n);
+                            sleep(Duration::from_millis(wait_ms)).await;
+                        }
+                    }
+
                     // Send the line including newline
                     send.write_all(line)
                         .await
                         .map_err(|e| anyhow!("failed to send response: {}", e))?;
 
-                    message_count += 1;
                     if message_count == options.reset_after_messages
                         && options.reset_after_messages > 0
                     {
